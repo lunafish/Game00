@@ -1,0 +1,156 @@
+#pragma kernel CSMain
+
+struct Bone {
+    float3 position;
+};
+
+struct JointLimit {
+    float minAngle;
+    float maxAngle;
+    int enabled;
+};
+
+RWStructuredBuffer<Bone> Bones;
+float3 TargetPosition;
+float3 PolePosition;
+int BoneCount;
+int UsePole;
+StructuredBuffer<float> BoneLengths;
+StructuredBuffer<JointLimit> JointLimits;
+
+// 특정 축(axis)을 중심으로 벡터(v)를 회전시키는 헬퍼 함수
+float3 rotate_vector(float3 v, float3 axis, float angle)
+{
+    float rad = angle * (3.14159265 / 180.0);
+    float s, c;
+    sincos(rad, s, c);
+    return v * c + cross(axis, v) * s + axis * dot(axis, v) * (1.0 - c);
+}
+
+[numthreads(1, 1, 1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    int iterationCount = 10; // FABRIK 반복 횟수 (정밀도와 성능 타협점)
+    float3 startPosition = Bones[0].position; // 뿌리(Root) 위치 저장
+    
+    for(int iter=0; iter<iterationCount; iter++)
+    {
+        // 1. 역방향 패스 (Backward Pass): 이펙터(Target)에서 뿌리(Root) 방향으로 위치 조정
+        Bones[BoneCount-1].position = TargetPosition;
+        for(int i = BoneCount - 2; i >= 0; i--)
+        {
+            float dist = distance(Bones[i].position, Bones[i+1].position);
+            if(dist > 0.0001)
+            {
+                float lambda = BoneLengths[i] / dist;
+                Bones[i].position = (1.0 - lambda) * Bones[i+1].position + lambda * Bones[i].position;
+            }
+        }
+        
+        // 2. 정방향 패스 (Forward Pass): 뿌리(Root)에서 이펙터 방향으로 위치 조정 (제약 조건 적용)
+        Bones[0].position = startPosition;
+        for(int j = 0; j < BoneCount - 1; j++)
+        {
+            float3 currentPos = Bones[j].position;
+            float3 nextPos = Bones[j+1].position;
+            float3 prevPos;
+
+            // 현재 뼈의 기준 앞방향 정의
+            if (j == 0) {
+                prevPos = currentPos - float3(0, 0, 1); 
+            } else {
+                prevPos = Bones[j-1].position;
+            }
+
+            // 표준 FABRIK 위치 업데이트
+            float3 dirNext = nextPos - currentPos;
+            float dist = length(dirNext);
+            if(dist > 0.0001)
+            {
+                dirNext = normalize(dirNext);
+            }
+            else
+            {
+                dirNext = float3(0, 0, 1);
+            }
+
+            // 관절 각도 제한(Joint Limits) 적용
+            if(JointLimits[j].enabled)
+            {
+                float3 dirPrev = normalize(currentPos - prevPos);
+                
+                // 현재 각도 계산
+                float cosAngle = dot(dirPrev, dirNext);
+                float angle = acos(clamp(cosAngle, -1.0, 1.0)) * (180.0 / 3.14159265);
+
+                if(angle < JointLimits[j].minAngle || angle > JointLimits[j].maxAngle)
+                {
+                    float targetAngle = clamp(angle, JointLimits[j].minAngle, JointLimits[j].maxAngle);
+                    
+                    // 회전축 찾기
+                    float3 axis = cross(dirPrev, dirNext);
+                    if(length(axis) < 0.0001) {
+                        // 두 벡터가 평행할 경우 대체 축 사용
+                        float3 rootToEnd = normalize(Bones[BoneCount-1].position - startPosition);
+                        float3 toPole = normalize(PolePosition - startPosition);
+                        axis = cross(rootToEnd, toPole);
+                        if(length(axis) < 0.0001) axis = float3(0, 1, 0);
+                        else axis = normalize(axis);
+                    }
+                    else {
+                        axis = normalize(axis);
+                    }
+
+                    // 제한된 각도로 벡터 회전
+                    dirNext = rotate_vector(dirPrev, axis, targetAngle);
+                }
+            }
+            
+            // 최종 위치 결정 (길이 유지)
+            Bones[j+1].position = currentPos + dirNext * BoneLengths[j];
+        }
+
+        // 3. Pole 조향 (Pole Steering): 무릎/팔꿈치를 Pole 타겟 방향으로 강제 정렬
+        if(UsePole && BoneCount > 2)
+        {
+            float3 root = startPosition;
+            float3 end = Bones[BoneCount-1].position;
+            float3 pole = PolePosition;
+
+            float3 chainLine = end - root;
+            float lineLen = length(chainLine);
+            if(lineLen > 0.0001)
+            {
+                float3 lineDir = chainLine / lineLen;
+                
+                for(int k = 1; k < BoneCount - 1; k++)
+                {
+                    float3 bonePos = Bones[k].position;
+                    float3 rootToBone = bonePos - root;
+                    
+                    // Root-End 라인에 수직 투영된 위치 계산
+                    float projection = dot(rootToBone, lineDir);
+                    float3 projectedPoint = root + lineDir * projection;
+                    
+                    // 투영 지점에서 뼈와 Pole까지의 방향
+                    float3 dirToBone = bonePos - projectedPoint;
+                    float3 dirToPole = pole - projectedPoint;
+                    
+                    float distToBone = length(dirToBone);
+                    float distToPole = length(dirToPole);
+                    
+                    if(distToPole > 0.0001)
+                    {
+                        float3 targetDir = dirToPole / distToPole;
+                        // 무릎/팔꿈치 관절을 Pole 방향과 동일한 평면으로 이동
+                        Bones[k].position = projectedPoint + targetDir * distToBone;
+                    }
+
+                    // Pole 조향 후 다시 한 번 뼈의 길이를 강제 정정
+                    float3 d = Bones[k].position - Bones[k-1].position;
+                    Bones[k].position = Bones[k-1].position + normalize(d) * BoneLengths[k-1];
+                }
+            }
+        }
+    }
+}

@@ -32,6 +32,10 @@ namespace ComputeIK
         public float swayAmount = 0.1f;   // 보행 중 몸체의 좌우 흔들림 정도
         public float bounceAmount = 0.05f; // 보행 중 몸체의 상하 반동 정도
 
+        [Header("Predictive Steering")]
+        public int predictionSteps = 3;   // 미래 경로를 예측할 노드 수 (높을수록 부드럽지만 반응이 느려짐)
+        public float predictionStepDist = 0.2f; // 예측 노드 간의 간격 (미터)
+
         private Vector3 lastBodyPos;
         private Vector3 velocity;         // 이동 '의도'를 담는 속도 벡터
         
@@ -42,6 +46,7 @@ namespace ComputeIK
         
         private bool isLeftStepping;     // 현재 어느 발을 내디딜 차례인지 (교차 보행 관리)
         private bool isMoving;           // 현재 이동/회전 중인지 여부
+        private float rotationInput;      // 수집된 회전 입력값
 
         // Async Raycast Data
         private NativeArray<RaycastCommand> raycastCommands;
@@ -58,9 +63,10 @@ namespace ComputeIK
 
         void OnEnable()
         {
-            // 9개 레이: Body(0-2), FootL(3-5), FootR(6-8)
-            raycastCommands = new NativeArray<RaycastCommand>(9, Allocator.Persistent);
-            raycastResults = new NativeArray<RaycastHit>(9, Allocator.Persistent);
+            // Raycast Batch 크기: Body 예측(predictionSteps * 3) + FootL(3) + FootR(3)
+            int totalRays = (predictionSteps * 3) + 6;
+            raycastCommands = new NativeArray<RaycastCommand>(totalRays, Allocator.Persistent);
+            raycastResults = new NativeArray<RaycastHit>(totalRays, Allocator.Persistent);
         }
 
         void OnDisable()
@@ -84,36 +90,85 @@ namespace ComputeIK
 
         void Update()
         {
-            HandleMovement();
-
-            // [Raycast Batch Scheduling]
-            // 다음 프레임이나 LateUpdate에서 사용할 지면 정보를 미리 비동기로 요청합니다.
+            UpdateMovementIntent();
             PrepareRaycastBatch();
             raycastJobHandle = RaycastCommand.ScheduleBatch(raycastCommands, raycastResults, 1);
         }
 
         void LateUpdate()
         {
-            // 비동기 레이캐스트 작업 완료 대기 (이미 완료되었을 가능성이 높음)
             raycastJobHandle.Complete();
+            SynchPhysicsWithGait();
+        }
 
+        /// <summary>
+        /// 사용자 입력을 처리하고 이동 의도(Velocity)와 발 착지 예상 지점을 계산합니다.
+        /// </summary>
+        private void UpdateMovementIntent()
+        {
+            // 1. 입력 수집
+            float horizontal = 0;
+            float vertical = 0;
+            rotationInput = 0;
+
+            var keyboard = UnityEngine.InputSystem.Keyboard.current;
+            if (keyboard != null)
+            {
+                if (keyboard.wKey.isPressed) vertical += 1;
+                if (keyboard.sKey.isPressed) vertical -= 1;
+                if (keyboard.aKey.isPressed) horizontal -= 1;
+                if (keyboard.dKey.isPressed) horizontal += 1;
+                if (keyboard.qKey.isPressed) rotationInput -= 2f;
+                if (keyboard.eKey.isPressed) rotationInput += 2f;
+            }
+
+            var mouse = UnityEngine.InputSystem.Mouse.current;
+            if (mouse != null) rotationInput += mouse.delta.x.ReadValue() * 0.1f;
+
+            HandleMovement(horizontal, vertical);
+
+            // 2. 발걸음 감지용 목표 지점 미리 계산
             Vector3 myPos = transform.position;
+            Quaternion myRot = transform.rotation;
+            Vector3 strideDir = velocity.magnitude > 0.1f ? velocity.normalized : Vector3.zero;
             
-            // [Surface Resolution] 배치 결과 해석
-            SurfaceData bodySurface = ResolveSurfaceData(0); // Body Site index 0
-            if (bodySurface.isValid) {
-                targetNormal = bodySurface.normal;
+            desiredPosL = myPos + (myRot * Vector3.right * -stepSpacing) + (strideDir * stepLength);
+            desiredPosR = myPos + (myRot * Vector3.right * stepSpacing) + (strideDir * stepLength);
+        }
+
+        /// <summary>
+        /// 물리적 위치(지면 스냅)와 보행 애니메이션(발 고정)을 동기화합니다.
+        /// </summary>
+        private void SynchPhysicsWithGait()
+        {
+            Vector3 myPos = transform.position;
+            Vector3 myUp = transform.up;
+            
+            // [1. Body Continuous Movement]
+            Vector3 targetBodyPos = myPos + velocity * Time.deltaTime;
+
+            // [2. Predictive Surface Resolution]
+            SurfaceData predictiveSurface = ResolvePredictiveSurface(0, myPos);
+            if (predictiveSurface.isValid) {
+                targetNormal = predictiveSurface.normal;
+                targetBodyPos = predictiveSurface.point + targetNormal * bodyHeight;
             }
 
-            // [Normal Smoothing]
+            // [3. Smoothing & Rotation]
             currentNormal = Vector3.Slerp(currentNormal, targetNormal, Time.deltaTime * normalSmoothSpeed);
+            Quaternion alignmentRot = Quaternion.FromToRotation(myUp, currentNormal) * transform.rotation;
+            float finalRotation = rotationInput * turnSpeed * Time.deltaTime * 10f;
+            transform.rotation = alignmentRot * Quaternion.Euler(0, finalRotation, 0);
 
-            // [Surface Snapping] 
-            if (bodySurface.isValid) {
-                transform.position = Vector3.Lerp(myPos, bodySurface.point + currentNormal * bodyHeight, Time.deltaTime * 10f);
+            // [4. Apply Position]
+            if (predictiveSurface.isValid) {
+                if (Vector3.Distance(myPos, targetBodyPos) > 0.45f) transform.position = targetBodyPos;
+                else transform.position = Vector3.Lerp(myPos, targetBodyPos, Time.deltaTime * 20f);
+            } else {
+                transform.position = Vector3.Lerp(myPos, targetBodyPos, Time.deltaTime * 20f);
             }
 
-            // [Gait & Foot Persistence]
+            // [5. Gait & Zero-Slip]
             UpdateGait();
 
             if (!lStepping) footTargetL.position = currentFootPosL;
@@ -126,32 +181,16 @@ namespace ComputeIK
         /// WASD 입력을 받아 로봇의 이동 방향과 회전을 결정합니다.
         /// 전진 이동은 직접 transform을 수정하지 않고 velocity 변수에 의도만 저장합니다.
         /// </summary>
-        void HandleMovement()
+        void HandleMovement(float horizontal, float vertical)
         {
-            float horizontal = 0;
-            float vertical = 0;
-
-            // [New Input System] Keyboard 입력 처리
-            var keyboard = UnityEngine.InputSystem.Keyboard.current;
-            if (keyboard != null)
-            {
-                if (keyboard.wKey.isPressed) vertical += 1;
-                if (keyboard.sKey.isPressed) vertical -= 1;
-                if (keyboard.aKey.isPressed) horizontal -= 1;
-                if (keyboard.dKey.isPressed) horizontal += 1;
-            }
-
-            // [Move Direction Calculation]
             Vector3 myForward = transform.forward;
             Vector3 myRight = transform.right;
-            Vector3 myUp = transform.up;
 
             bool moving = vertical != 0 || horizontal != 0;
             isMoving = moving;
 
             if (moving)
             {
-                // W/S는 로컬 정면(forward), A/D는 로컬 측면(right) 이동 (Strafing)
                 Vector3 combinedMove = (myForward * vertical + myRight * horizontal).normalized;
                 Vector3 worldMoveDir = Vector3.ProjectOnPlane(combinedMove, currentNormal);
                 
@@ -159,36 +198,9 @@ namespace ComputeIK
                 {
                     velocity = worldMoveDir.normalized * moveSpeed;
                 }
-                else
-                {
-                    velocity = Vector3.zero;
-                }
+                else velocity = Vector3.zero;
             }
-            else
-            {
-                velocity = Vector3.zero;
-            }
-
-            // [Rotation Handling] 마우스 델타와 Q/E 키 입력을 결합
-            float rotationInput = 0;
-            
-            // 마우스 델타 (New Input System)
-            var mouse = UnityEngine.InputSystem.Mouse.current;
-            if (mouse != null) rotationInput += mouse.delta.x.ReadValue() * 0.1f;
-
-            // 키보드 Q/E (New Input System)
-            if (keyboard != null)
-            {
-                if (keyboard.qKey.isPressed) rotationInput -= 2f;
-                if (keyboard.eKey.isPressed) rotationInput += 2f;
-            }
-
-            // 표면 법선 정렬: 현재 up을 지면 법선에 맞춤
-            Quaternion alignmentRot = Quaternion.FromToRotation(myUp, currentNormal) * transform.rotation;
-            
-            // 회전 적용 (프레임 독립적으로 속도 계산)
-            float finalRotation = rotationInput * turnSpeed * Time.deltaTime * 10f;
-            transform.rotation = alignmentRot * Quaternion.Euler(0, finalRotation, 0);
+            else velocity = Vector3.zero;
 
             lastBodyPos = transform.position;
         }
@@ -199,14 +211,6 @@ namespace ComputeIK
         void UpdateGait()
         {
             if (IsStepping()) return;
-
-            Vector3 restingPosL = transform.position + (transform.rotation * Vector3.right * -stepSpacing);
-            Vector3 restingPosR = transform.position + (transform.rotation * Vector3.right * stepSpacing);
-
-            // Stride Direction 예측 (Update에서 계산된 velocity 사용)
-            Vector3 strideDir = velocity.magnitude > 0.1f ? velocity.normalized : Vector3.zero;
-            desiredPosL = restingPosL + (strideDir * stepLength);
-            desiredPosR = restingPosR + (strideDir * stepLength);
 
             float angleL = Vector3.Angle(transform.rotation * Vector3.left, (currentFootPosL - transform.position).normalized);
             float angleR = Vector3.Angle(transform.rotation * Vector3.right, (currentFootPosR - transform.position).normalized);
@@ -223,7 +227,8 @@ namespace ComputeIK
 
             if (isLeftStepping)
             {
-                SurfaceData footSurface = ResolveSurfaceData(1); // L Foot index 1
+                // 몸체 예측 노드 이후의 index가 발 위치 데이터임
+                SurfaceData footSurface = ResolvePredictiveSurface(predictionSteps, desiredPosL);
                 bool wantToMove = velocity.magnitude > 0.1f;
                 bool tooRotated = angleL > stepAngle;
                 bool crossed = Vector3.Dot(transform.rotation * Vector3.right, (currentFootPosL - transform.position).normalized) > 0.15f;
@@ -237,7 +242,7 @@ namespace ComputeIK
             }
             else
             {
-                SurfaceData footSurface = ResolveSurfaceData(2); // R Foot index 2
+                SurfaceData footSurface = ResolvePredictiveSurface(predictionSteps + 1, desiredPosR);
                 bool wantToMove = velocity.magnitude > 0.1f;
                 bool tooRotated = angleR > stepAngle;
                 bool crossed = Vector3.Dot(transform.rotation * Vector3.left, (currentFootPosR - transform.position).normalized) > 0.15f;
@@ -262,49 +267,32 @@ namespace ComputeIK
         /// </summary>
         IEnumerator MoveFoot(bool left, Vector3 targetFootPos, float duration)
         {
-            if (left) { if (rStepping) yield break; lStepping = true; }
-            else { if (lStepping) yield break; rStepping = true; }
+            if (left) lStepping = true;
+            else rStepping = true;
 
             Vector3 startFootPos = left ? currentFootPosL : currentFootPosR;
-            Vector3 startBodyPos = transform.position;
-            
-            // 몸체 이동 거리 계산 (한 스텝당 보폭의 절반만큼 몸체가 전진함)
-            Vector3 bodyMoveOffset = Vector3.zero;
-            if (velocity.magnitude > 0.1f) {
-                bodyMoveOffset = velocity.normalized * (stepLength * 0.5f);
-            }
-
             float elapsed = 0;
 
             while (elapsed < duration)
             {
                 elapsed += Time.deltaTime;
-                float t = elapsed / duration;
-                float easedT = EaseInOutSine(t); // 움직임을 자연스럽게 만드는 가감속 처리
+                float t = Mathf.Clamp01(elapsed / duration);
+                float easedT = EaseInOutSine(t);
+
+                // [Foot Trajectory] 포물선 궤적으로 발 이동
+                Vector3 footPos = Vector3.Lerp(startFootPos, targetFootPos, easedT);
+                footPos += currentNormal * Mathf.Sin(t * Mathf.PI) * stepHeight;
                 
-                // [Root Sync] 발이 공중에 떠 있는 동안 몸체를 같이 이동시킵니다.
-                // 지면에 붙어 있는 Anchor 발은 월드 좌표계에서 그대로 유지되어 미끄러짐이 발생하지 않습니다.
-                if (bodyMoveOffset != Vector3.zero) {
-                    transform.position = Vector3.Lerp(startBodyPos, startBodyPos + bodyMoveOffset, easedT);
+                if (left) { 
+                    currentFootPosL = footPos; 
+                    footTargetL.position = footPos;
+                } else { 
+                    currentFootPosR = footPos; 
+                    footTargetR.position = footPos;
                 }
 
-                // 포물선 궤적으로 발의 위치 보간
-                Vector3 currentPos = Vector3.Lerp(startFootPos, targetFootPos, easedT);
-                currentPos.y += Mathf.Sin(t * Mathf.PI) * stepHeight;
-                
-                if (left) {
-                    currentFootPosL = currentPos;
-                    footTargetL.position = currentPos;
-                } else {
-                    currentFootPosR = currentPos;
-                    footTargetR.position = currentPos;
-                }
-                
                 yield return null;
             }
-
-            // 오차 보정을 위한 최종 위치 강제 지정
-            if (bodyMoveOffset != Vector3.zero) transform.position = startBodyPos + bodyMoveOffset;
 
             if (left) { 
                 currentFootPosL = targetFootPos; 
@@ -317,16 +305,64 @@ namespace ComputeIK
             }
         }
 
-        // 배치 데이터 해석 유틸리티
-        private SurfaceData ResolveSurfaceData(int siteIndex)
+        // N-Step 예측 지형 해석 유틸리티 (가중치 평균 법선 산출)
+        private SurfaceData ResolvePredictiveSurface(int startSiteIndex, Vector3 currentPos)
         {
+            raycastJobHandle.Complete();
+
+            Vector3 blendedNormal = Vector3.zero;
+            Vector3 averagePoint = currentPos;
+            bool anyValid = false;
+            float totalWeight = 0;
+
+            // 각 예측 노드의 데이터를 순회하며 가중치 블렌딩
+            for (int i = 0; i < predictionSteps; i++)
+            {
+                SurfaceData stepSD = ResolveSurfaceData(startSiteIndex + i, currentPos);
+                if (stepSD.isValid)
+                {
+                    // 현재 위치와 가까울수록 높은 가중치 (1.0 -> 0.2 등)
+                    float weight = 1.0f / (i + 1);
+                    
+                    // 만약 미래 노드에서 벽(Wall)이 감지되면 가중치를 대폭 높여 미리 대비함
+                    if (Vector3.Angle(Vector3.up, stepSD.normal) > 45f) weight *= 2.0f;
+                    
+                    blendedNormal += stepSD.normal * weight;
+                    if (i == 0) averagePoint = stepSD.point; // 위치는 현재 지점 위주로
+                    
+                    totalWeight += weight;
+                    anyValid = true;
+                }
+            }
+
+            SurfaceData res = new SurfaceData { isValid = anyValid };
+            if (anyValid)
+            {
+                res.normal = (blendedNormal / totalWeight).normalized;
+                res.point = averagePoint;
+            }
+            else
+            {
+                res.normal = transform.up;
+                res.point = currentPos;
+            }
+            return res;
+        }
+
+        private SurfaceData ResolveSurfaceData(int siteIndex, Vector3 siteOrigin)
+        {
+            // 비동기 작업 완료 보장 (코루틴 등에서 호출 시)
+            raycastJobHandle.Complete();
+            
             int baseIdx = siteIndex * 3;
+            if (baseIdx + 2 >= raycastResults.Length) return new SurfaceData { isValid = false };
             RaycastHit floorHit = raycastResults[baseIdx];
             RaycastHit wallHit = raycastResults[baseIdx + 1];
             RaycastHit edgeHit = raycastResults[baseIdx + 2];
 
             bool hasFloor = floorHit.collider != null;
-            bool hasWall = wallHit.collider != null && Vector3.Angle(transform.up, wallHit.normal) > 40f;
+            // 캐릭터의 회전 상태가 아닌, 실제 지면들 사이의 각도차이를 계산하여 전환 중의 Jitter 방지
+            bool hasWall = wallHit.collider != null && (!hasFloor || Vector3.Angle(floorHit.normal, wallHit.normal) > 35f);
             bool hasEdge = edgeHit.collider != null;
 
             SurfaceData sd = new SurfaceData { isValid = true };
@@ -334,9 +370,16 @@ namespace ComputeIK
 
             if (hasWall)
             {
-                float dWall = Vector3.Distance(myPos, wallHit.point);
-                float dFloor = hasFloor ? Vector3.Distance(myPos, floorHit.point) : float.MaxValue;
-                if (dWall < dFloor + 0.15f) { sd.point = wallHit.point; sd.normal = wallHit.normal; return sd; }
+                float dWall = Vector3.Distance(siteOrigin, wallHit.point);
+                float dFloor = hasFloor ? Vector3.Distance(siteOrigin, floorHit.point) : float.MaxValue;
+                
+                // [Transition Bias] 벽이 충분히 근처에 있다면(0.35f) 바닥보다 우선순위를 높임
+                if (dWall < dFloor + 0.35f) 
+                { 
+                    sd.point = wallHit.point; 
+                    sd.normal = wallHit.normal; 
+                    return sd; 
+                }
             }
             if (hasEdge) { sd.point = edgeHit.point; sd.normal = edgeHit.normal; return sd; }
             if (hasFloor) { sd.point = floorHit.point; sd.normal = floorHit.normal; return sd; }
@@ -347,18 +390,67 @@ namespace ComputeIK
             return sd;
         }
 
-        // 비동기 레이캐스트 명령 준비
+        // 비동기 레이캐스트 명령 준비 (N-Step 경로 예측 포함)
         private void PrepareRaycastBatch()
         {
-            Vector3 myUp = transform.up;
+            Vector3 refUp = currentNormal;
             Vector3 myForward = transform.forward;
             Vector3 moveDir = velocity.sqrMagnitude > 0.0001f ? velocity.normalized : myForward;
             float dynamicOffset = velocity.sqrMagnitude > 0.0001f ? detectionOffset : 0f;
 
-            // Site 0: Body, Site 1: FootL, Site 2: FootR
-            SetupProbeCommands(0, transform.position, myUp, moveDir, dynamicOffset);
-            SetupProbeCommands(1, desiredPosL, myUp, moveDir, dynamicOffset);
-            SetupProbeCommands(2, desiredPosR, myUp, moveDir, dynamicOffset);
+            // 1. 몸체 경로 예측 노드들 (Site 0 ~ N-1)
+            for (int i = 0; i < predictionSteps; i++)
+            {
+                Vector3 predictPos = transform.position + (moveDir * i * predictionStepDist);
+                SetupProbeCommands(i, predictPos, refUp, moveDir, dynamicOffset);
+            }
+
+            // 2. 발 목표 지점들 (Body 이후 index 사용)
+            int footL_Idx = predictionSteps;
+            int footR_Idx = predictionSteps + 1;
+            SetupProbeCommands(footL_Idx, desiredPosL, refUp, moveDir, dynamicOffset);
+            SetupProbeCommands(footR_Idx, desiredPosR, refUp, moveDir, dynamicOffset);
+        }
+
+        // [Debug Visualization]
+        void OnDrawGizmos()
+        {
+            if (!Application.isPlaying) return;
+
+            // 1. 예측 경로 (Predictive Path)
+            Gizmos.color = Color.cyan;
+            Vector3 refUp = currentNormal;
+            Vector3 moveDir = velocity.sqrMagnitude > 0.0001f ? velocity.normalized : transform.forward;
+            
+            // 비동기 작업 중이 아닐 때만 정확한 비주얼이 가능 (Job이 완료된 시점)
+            if (raycastJobHandle.IsCompleted)
+            {
+                // Body Nodes
+                for (int i = 0; i < predictionSteps; i++)
+                {
+                    SurfaceData sd = ResolveSurfaceData(i, Vector3.zero); // Origin은 Debug용이라 크게 중요치 않음
+                    if (sd.isValid)
+                    {
+                        // 벽이면 빨간색, 평지면 초록색
+                        bool isWall = Vector3.Angle(Vector3.up, sd.normal) > 45f;
+                        Gizmos.color = isWall ? Color.red : Color.green;
+                        Gizmos.DrawWireSphere(sd.point, 0.1f);
+                        Gizmos.DrawLine(sd.point, sd.point + sd.normal * 0.5f);
+                    }
+                    else
+                    {
+                        // Raycast 실패 시 예측 위치만 표시
+                        Gizmos.color = Color.gray;
+                        Vector3 pPos = transform.position + (moveDir * i * predictionStepDist);
+                        Gizmos.DrawWireSphere(pPos, 0.05f);
+                    }
+                }
+            }
+
+            // 2. 발 IK 타겟
+            Gizmos.color = Color.blue;
+            Gizmos.DrawWireCube(footTargetL.position, Vector3.one * 0.1f);
+            Gizmos.DrawWireCube(footTargetR.position, Vector3.one * 0.1f);
         }
 
         private void SetupProbeCommands(int siteIndex, Vector3 pos, Vector3 up, Vector3 moveDir, float offset)
@@ -370,11 +462,14 @@ namespace ComputeIK
             Vector3 floorOrigin = pos + (up * 1f) + (moveDir * offset);
             raycastCommands[baseIdx] = new RaycastCommand(floorOrigin, -up, 3f, mask);
 
-            // 2. Wall
-            float wallDist = detectionOffset * 1.5f;
-            raycastCommands[baseIdx + 1] = new RaycastCommand(pos, moveDir, wallDist, mask);
+            // 2. Wall (진행 방향 앞쪽 감지)
+            // 검사 거리를 충분히 확보하여 고속 주행 시에도 벽을 미리 감지 (1.5m)
+            float wallDist = 1.5f;
+            // 레이 발사 지점을 약간 뒤(-0.15f)와 위(+0.15f)에서 시작하여 이미 근접한 벽도 놓치지 않게 함
+            Vector3 wallOrigin = pos + up * 0.15f - moveDir * 0.15f;
+            raycastCommands[baseIdx + 1] = new RaycastCommand(wallOrigin, moveDir, wallDist, mask);
 
-            // 3. Edge
+            // 3. Edge (낭떠러지/외각 모서리 감지)
             Vector3 probeOrigin = pos + moveDir * (detectionOffset * 1.2f) + up * -1.0f;
             raycastCommands[baseIdx + 2] = new RaycastCommand(probeOrigin, -moveDir, detectionOffset * 1.5f, mask);
         }
@@ -388,7 +483,7 @@ namespace ComputeIK
         }
 
         // 기존 GetGroundPos를 동기식 레거시로 유지 (필요 시)
-        private SurfaceData GetGroundPos(Vector3 pos) => ResolveSurfaceData(0); 
+        private SurfaceData GetGroundPos(Vector3 pos) => ResolveSurfaceData(0, pos); 
 
         // 사인 곡선을 이용한 입출력 가속 보간
         float EaseInOutSine(float x) => -(Mathf.Cos(Mathf.PI * x) - 1) / 2;

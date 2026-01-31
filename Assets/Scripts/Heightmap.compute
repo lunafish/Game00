@@ -1,0 +1,63 @@
+#pragma kernel CSMain
+
+// 정점 데이터 구조체
+struct VertexData {
+    float3 position;
+    float3 normal;
+};
+
+RWStructuredBuffer<VertexData> Vertices;
+
+float scale;
+float heightMultiplier;
+float3 offset;
+int octaves;
+float persistence;
+
+// Hash function for noise
+float hash(float3 p) {
+    p = frac(p * 0.3183099 + 0.1);
+    p *= 17.0;
+    return frac(p.x * p.y * p.z * (p.x + p.y + p.z));
+}
+
+// 3D Noise function (Interpolated)
+float noise(float3 x) {
+    float3 i = floor(x);
+    float3 f = frac(x);
+    f = f * f * (3.0 - 2.0 * f);
+
+    return lerp(lerp(lerp(hash(i + float3(0, 0, 0)), hash(i + float3(1, 0, 0)), f.x),
+                   lerp(hash(i + float3(0, 1, 0)), hash(i + float3(1, 1, 0)), f.x), f.y),
+               lerp(lerp(hash(i + float3(0, 0, 1)), hash(i + float3(1, 0, 1)), f.x),
+                   lerp(hash(i + float3(0, 1, 1)), hash(i + float3(1, 1, 1)), f.x), f.y), f.z);
+}
+
+// Fractal Brownian Motion (FBM) for more detailed "굴곡"
+float fbm(float3 p) {
+    float total = 0.0;
+    float amplitude = 1.0;
+    float frequency = 1.0;
+    float maxValue = 0.0;
+    for(int i = 0; i < octaves; i++) {
+        total += noise(p * frequency) * amplitude;
+        maxValue += amplitude;
+        amplitude *= persistence;
+        frequency *= 2.0;
+    }
+    return total / maxValue;
+}
+
+[numthreads(64, 1, 1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    float3 pos = Vertices[id.x].position;
+    float3 norm = Vertices[id.x].normal;
+    
+    // FBM 노이즈를 사용하여 법선 방향으로 변위 적용
+    // 0~1 사이의 값을 -1~1 또는 0~1로 가공하여 굴곡 표현
+    float n = fbm((pos + offset) * scale);
+    float displacement = (n - 0.5) * 2.0 * heightMultiplier;
+    
+    Vertices[id.x].position = pos + norm * displacement;
+}

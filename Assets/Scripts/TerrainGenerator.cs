@@ -8,10 +8,7 @@ public class TerrainGenerator : MonoBehaviour
     public ComputeShader heightmapCompute;
     public Mesh baseMesh; 
     
-    public enum TerrainType { Plane, Cube }
-    
     [Header("Generation Settings")]
-    public TerrainType terrainType = TerrainType.Plane;
     public int resolution = 50; 
     public float size = 10f;
 
@@ -45,10 +42,11 @@ public class TerrainGenerator : MonoBehaviour
         }
 
         Mesh sourceMesh = baseMesh;
-        if (sourceMesh == null || (terrainType != TerrainType.Plane && resolution > 10) || (terrainType == TerrainType.Plane && resolution > 10)) // 자동 생성 조건
+        
+        // baseMesh가 없거나 해상도 자동 생성 조건일 경우 Plane 생성
+        if (sourceMesh == null || resolution > 10) 
         {
-            if (terrainType == TerrainType.Plane) sourceMesh = CreateSubdividedPlane(resolution, size);
-            else sourceMesh = CreateSubdividedCube(resolution, size);
+            sourceMesh = CreateSubdividedPlane(resolution, size);
         }
 
         Vector3[] vertices = sourceMesh.vertices;
@@ -134,53 +132,6 @@ public class TerrainGenerator : MonoBehaviour
         mesh.vertices = verts.ToArray();
         mesh.uv = uvs.ToArray();
         mesh.triangles = tris.ToArray();
-        mesh.RecalculateNormals();
-        return mesh;
-    }
-
-    // 고해상도 박스(방) 메쉬 생성 - 벽 타기 테스트용
-    Mesh CreateSubdividedCube(int res, float size)
-    {
-        Mesh mesh = new Mesh();
-        mesh.name = "Subdivided Cube";
-        List<Vector3> verts = new List<Vector3>();
-        List<int> tris = new List<int>();
-        List<Vector2> uvs = new List<Vector2>();
-
-        Vector3[] faceNormals = { Vector3.up, Vector3.down, Vector3.left, Vector3.right, Vector3.forward, Vector3.back };
-
-        foreach (Vector3 normal in faceNormals)
-        {
-            Vector3 side1 = new Vector3(normal.y, normal.z, normal.x);
-            Vector3 side2 = Vector3.Cross(normal, side1);
-            int vOffset = verts.Count;
-
-            for (int y = 0; y < res; y++)
-            {
-                for (int x = 0; x < res; x++)
-                {
-                    float tx = (float)x / (res - 1);
-                    float ty = (float)y / (res - 1);
-                    Vector3 p = normal * 0.5f + (tx - 0.5f) * side1 + (ty - 0.5f) * side2;
-                    verts.Add(p * size);
-                    uvs.Add(new Vector2(tx, ty));
-                }
-            }
-
-            for (int y = 0; y < res - 1; y++)
-            {
-                for (int x = 0; x < res - 1; x++)
-                {
-                    int i = vOffset + x + y * res;
-                    tris.Add(i); tris.Add(i + res); tris.Add(i + res + 1);
-                    tris.Add(i); tris.Add(i + res + 1); tris.Add(i + 1);
-                }
-            }
-        }
-
-        mesh.vertices = verts.ToArray();
-        mesh.triangles = tris.ToArray();
-        mesh.uv = uvs.ToArray();
         mesh.RecalculateNormals();
         return mesh;
     }

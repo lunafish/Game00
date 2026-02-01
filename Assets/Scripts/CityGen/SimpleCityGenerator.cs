@@ -3,6 +3,7 @@ using UnityEngine;
 
 namespace CityGen
 {
+    [RequireComponent(typeof(MeshFilter), typeof(MeshRenderer))]
     public class SimpleCityGenerator : MonoBehaviour
     {
         [Header("Subdivision Settings")]
@@ -12,6 +13,12 @@ namespace CityGen
         [Range(0, 0.4f)] public float splitJitter = 0.1f;
         [Range(0, 5f)] public float nodeJitter = 1.0f;
         public int maxDepth = 5;
+
+        [Header("Mesh Settings")]
+        public float roadWidth = 2.0f;
+        [Range(0.001f, 2.0f)] public float weldTolerance = 2.0f;
+        public MeshFilter meshFilter;
+        public MeshRenderer meshRenderer;
 
         // Graph Data
         protected List<Vector3> nodes = new List<Vector3>();
@@ -34,6 +41,7 @@ namespace CityGen
         [ContextMenu("Generate")]
         public void Generate()
         {
+            SetupComponents();
             ClearGraph();
             Random.InitState(seed);
 
@@ -50,6 +58,9 @@ namespace CityGen
 
             // Final Adjacency Rebuild (since we might have split segments)
             RebuildAdjacency();
+
+            // 4. Mesh Generation
+            GenerateMesh();
 
             Debug.Log($"Subdivision complete: {nodes.Count} nodes, {uniqueSegments.Count} segments.");
         }
@@ -238,6 +249,215 @@ namespace CityGen
                 return true;
             }
             return false;
+        }
+
+        private void GenerateMesh()
+        {
+            if (meshFilter == null) return;
+
+            // --- PASS 1: Roads Only ---
+            List<Vector3> roadVerts = new List<Vector3>();
+            List<Color> roadColors = new List<Color>();
+            List<int> roadTris = new List<int>();
+
+            foreach (var seg in uniqueSegments)
+            {
+                GenerateRoadMesh(seg, roadVerts, roadColors, roadTris);
+            }
+
+            Mesh roadMesh = new Mesh();
+            roadMesh.vertices = roadVerts.ToArray();
+            roadMesh.colors = roadColors.ToArray();
+            roadMesh.SetTriangles(roadTris.ToArray(), 0);
+
+            // Weld roads first to get stable intersection points
+            WeldVertices(roadMesh, false); 
+            
+            // Get the welded road data
+            List<Vector3> finalVerts = new List<Vector3>(roadMesh.vertices);
+            List<Color> finalColors = new List<Color>(roadMesh.colors);
+            List<int> finalTris = new List<int>(roadMesh.GetTriangles(0));
+
+            // --- PASS 2: Junctions Snapped to Welded Roads ---
+            int roadVertexCount = finalVerts.Count;
+            for (int i = 0; i < nodes.Count; i++)
+            {
+                GenerateJunctionMeshSnapped(i, finalVerts, finalColors, finalTris, roadVertexCount);
+            }
+
+            // Create Final Mesh
+            Mesh mesh = new Mesh();
+            mesh.name = "CityNetwork_SnappedJunctions";
+            mesh.vertices = finalVerts.ToArray();
+            mesh.colors = finalColors.ToArray();
+            mesh.SetTriangles(finalTris.ToArray(), 0);
+
+            // Final welding pass to connect junctions to roads
+            WeldVertices(mesh, true);
+
+            mesh.RecalculateNormals();
+            mesh.RecalculateBounds();
+            meshFilter.mesh = mesh;
+        }
+
+        private void SetupComponents()
+        {
+            if (meshFilter == null) meshFilter = GetComponent<MeshFilter>();
+            if (meshFilter == null) meshFilter = gameObject.AddComponent<MeshFilter>();
+
+            if (meshRenderer == null) meshRenderer = GetComponent<MeshRenderer>();
+            if (meshRenderer == null) meshRenderer = gameObject.AddComponent<MeshRenderer>();
+
+            // Ensure we have a proper URP Lit material for the road mesh
+            if (meshRenderer.sharedMaterials == null || meshRenderer.sharedMaterials.Length < 1 || meshRenderer.sharedMaterials[0] == null)
+            {
+                Shader urpLit = Shader.Find("Universal Render Pipeline/Lit");
+                if (urpLit == null) urpLit = Shader.Find("Standard");
+
+                Material m = new Material(urpLit);
+                m.name = "Road_URP_Lit";
+                m.color = new Color(0.2f, 0.2f, 0.2f); // Dark road surface
+                
+                // URP Lit properties (if using URP)
+                if (urpLit.name.Contains("Universal Render Pipeline"))
+                {
+                    m.SetFloat("_Roughness", 0.8f);
+                    m.SetFloat("_Metallic", 0.0f);
+                }
+                
+                meshRenderer.sharedMaterials = new Material[] { m };
+            }
+        }
+
+        private void GenerateRoadMesh(RoadSegment seg, List<Vector3> verts, List<Color> colors, List<int> tris)
+        {
+            Vector3 pA = nodes[seg.a];
+            Vector3 pB = nodes[seg.b];
+            float dist = Vector3.Distance(pA, pB);
+            
+            if (dist < roadWidth * 1.1f) return;
+
+            Vector3 dir = (pB - pA) / dist;
+            Vector3 side = new Vector3(-dir.z, 0, dir.x) * (roadWidth / 2f);
+            
+            // Re-applying offsets to road ends
+            float offset = roadWidth / 2f;
+            Vector3 startP = pA + dir * offset;
+            Vector3 endP = pB - dir * offset;
+
+            Color roadColor = Color.white;
+            int startIdx = verts.Count;
+            
+            verts.Add(startP - side); colors.Add(roadColor); // 0
+            verts.Add(startP + side); colors.Add(roadColor); // 1
+            verts.Add(endP + side);   colors.Add(roadColor); // 2
+            verts.Add(endP - side);   colors.Add(roadColor); // 3
+
+            tris.Add(startIdx + 0); tris.Add(startIdx + 1); tris.Add(startIdx + 2);
+            tris.Add(startIdx + 0); tris.Add(startIdx + 2); tris.Add(startIdx + 3);
+        }
+
+        private void GenerateJunctionMeshSnapped(int nodeIdx, List<Vector3> verts, List<Color> colors, List<int> tris, int roadVertexCount)
+        {
+            if (adjacency[nodeIdx].Count == 0) return;
+
+            Vector3 center = nodes[nodeIdx];
+            float hw = roadWidth / 2f;
+            Color col = Color.white;
+            int startIdx = verts.Count;
+
+            // 1. Define base square corners
+            Vector3[] baseCorners = new Vector3[]
+            {
+                center + new Vector3(-hw, 0, -hw), // BL
+                center + new Vector3(-hw, 0,  hw), // TL
+                center + new Vector3( hw, 0,  hw), // TR
+                center + new Vector3( hw, 0, -hw)  // BR
+            };
+
+            // 2. Snap corners to nearest road vertices
+            // We search through the existing road vertices (Pass 1)
+            for (int i = 0; i < 4; i++)
+            {
+                Vector3 snappedPos = baseCorners[i];
+                float minDist = roadWidth * 0.4f; // Allow snapping up to 40% of road width
+                
+                for (int vIdx = 0; vIdx < roadVertexCount; vIdx++) 
+                {
+                    float d = Vector3.Distance(baseCorners[i], verts[vIdx]);
+                    if (d < minDist)
+                    {
+                        minDist = d;
+                        snappedPos = verts[vIdx];
+                    }
+                }
+                verts.Add(snappedPos);
+                colors.Add(col);
+            }
+
+            // CW Winding
+            tris.Add(startIdx + 0); tris.Add(startIdx + 1); tris.Add(startIdx + 2);
+            tris.Add(startIdx + 0); tris.Add(startIdx + 2); tris.Add(startIdx + 3);
+        }
+
+        private void WeldVertices(Mesh mesh, bool logResult = true)
+        {
+            Vector3[] oldVerts = mesh.vertices;
+            Color[] oldColors = mesh.colors;
+            List<Vector3> newVerts = new List<Vector3>();
+            List<Color> newColors = new List<Color>();
+            
+            int submeshCount = mesh.subMeshCount;
+            List<int[]> newSubmeshTris = new List<int[]>();
+            
+            // Scaled quantization to allow stable floating point comparison
+            float invTol = 1f / Mathf.Max(0.001f, weldTolerance);
+            Dictionary<Vector3Int, int> weldMap = new Dictionary<Vector3Int, int>();
+
+            for (int subIdx = 0; subIdx < submeshCount; subIdx++)
+            {
+                int[] oldTris = mesh.GetTriangles(subIdx);
+                int[] newTris = new int[oldTris.Length];
+
+                for (int i = 0; i < oldTris.Length; i++)
+                {
+                    int oldVIdx = oldTris[i];
+                    Vector3 pos = oldVerts[oldVIdx];
+                    
+                    Vector3Int qPos = new Vector3Int(
+                        Mathf.RoundToInt(pos.x * invTol),
+                        Mathf.RoundToInt(pos.y * invTol),
+                        Mathf.RoundToInt(pos.z * invTol)
+                    );
+
+                    if (!weldMap.TryGetValue(qPos, out int newVIdx))
+                    {
+                        newVIdx = newVerts.Count;
+                        newVerts.Add(pos);
+                        newColors.Add(oldColors.Length > oldVIdx ? oldColors[oldVIdx] : Color.white);
+                        weldMap.Add(qPos, newVIdx);
+                    }
+                    newTris[i] = newVIdx;
+                }
+                newSubmeshTris.Add(newTris);
+            }
+
+            mesh.Clear();
+            mesh.vertices = newVerts.ToArray();
+            mesh.colors = newColors.ToArray();
+            mesh.subMeshCount = submeshCount;
+            for (int i = 0; i < submeshCount; i++)
+            {
+                mesh.SetTriangles(newSubmeshTris[i], i);
+            }
+
+            if (logResult)
+            {
+                int originalCount = oldVerts.Length;
+                int weldedCount = newVerts.Count;
+                float reduction = originalCount > 0 ? (1f - (float)weldedCount / originalCount) * 100f : 0f;
+                Debug.Log($"[Mesh Optimization] Welding complete: {originalCount} -> {weldedCount} vertices ({reduction:F1}% reduction)");
+            }
         }
 
         protected void ClearGraph()

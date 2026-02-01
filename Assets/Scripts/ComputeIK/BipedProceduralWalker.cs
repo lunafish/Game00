@@ -101,39 +101,116 @@ namespace ComputeIK
             SynchPhysicsWithGait();
         }
 
+        public Transform referenceCamera; // [New] Camera reference for relative movement
+
         /// <summary>
         /// 사용자 입력을 처리하고 이동 의도(Velocity)와 발 착지 예상 지점을 계산합니다.
         /// </summary>
         private void UpdateMovementIntent()
         {
-            // 1. 입력 수집
-            float horizontal = 0;
-            float vertical = 0;
-            rotationInput = 0;
+            if (referenceCamera == null)
+            {
+                if (Camera.main != null) referenceCamera = Camera.main.transform;
+                else return; 
+            }
+
+            // 1. 입력 수집 (Input Gathering)
+            float moveX = 0;      // A/D
+            float moveZ = 0;      // W/S
+            float strafeInput = 0; // Q/E
+            
+            rotationInput = 0; 
 
             var keyboard = UnityEngine.InputSystem.Keyboard.current;
             if (keyboard != null)
             {
-                if (keyboard.wKey.isPressed) vertical += 1;
-                if (keyboard.sKey.isPressed) vertical -= 1;
-                if (keyboard.aKey.isPressed) horizontal -= 1;
-                if (keyboard.dKey.isPressed) horizontal += 1;
-                if (keyboard.qKey.isPressed) rotationInput -= 2f;
-                if (keyboard.eKey.isPressed) rotationInput += 2f;
+                if (keyboard.wKey.isPressed) moveZ += 1;
+                if (keyboard.sKey.isPressed) moveZ -= 1;
+                if (keyboard.aKey.isPressed) moveX -= 1;
+                if (keyboard.dKey.isPressed) moveX += 1;
+                
+                if (keyboard.qKey.isPressed) strafeInput -= 1;
+                if (keyboard.eKey.isPressed) strafeInput += 1;
             }
 
-            var mouse = UnityEngine.InputSystem.Mouse.current;
-            if (mouse != null) rotationInput += mouse.delta.x.ReadValue() * 0.1f;
+            // 2. 통합 이동 처리 (Optimized Movement Logic)
+            HandleMovementCameraRelative(moveX, moveZ, strafeInput);
 
-            HandleMovement(horizontal, vertical);
-
-            // 2. 발걸음 감지용 목표 지점 미리 계산
+            // 3. 발걸음 감지용 목표 지점 미리 계산
             Vector3 myPos = transform.position;
             Quaternion myRot = transform.rotation;
             Vector3 strideDir = velocity.magnitude > 0.1f ? velocity.normalized : Vector3.zero;
             
             desiredPosL = myPos + (myRot * Vector3.right * -stepSpacing) + (strideDir * stepLength);
             desiredPosR = myPos + (myRot * Vector3.right * stepSpacing) + (strideDir * stepLength);
+        }
+
+        /// <summary>
+        /// 카메라 기준 입력 처리 (최적화 버전)
+        /// </summary>
+        void HandleMovementCameraRelative(float moveX, float moveZ, float strafeInput)
+        {
+            // [Basis Calculation]
+            // Build a robust Orthogonal Basis (Right, Forward) on the current surface.
+            Vector3 surfRight = Vector3.ProjectOnPlane(referenceCamera.right, currentNormal).normalized;
+            Vector3 surfFwd;
+
+            // Singularity Check: If Camera Right aligns with Normal (e.g., wall run), projection fails.
+            if (surfRight.sqrMagnitude < 0.001f)
+            {
+                // Fallback: Project Forward vector first
+                surfFwd = Vector3.ProjectOnPlane(referenceCamera.forward, currentNormal).normalized;
+                // Reconstruct Right from Forward x Normal
+                surfRight = Vector3.Cross(currentNormal, surfFwd).normalized;
+            }
+            else
+            {
+                // Standard: Derive Forward from Right x Normal
+                // This guarantees 'Screen Up' maps to 'Surface Upward' (Fixes inverted vertical movement)
+                surfFwd = Vector3.Cross(surfRight, currentNormal).normalized;
+            }
+
+            // [Input Combination]
+            // Merge lateral inputs (MoveX + Strafe) before vector math
+            float finalX = moveX + strafeInput;
+            
+            Vector3 targetMoveDir = (surfFwd * moveZ) + (surfRight * finalX);
+            
+            if (targetMoveDir.sqrMagnitude > 1f) targetMoveDir.Normalize();
+            
+            isMoving = targetMoveDir.sqrMagnitude > 0.0001f;
+            velocity = isMoving ? targetMoveDir * moveSpeed : Vector3.zero;
+
+            // [Rotation Logic]
+            // Strafe (Q/E) -> Look at Camera Forward (Surface projected)
+            // Move (WASD) -> Look at Movement Direction
+            if (Mathf.Abs(strafeInput) > 0.01f)
+            {
+                RotateTowards(surfFwd);
+            }
+            else if (isMoving)
+            {
+                RotateTowards(targetMoveDir);
+            }
+            
+            lastBodyPos = transform.position;
+        }
+
+        private void RotateTowards(Vector3 dir)
+        {
+            if (dir.sqrMagnitude < 0.001f) return;
+            
+            Quaternion targetRot = Quaternion.LookRotation(dir, currentNormal);
+            // SynchPhysicsWithGait에서 덮어쓰지 않도록 'rotationInput' 의존성을 줄이거나,
+            // 여기서 직접 보간 회전을 수행함. 
+            // 단, SynchPhysicsWithGait의 161라인(alignment)과 충돌 가능성 있음.
+            
+            // 해결책: SynchPhysicsWithGait에서는 지면 경사(Alignment)만 맞추고, Y축 회전은 여기서 결정된 값을 사용하도록 변경 필요.
+            // 일단 부드럽게 보간
+            float step = turnSpeed * Time.deltaTime * 5f;
+            transform.rotation = Quaternion.Slerp(transform.rotation, targetRot, step);
+            
+            // SynchPhysicsWithGait의 rotationInput 영향을 상쇄하기 위해 0으로 유지 (위에서 초기화함)
         }
 
         /// <summary>
@@ -156,9 +233,11 @@ namespace ComputeIK
 
             // [3. Smoothing & Rotation]
             currentNormal = Vector3.Slerp(currentNormal, targetNormal, Time.deltaTime * normalSmoothSpeed);
-            Quaternion alignmentRot = Quaternion.FromToRotation(myUp, currentNormal) * transform.rotation;
-            float finalRotation = rotationInput * turnSpeed * Time.deltaTime * 10f;
-            transform.rotation = alignmentRot * Quaternion.Euler(0, finalRotation, 0);
+            
+            // [Modified] Rotation is now handled by UpdateMovementIntent -> RotateTowards.
+            // We only align the Up-vector to the terrain normal here.
+            Quaternion alignmentRot = Quaternion.FromToRotation(transform.up, currentNormal) * transform.rotation;
+            transform.rotation = alignmentRot;
 
             // [4. Apply Position]
             if (predictiveSurface.isValid) {
@@ -175,34 +254,6 @@ namespace ComputeIK
             if (!rStepping) footTargetR.position = currentFootPosR;
             
             ApplyBodySway();
-        }
-
-        /// <summary>
-        /// WASD 입력을 받아 로봇의 이동 방향과 회전을 결정합니다.
-        /// 전진 이동은 직접 transform을 수정하지 않고 velocity 변수에 의도만 저장합니다.
-        /// </summary>
-        void HandleMovement(float horizontal, float vertical)
-        {
-            Vector3 myForward = transform.forward;
-            Vector3 myRight = transform.right;
-
-            bool moving = vertical != 0 || horizontal != 0;
-            isMoving = moving;
-
-            if (moving)
-            {
-                Vector3 combinedMove = (myForward * vertical + myRight * horizontal).normalized;
-                Vector3 worldMoveDir = Vector3.ProjectOnPlane(combinedMove, currentNormal);
-                
-                if (worldMoveDir.sqrMagnitude > 0.0001f)
-                {
-                    velocity = worldMoveDir.normalized * moveSpeed;
-                }
-                else velocity = Vector3.zero;
-            }
-            else velocity = Vector3.zero;
-
-            lastBodyPos = transform.position;
         }
 
         /// <summary>

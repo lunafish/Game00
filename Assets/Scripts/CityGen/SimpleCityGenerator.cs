@@ -5,464 +5,294 @@ namespace CityGen
 {
     public class SimpleCityGenerator : MonoBehaviour
     {
-        [Header("L-System Settings")]
-        public string axiom = "X";
-        public Rule[] rules;
-        [Range(1, 6)]
-        public int iterations = 3;
-
-        [Header("Road Settings")]
-        public float length = 5f;
-        public float angle = 90f;
-        public float angleVariance = 0f; 
-        public float width = 1f;
-        public float snapDistance = 1f; // Distance to snap/connect nodes
-        public float minSegmentLength = 0.5f; // Shortest road allowed
-        [Range(1, 10)]
-        public int maxResolutionPasses = 5; // Max iterations for graph stabilization
+        [Header("Subdivision Settings")]
+        public int seed = 1234;
+        public Vector2 citySize = new Vector2(100, 100);
+        public float minBlockSize = 20f;
+        [Range(0, 0.4f)] public float splitJitter = 0.1f;
+        [Range(0, 5f)] public float nodeJitter = 1.0f;
+        public int maxDepth = 5;
 
         // Graph Data
-        private List<Vector3> nodes = new List<Vector3>();
-        private HashSet<RoadSegment> uniqueSegments = new HashSet<RoadSegment>();
-        private List<List<int>> adjacency = new List<List<int>>();
+        protected List<Vector3> nodes = new List<Vector3>();
+        protected HashSet<RoadSegment> uniqueSegments = new HashSet<RoadSegment>();
+        protected List<List<int>> adjacency = new List<List<int>>();
 
-        // Turtle State
-        struct TurtleState
+        [System.Serializable]
+        public struct RoadSegment : System.IEquatable<RoadSegment>
         {
-            public Vector3 position;
-            public Quaternion rotation;
-        }
-
-        // Graph Structures
-        struct RoadSegment : System.IEquatable<RoadSegment>
-        {
-            public int a;
-            public int b;
-
+            public int a, b;
             public RoadSegment(int a, int b)
             {
                 if (a < b) { this.a = a; this.b = b; }
                 else { this.a = b; this.b = a; }
             }
-
-            public bool Equals(RoadSegment other)
-            {
-                return a == other.a && b == other.b;
-            }
-
-            public override int GetHashCode()
-            {
-                return System.HashCode.Combine(a, b);
-            }
-        }
-
-        private void Reset()
-        {
-            axiom = "X";
-            rules = new Rule[]
-            {
-                new Rule { input = 'X', outputs = "[+FX][-FX]F" },
-                new Rule { input = 'F', outputs = "F" } 
-            };
-            iterations = 3;
-            length = 5f;
-            angle = 90f;
-            angleVariance = 10f;
-            width = 1f;
-            snapDistance = 1f;
-            minSegmentLength = 1f;
-            maxResolutionPasses = 5;
+            public bool Equals(RoadSegment other) => a == other.a && b == other.b;
+            public override int GetHashCode() => System.HashCode.Combine(a, b);
         }
 
         [ContextMenu("Generate")]
         public void Generate()
         {
-            // 1. Generate Logic String
-            string sequence = LSystem.GenerateSentence(axiom, rules, iterations);
-            Debug.Log($"Generating Planar Graph: {sequence.Length} instructions...");
-
-            // 2. Initial Setup
             ClearGraph();
+            Random.InitState(seed);
 
-            // 3. Turtle Traversal (Initial Graph Build)
-            BuildInitialGraph(sequence);
+            Rect totalArea = new Rect(-citySize.x / 2f, -citySize.y / 2f, citySize.x, citySize.y);
+            
+            // 1. Draw Outer Boundary
+            DrawBoundary(totalArea);
 
-            // 4. Multi-pass Resolution Loop (Stabilization)
-            ResolveGraphStability();
+            // 2. Recursively Subdivide
+            Subdivide(totalArea, 0);
 
-            Debug.Log($"Graph Finalized: {nodes.Count} nodes, {uniqueSegments.Count} edges.");
+            // 3. Post-processing: Node Jitter for natural look
+            JitterNodes();
+
+            // Final Adjacency Rebuild (since we might have split segments)
+            RebuildAdjacency();
+
+            Debug.Log($"Subdivision complete: {nodes.Count} nodes, {uniqueSegments.Count} segments.");
         }
 
-        private void ClearGraph()
+        private void JitterNodes()
+        {
+            if (nodeJitter <= 0) return;
+
+            float eps = 0.1f;
+            for (int i = 0; i < nodes.Count; i++)
+            {
+                Vector3 p = nodes[i];
+                
+                // Skip nodes on the outer boundary
+                bool onBoundaryX = Mathf.Abs(p.x - (-citySize.x / 2f)) < eps || Mathf.Abs(p.x - (citySize.x / 2f)) < eps;
+                bool onBoundaryZ = Mathf.Abs(p.z - (-citySize.y / 2f)) < eps || Mathf.Abs(p.z - (citySize.y / 2f)) < eps;
+                if (onBoundaryX || onBoundaryZ) continue;
+
+                // Calculate repulsion from neighbors
+                Vector3 repulsionDir = Vector3.zero;
+                List<int> neighbors = adjacency[i];
+                
+                if (neighbors.Count > 0)
+                {
+                    foreach (int nIdx in neighbors)
+                    {
+                        Vector3 toCurrent = nodes[i] - nodes[nIdx];
+                        // Inverse square distance repulsion or simple directional bias
+                        repulsionDir += toCurrent.normalized;
+                    }
+                    repulsionDir.Normalize();
+                }
+
+                // Apply jitter biased away from neighbors
+                // If repulsion is zero (balanced grid), we use a random direction
+                if (repulsionDir.sqrMagnitude < 0.01f)
+                {
+                    repulsionDir = new Vector3(Random.Range(-1f, 1f), 0, Random.Range(-1f, 1f)).normalized;
+                }
+
+                float individualJitter = Random.Range(nodeJitter * 0.5f, nodeJitter);
+                nodes[i] += repulsionDir * individualJitter;
+            }
+        }
+
+        private void RebuildAdjacency()
+        {
+            adjacency.Clear();
+            for (int i = 0; i < nodes.Count; i++) adjacency.Add(new List<int>());
+            foreach (var seg in uniqueSegments)
+            {
+                if (seg.a == seg.b) continue;
+                adjacency[seg.a].Add(seg.b);
+                adjacency[seg.b].Add(seg.a);
+            }
+        }
+
+        private void DrawBoundary(Rect r)
+        {
+            Vector3 tl = new Vector3(r.xMin, 0, r.yMax);
+            Vector3 tr = new Vector3(r.xMax, 0, r.yMax);
+            Vector3 bl = new Vector3(r.xMin, 0, r.yMin);
+            Vector3 br = new Vector3(r.xMax, 0, r.yMin);
+
+            AddSplitLine(tl, tr);
+            AddSplitLine(tr, br);
+            AddSplitLine(br, bl);
+            AddSplitLine(bl, tl);
+        }
+
+        private void Subdivide(Rect area, int depth)
+        {
+            if (depth >= maxDepth) return;
+            if (area.width < minBlockSize * 2f && area.height < minBlockSize * 2f) return;
+
+            bool horizontalSplit = area.width < area.height;
+            if (area.width > area.height * 1.5f) horizontalSplit = false;
+            else if (area.height > area.width * 1.5f) horizontalSplit = true;
+
+            float splitPos = horizontalSplit 
+                ? area.yMin + area.height * Random.Range(0.4f - splitJitter, 0.6f + splitJitter)
+                : area.xMin + area.width * Random.Range(0.4f - splitJitter, 0.6f + splitJitter);
+
+            if (horizontalSplit)
+            {
+                Vector3 start = new Vector3(area.xMin, 0, splitPos);
+                Vector3 end = new Vector3(area.xMax, 0, splitPos);
+                AddSplitLine(start, end);
+
+                Subdivide(new Rect(area.x, area.y, area.width, splitPos - area.yMin), depth + 1);
+                Subdivide(new Rect(area.x, splitPos, area.width, area.yMax - splitPos), depth + 1);
+            }
+            else
+            {
+                Vector3 start = new Vector3(splitPos, 0, area.yMin);
+                Vector3 end = new Vector3(splitPos, 0, area.yMax);
+                AddSplitLine(start, end);
+
+                Subdivide(new Rect(area.x, area.y, splitPos - area.xMin, area.height), depth + 1);
+                Subdivide(new Rect(splitPos, area.y, area.xMax - splitPos, area.height), depth + 1);
+            }
+        }
+
+        private void AddSplitLine(Vector3 start, Vector3 end)
+        {
+            List<Vector3> splitPoints = new List<Vector3> { start, end };
+            List<RoadSegment> existingSegments = new List<RoadSegment>(uniqueSegments);
+
+            foreach (var seg in existingSegments)
+            {
+                Vector3 s1 = nodes[seg.a];
+                Vector3 s2 = nodes[seg.b];
+
+                // 1. Cross Intersections
+                if (GetLineIntersection(start, end, s1, s2, out Vector3 inter))
+                {
+                    uniqueSegments.Remove(seg);
+                    int interIdx = GetOrAddNode(inter);
+                    uniqueSegments.Add(new RoadSegment(seg.a, interIdx));
+                    uniqueSegments.Add(new RoadSegment(interIdx, seg.b));
+                    if (!splitPoints.Contains(inter)) splitPoints.Add(inter);
+                }
+
+                // 2. T-Junctions (Start or End on an existing segment)
+                if (IsPointNearSegment(start, s1, s2, out Vector3 snapStart))
+                {
+                    if (Vector3.Distance(start, snapStart) < 0.1f)
+                    {
+                        uniqueSegments.Remove(seg);
+                        int startIdx = GetOrAddNode(start);
+                        uniqueSegments.Add(new RoadSegment(seg.a, startIdx));
+                        uniqueSegments.Add(new RoadSegment(startIdx, seg.b));
+                        if (!splitPoints.Contains(start)) splitPoints.Add(start);
+                    }
+                }
+                if (IsPointNearSegment(end, s1, s2, out Vector3 snapEnd))
+                {
+                    if (Vector3.Distance(end, snapEnd) < 0.1f)
+                    {
+                        uniqueSegments.Remove(seg);
+                        int endIdx = GetOrAddNode(end);
+                        uniqueSegments.Add(new RoadSegment(seg.a, endIdx));
+                        uniqueSegments.Add(new RoadSegment(endIdx, seg.b));
+                        if (!splitPoints.Contains(end)) splitPoints.Add(end);
+                    }
+                }
+            }
+
+            // Deduplicate and Sort
+            splitPoints.Sort((a, b) => Vector3.Distance(start, a).CompareTo(Vector3.Distance(start, b)));
+            
+            for (int i = 0; i < splitPoints.Count - 1; i++)
+            {
+                if (Vector3.Distance(splitPoints[i], splitPoints[i+1]) > 0.1f)
+                {
+                    int a = GetOrAddNode(splitPoints[i]);
+                    int b = GetOrAddNode(splitPoints[i+1]);
+                    uniqueSegments.Add(new RoadSegment(a, b));
+                }
+            }
+        }
+
+        private bool GetLineIntersection(Vector3 p1, Vector3 p2, Vector3 p3, Vector3 p4, out Vector3 res)
+        {
+            res = Vector3.zero;
+            float denom = (p4.z - p3.z) * (p2.x - p1.x) - (p4.x - p3.x) * (p2.z - p1.z);
+            if (Mathf.Abs(denom) < 0.0001f) return false;
+            float ua = ((p4.x - p3.x) * (p1.z - p3.z) - (p4.z - p3.z) * (p1.x - p3.x)) / denom;
+            float ub = ((p2.x - p1.x) * (p1.z - p3.z) - (p2.z - p1.z) * (p1.x - p3.x)) / denom;
+            if (ua > 0.01f && ua < 0.99f && ub > 0.01f && ub < 0.99f)
+            {
+                res = new Vector3(p1.x + ua * (p2.x - p1.x), 0, p1.z + ua * (p2.z - p1.z));
+                return true;
+            }
+            return false;
+        }
+
+        private bool IsPointNearSegment(Vector3 p, Vector3 a, Vector3 b, out Vector3 closest)
+        {
+            closest = Vector3.zero;
+            Vector3 ab = b - a;
+            float t = Vector3.Dot(p - a, ab) / Vector3.SqrMagnitude(ab);
+            if (t > 0.01f && t < 0.99f)
+            {
+                closest = a + t * ab;
+                return true;
+            }
+            return false;
+        }
+
+        protected void ClearGraph()
         {
             nodes.Clear();
             uniqueSegments.Clear();
             adjacency.Clear();
         }
 
-        private void BuildInitialGraph(string sequence)
-        {
-            Stack<TurtleState> stack = new Stack<TurtleState>();
-            Vector3 currentPos = transform.position;
-            Quaternion currentRot = transform.rotation;
-            int currentIndex = GetOrAddNode(currentPos);
-
-            Random.InitState(System.DateTime.Now.Millisecond);
-
-            foreach (char c in sequence)
-            {
-                switch (c)
-                {
-                    case 'F':
-                        Vector3 nextPos = currentPos + (currentRot * Vector3.forward * length);
-                        int nextIndex = GetOrAddNode(nextPos);
-                        if (currentIndex != nextIndex)
-                        {
-                            AddSegmentIfValid(currentIndex, nextIndex);
-                        }
-                        currentPos = nextPos;
-                        currentIndex = nextIndex;
-                        break;
-                    case 'f':
-                        currentPos += (currentRot * Vector3.forward * length);
-                        currentIndex = GetOrAddNode(currentPos);
-                        break;
-                    case '+':
-                        currentRot *= Quaternion.Euler(0, angle + Random.Range(-angleVariance, angleVariance), 0);
-                        break;
-                    case '-':
-                        currentRot *= Quaternion.Euler(0, -(angle + Random.Range(-angleVariance, angleVariance)), 0);
-                        break;
-                    case '[':
-                        stack.Push(new TurtleState { position = currentPos, rotation = currentRot });
-                        break;
-                    case ']':
-                        if (stack.Count > 0)
-                        {
-                            TurtleState popped = stack.Pop();
-                            currentPos = popped.position;
-                            currentRot = popped.rotation;
-                            currentIndex = GetOrAddNode(currentPos);
-                        }
-                        break;
-                }
-            }
-        }
-
-        private void ResolveGraphStability()
-        {
-            bool changed = true;
-            int pass = 0;
-            while (changed && pass++ < maxResolutionPasses)
-            {
-                changed = false;
-                
-                // Pass A: Resolve intersections and T-junctions
-                changed |= ResolveIntersections();
-                
-                // Pass B: Merge nearby nodes
-                changed |= OptimizeGraph();
-                
-                // Pass C: Remove redundant short segments
-                changed |= PruneShortSegments();
-
-                if (changed) Debug.Log($"Resolution Pass {pass} applied changes...");
-            }
-        }
-
-        private bool PruneShortSegments()
-        {
-            if (minSegmentLength <= 0) return false;
-
-            float minSq = minSegmentLength * minSegmentLength;
-            List<RoadSegment> toRemove = new List<RoadSegment>();
-
-            foreach (var seg in uniqueSegments)
-            {
-                if (Vector3.SqrMagnitude(nodes[seg.a] - nodes[seg.b]) < minSq)
-                {
-                    toRemove.Add(seg);
-                }
-            }
-
-            foreach (var seg in toRemove)
-            {
-                uniqueSegments.Remove(seg);
-            }
-
-            return toRemove.Count > 0;
-        }
-
-        private bool ResolveIntersections()
-        {
-            bool anyChange = false;
-            bool localChange = true;
-            int safety = 0;
-
-            // Iteratively split until no more intersections found in this pass
-            while (localChange && safety++ < 10)
-            {
-                localChange = SplitCrossingSegments();
-                localChange |= SnapEndpointsToSegments();
-                if (localChange) anyChange = true;
-            }
-            return anyChange;
-        }
-
-        private bool SplitCrossingSegments()
-        {
-            List<RoadSegment> segList = new List<RoadSegment>(uniqueSegments);
-            int count = segList.Count;
-
-            for (int i = 0; i < count; i++)
-            {
-                for (int j = i + 1; j < count; j++)
-                {
-                    RoadSegment s1 = segList[i];
-                    RoadSegment s2 = segList[j];
-
-                    if (s1.a == s2.a || s1.a == s2.b || s1.b == s2.a || s1.b == s2.b) continue;
-
-                    Vector3 p1 = nodes[s1.a];
-                    Vector3 p2 = nodes[s1.b];
-                    Vector3 p3 = nodes[s2.a];
-                    Vector3 p4 = nodes[s2.b];
-
-                    if (GetLineIntersection(p1, p2, p3, p4, out Vector3 intersection))
-                    {
-                        // Split both
-                        int newNodeIndex = GetOrAddNode(intersection);
-                        
-                        uniqueSegments.Remove(s1);
-                        uniqueSegments.Remove(s2);
-
-                        AddSegmentIfValid(s1.a, newNodeIndex);
-                        AddSegmentIfValid(newNodeIndex, s1.b);
-                        AddSegmentIfValid(s2.a, newNodeIndex);
-                        AddSegmentIfValid(newNodeIndex, s2.b);
-                        
-                        return true; // Restart
-                    }
-                }
-            }
-            return false;
-        }
-
-        private bool SnapEndpointsToSegments()
-        {
-            // Check if any node lies on a segment it doesn't belong to
-            List<RoadSegment> segList = new List<RoadSegment>(uniqueSegments);
-            
-            for (int i = 0; i < nodes.Count; i++)
-            {
-                Vector3 p = nodes[i];
-                foreach (var seg in segList)
-                {
-                    if (seg.a == i || seg.b == i) continue; // It's strictly one of the endpoints
-
-                    Vector3 p1 = nodes[seg.a];
-                    Vector3 p2 = nodes[seg.b];
-
-                    if (IsPointOnSegment(p, p1, p2, 0.1f)) // Small tolerance for "on line"
-                    {
-                        // Split segment 'seg' at node 'i'
-                        uniqueSegments.Remove(seg);
-                        AddSegmentIfValid(seg.a, i);
-                        AddSegmentIfValid(i, seg.b);
-                        return true; // Restart
-                    }
-                }
-            }
-            return false;
-        }
-
-        bool IsPointOnSegment(Vector3 point, Vector3 start, Vector3 end, float tolerance)
-        {
-            float length = Vector3.Distance(start, end);
-            float d1 = Vector3.Distance(point, start);
-            float d2 = Vector3.Distance(point, end);
-
-            // Check if point is roughly on the line and between endpoints
-            if (d1 + d2 >= length - tolerance && d1 + d2 <= length + tolerance)
-            {
-                // Refined check: Perpendicular distance using vector projection
-                // Only works if length > 0
-                if (length < 0.0001f) return false;
-
-                Vector3 direction = (end - start).normalized;
-                Vector3 projectedPoint = start + Vector3.Dot(point - start, direction) * direction;
-                
-                if (Vector3.Distance(point, projectedPoint) < tolerance)
-                {
-                    // Ensure strictly inside (not endpoints)
-                    if (d1 > tolerance && d2 > tolerance) return true;
-                }
-            }
-            return false;
-        }
-
-        void AddSegmentIfValid(int a, int b)
-        {
-            if (a == b) return;
-            uniqueSegments.Add(new RoadSegment(a, b));
-        }
-
-        bool GetLineIntersection(Vector3 p1, Vector3 p2, Vector3 p3, Vector3 p4, out Vector3 result)
-        {
-            result = Vector3.zero;
-            
-            float x1 = p1.x; float z1 = p1.z;
-            float x2 = p2.x; float z2 = p2.z;
-            float x3 = p3.x; float z3 = p3.z;
-            float x4 = p4.x; float z4 = p4.z;
-
-            float denom = (z4 - z3) * (x2 - x1) - (x4 - x3) * (z2 - z1);
-            if (Mathf.Abs(denom) < 0.0001f) return false;
-
-            float ua = ((x4 - x3) * (z1 - z3) - (z4 - z3) * (x1 - x3)) / denom;
-            float ub = ((x2 - x1) * (z1 - z3) - (z2 - z1) * (x1 - x3)) / denom;
-
-            float tolerance = 0.001f;
-            if (ua >= tolerance && ua <= 1f - tolerance && ub >= tolerance && ub <= 1f - tolerance)
-            {
-                result = new Vector3(x1 + ua * (x2 - x1), 0, z1 + ua * (z2 - z1));
-                return true;
-            }
-
-            return false;
-        }
-
-        private bool OptimizeGraph()
-        {
-            bool nodesChanged = false;
-            int[] nodeMap = new int[nodes.Count];
-            for (int i = 0; i < nodes.Count; i++) nodeMap[i] = i;
-
-            for (int i = 0; i < nodes.Count; i++)
-            {
-                if (nodeMap[i] != i) continue;
-                for (int j = i + 1; j < nodes.Count; j++)
-                {
-                    if (nodeMap[j] != j) continue;
-                    if (Vector3.SqrMagnitude(nodes[i] - nodes[j]) <= snapDistance * snapDistance)
-                    {
-                        nodeMap[j] = i;
-                        nodesChanged = true;
-                    }
-                }
-            }
-
-            bool segmentsChanged = false;
-            HashSet<RoadSegment> optimizedSegments = new HashSet<RoadSegment>();
-            foreach (var seg in uniqueSegments)
-            {
-                int newA = nodeMap[seg.a];
-                int newB = nodeMap[seg.b];
-                if (newA != newB)
-                {
-                    if (optimizedSegments.Add(new RoadSegment(newA, newB)))
-                    {
-                        if (newA != seg.a || newB != seg.b) segmentsChanged = true;
-                    }
-                    else
-                    {
-                        // Duplicate segment removed
-                        segmentsChanged = true;
-                    }
-                }
-                else
-                {
-                    // Self-loop removed
-                    segmentsChanged = true;
-                }
-            }
-            uniqueSegments = optimizedSegments;
-
-            // 3. Consolidate Node List (Only if needed, but for stability we always re-squeeze if something changed)
-            if (nodesChanged || segmentsChanged)
-            {
-                List<Vector3> squeezedNodes = new List<Vector3>();
-                Dictionary<int, int> oldToNew = new Dictionary<int, int>();
-
-                foreach (var seg in uniqueSegments)
-                {
-                    if (!oldToNew.ContainsKey(seg.a))
-                    {
-                        oldToNew[seg.a] = squeezedNodes.Count;
-                        squeezedNodes.Add(nodes[seg.a]);
-                    }
-                    if (!oldToNew.ContainsKey(seg.b))
-                    {
-                        oldToNew[seg.b] = squeezedNodes.Count;
-                        squeezedNodes.Add(nodes[seg.b]);
-                    }
-                }
-
-                nodes = squeezedNodes;
-
-                HashSet<RoadSegment> consolidatedSegments = new HashSet<RoadSegment>();
-                foreach (var seg in uniqueSegments)
-                {
-                    consolidatedSegments.Add(new RoadSegment(oldToNew[seg.a], oldToNew[seg.b]));
-                }
-                uniqueSegments = consolidatedSegments;
-            }
-
-            // 5. Rebuild Adjacency
-            List<List<int>> newAdjacency = new List<List<int>>();
-            for (int i = 0; i < nodes.Count; i++) newAdjacency.Add(new List<int>());
-
-            foreach (var seg in uniqueSegments)
-            {
-                newAdjacency[seg.a].Add(seg.b);
-                newAdjacency[seg.b].Add(seg.a);
-            }
-            adjacency = newAdjacency;
-
-            return nodesChanged || segmentsChanged;
-        }
-        // Helper to find existing node or add new one
-        int GetOrAddNode(Vector3 pos)
+        protected int GetOrAddNode(Vector3 pos)
         {
             for (int i = 0; i < nodes.Count; i++)
             {
-                if (Vector3.SqrMagnitude(nodes[i] - pos) < 0.0001f)
-                {
-                    return i;
-                }
+                if (Vector3.SqrMagnitude(nodes[i] - pos) < 0.0001f) return i;
             }
             nodes.Add(pos);
             adjacency.Add(new List<int>());
             return nodes.Count - 1;
         }
 
-        void OnDrawGizmos()
+        protected bool AddSegmentIfValid(int a, int b)
+        {
+            if (a == b) return false;
+            RoadSegment seg = new RoadSegment(a, b);
+            if (uniqueSegments.Add(seg))
+            {
+                while (adjacency.Count <= Mathf.Max(a, b)) adjacency.Add(new List<int>());
+                adjacency[a].Add(b);
+                adjacency[b].Add(a);
+                return true;
+            }
+            return false;
+        }
+
+        protected virtual void OnDrawGizmos()
         {
             if (nodes == null || uniqueSegments == null) return;
 
-            // 1. Draw Edges
-            Gizmos.color = new Color(0, 1, 1, 0.5f); // Semi-transparent Cyan
+            // Draw Roads
+            Gizmos.color = new Color(0, 1, 1, 0.6f);
             foreach (var seg in uniqueSegments)
             {
                 if (seg.a < nodes.Count && seg.b < nodes.Count)
-                {
                     Gizmos.DrawLine(nodes[seg.a], nodes[seg.b]);
-                }
             }
 
-            // 2. Draw Nodes (Connectivity Visualization)
+            // Draw Junctions
             for (int i = 0; i < nodes.Count; i++)
             {
                 if (i >= adjacency.Count) continue;
-
                 int degree = adjacency[i].Count;
-                if (degree == 0) continue; // Skip truly isolated nodes
+                if (degree == 0) continue;
 
-                if (degree == 1) Gizmos.color = Color.red;           // Dead End
-                else if (degree == 2) Gizmos.color = Color.yellow;   // Road/Path
-                else Gizmos.color = Color.green;                     // Intersection
-
-                Gizmos.DrawWireSphere(nodes[i], 0.25f);
+                Gizmos.color = degree == 1 ? Color.red : (degree == 2 ? Color.yellow : Color.green);
+                Gizmos.DrawWireSphere(nodes[i], 0.15f);
             }
         }
     }

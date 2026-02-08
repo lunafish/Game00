@@ -15,6 +15,9 @@ namespace CityGen
         public int seed = 1234;
         public Vector2 citySize = new Vector2(100, 100);
         public float minBlockSize = 20f;
+    public int subdivisionDepth = 2; // New: subdivision for lots
+    public float minLotArea = 100f; // New: minimum area for a lot
+    [Range(0, 0.45f)] public float lotSplitJitter = 0.2f; // New: randomization of split ratio
         [Range(0, 0.4f)] public float splitJitter = 0.1f;
         [Range(0, 5f)] public float nodeJitter = 1.0f;
         public int maxDepth = 5;
@@ -46,11 +49,13 @@ namespace CityGen
             public int tl, tr, br, bl; // Core topological corners
             public List<int> fullPerimeter; // All nodes on the loop (including T-junctions)
             public Vector3[] innerPolygon; // Final road-adjusted vertices
+            public List<Vector3[]> subLots; // New: recursively divided lots
             public CityBlock(int tl, int tr, int br, int bl)
             {
                 this.tl = tl; this.tr = tr; this.br = br; this.bl = bl;
                 this.fullPerimeter = null;
                 this.innerPolygon = null;
+                this.subLots = null;
             }
         }
         [SerializeField, HideInInspector] protected List<CityBlock> cityBlocks = new List<CityBlock>();
@@ -106,8 +111,8 @@ namespace CityGen
 
             // 6. 블록별 실제 모양(Inner Polygon) 계산
             CalculateBlockShapes();
-
-
+        SubdivideAllBlocks(); // New: Divide blocks into sub-lots
+        GenerateMesh();
             sw.Stop();
             UnityEngine.Debug.Log($"도시 생성 완료: {nodes.Count} 노드, {uniqueSegments.Count} 도로 구간 (소요 시간: {sw.ElapsedMilliseconds}ms)");
 
@@ -618,6 +623,100 @@ namespace CityGen
             }
         }
 
+        private void SubdivideAllBlocks()
+        {
+            for (int i = 0; i < cityBlocks.Count; i++)
+            {
+                CityBlock b = cityBlocks[i];
+                if (b.innerPolygon != null && b.innerPolygon.Length >= 3)
+                {
+                    b.subLots = new List<Vector3[]>();
+                    SubdividePolygonRecursive(b.innerPolygon, 0, b.subLots);
+                    cityBlocks[i] = b;
+                }
+            }
+        }
+
+        private void SubdividePolygonRecursive(Vector3[] polygon, int depth, List<Vector3[]> results)
+        {
+            float area = CalculatePolygonArea(polygon);
+            if (depth >= subdivisionDepth || area < minLotArea)
+            {
+                results.Add(polygon);
+                return;
+            }
+
+            // Simple split along longest bounding box axis
+            Bounds b = new Bounds(polygon[0], Vector3.zero);
+            foreach (var p in polygon) b.Encapsulate(p);
+
+            float ratio = 0.5f + UnityEngine.Random.Range(-lotSplitJitter, lotSplitJitter);
+            
+            Vector3 splitPoint;
+            Vector3 splitDir;
+            
+            if (b.size.x > b.size.z)
+            {
+                splitPoint = new Vector3(b.min.x + b.size.x * ratio, b.center.y, b.center.z);
+                splitDir = Vector3.right;
+            }
+            else
+            {
+                splitPoint = new Vector3(b.center.x, b.center.y, b.min.z + b.size.z * ratio);
+                splitDir = Vector3.forward;
+            }
+            
+            var split = SplitPolygon(polygon, splitPoint, splitDir);
+            if (split.Item1 != null && split.Item2 != null && split.Item1.Length >= 3 && split.Item2.Length >= 3)
+            {
+                SubdividePolygonRecursive(split.Item1, depth + 1, results);
+                SubdividePolygonRecursive(split.Item2, depth + 1, results);
+            }
+            else
+            {
+                results.Add(polygon);
+            }
+        }
+
+        private (Vector3[], Vector3[]) SplitPolygon(Vector3[] polygon, Vector3 planePoint, Vector3 planeNormal)
+        {
+            List<Vector3> sideA = new List<Vector3>();
+            List<Vector3> sideB = new List<Vector3>();
+
+            for (int i = 0; i < polygon.Length; i++)
+            {
+                Vector3 p1 = polygon[i];
+                Vector3 p2 = polygon[(i + 1) % polygon.Length];
+
+                float d1 = Vector3.Dot(p1 - planePoint, planeNormal);
+                float d2 = Vector3.Dot(p2 - planePoint, planeNormal);
+
+                if (d1 >= 0) sideA.Add(p1);
+                else sideB.Add(p1);
+
+                if ((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0))
+                {
+                    float t = Mathf.Abs(d1) / (Mathf.Abs(d1) + Mathf.Abs(d2));
+                    Vector3 intersect = Vector3.Lerp(p1, p2, t);
+                    sideA.Add(intersect);
+                    sideB.Add(intersect);
+                }
+            }
+            return (sideA.ToArray(), sideB.ToArray());
+        }
+
+        private float CalculatePolygonArea(Vector3[] polygon)
+        {
+            float area = 0f;
+            for (int i = 0; i < polygon.Length; i++)
+            {
+                Vector3 p1 = polygon[i];
+                Vector3 p2 = polygon[(i + 1) % polygon.Length];
+                area += (p1.x * p2.z - p2.x * p1.z);
+            }
+            return Mathf.Abs(area) * 0.5f;
+        }
+
         private Vector3 GetSpecificRoadCorner(int nodeIdx, int neighborIdx, bool getLeft, bool isStartOfSegment)
         {
             if (!nodeJunctionCorners.ContainsKey(nodeIdx)) return nodes[nodeIdx];
@@ -975,14 +1074,28 @@ namespace CityGen
 #endif
                 }
 
-                // 2. Draw Exact Inner Polygon
+                // Draw refined inner polygon
                 if (b.innerPolygon != null && b.innerPolygon.Length >= 3)
                 {
-                    Gizmos.color = Color.green;
+                    // Draw outer boundary of buildable area
+                    Gizmos.color = new Color(0, 1, 0, 0.5f);
                     for (int j = 0; j < b.innerPolygon.Length; j++)
                     {
                         Gizmos.DrawLine(b.innerPolygon[j], b.innerPolygon[(j + 1) % b.innerPolygon.Length]);
-                        Gizmos.DrawWireCube(b.innerPolygon[j], Vector3.one * 0.5f);
+                        Gizmos.DrawWireCube(b.innerPolygon[j], Vector3.one * 0.3f);
+                    }
+
+                    // Draw sub-lots
+                    if (b.subLots != null)
+                    {
+                        Gizmos.color = new Color(1, 1, 0, 0.4f); // Yellow for lots
+                        foreach (var lot in b.subLots)
+                        {
+                            for (int j = 0; j < lot.Length; j++)
+                            {
+                                Gizmos.DrawLine(lot[j], lot[(j + 1) % lot.Length]);
+                            }
+                        }
                     }
                 }
             }

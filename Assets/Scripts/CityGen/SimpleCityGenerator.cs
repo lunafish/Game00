@@ -1107,7 +1107,7 @@ namespace CityGen
             junctionValues.Clear();
             foreach (var kvp in nodeJunctionCorners)
             {
-                if (kvp.Value == null || kvp.Value.Length != 4) continue;
+                if (kvp.Value == null) continue;
                 junctionKeys.Add(kvp.Key);
                 junctionValues.Add(new Vector3ArrayWrapper { array = kvp.Value });
             }

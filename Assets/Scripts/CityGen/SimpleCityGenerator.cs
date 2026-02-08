@@ -40,6 +40,21 @@ namespace CityGen
         public struct Vector3ArrayWrapper { public Vector3[] array; }
         [SerializeField, HideInInspector] private List<Vector3ArrayWrapper> junctionValues = new List<Vector3ArrayWrapper>();
 
+        [System.Serializable]
+        public struct CityBlock
+        {
+            public int tl, tr, br, bl; // Core topological corners
+            public List<int> fullPerimeter; // All nodes on the loop (including T-junctions)
+            public Vector3[] innerPolygon; // Final road-adjusted vertices
+            public CityBlock(int tl, int tr, int br, int bl)
+            {
+                this.tl = tl; this.tr = tr; this.br = br; this.bl = bl;
+                this.fullPerimeter = null;
+                this.innerPolygon = null;
+            }
+        }
+        [SerializeField, HideInInspector] protected List<CityBlock> cityBlocks = new List<CityBlock>();
+
 
         [System.Serializable]
         public struct RoadSegment : System.IEquatable<RoadSegment>
@@ -88,6 +103,9 @@ namespace CityGen
 
             // // 5. 메쉬 생성 및 최적화
             GenerateMesh();
+
+            // 6. 블록별 실제 모양(Inner Polygon) 계산
+            CalculateBlockShapes();
 
 
             sw.Stop();
@@ -201,6 +219,19 @@ namespace CityGen
 
                 if (changed)
                 {
+                    // 블록 리스트 리매핑 (핵심 코너 업데이트)
+                    for (int k = 0; k < cityBlocks.Count; k++)
+                    {
+                        CityBlock b = cityBlocks[k];
+                        if (redirectMap.ContainsKey(b.tl)) b.tl = redirectMap[b.tl];
+                        if (redirectMap.ContainsKey(b.tr)) b.tr = redirectMap[b.tr];
+                        if (redirectMap.ContainsKey(b.br)) b.br = redirectMap[b.br];
+                        if (redirectMap.ContainsKey(b.bl)) b.bl = redirectMap[b.bl];
+                        cityBlocks[k] = b;
+                    }
+
+                    // 노드 리스트 갱신
+
                     // 노드 리스트 갱신
                     nodes = newNodes;
 
@@ -258,7 +289,7 @@ namespace CityGen
         {
             if (depth >= maxDepth || (area.width < minBlockSize * 2f && area.height < minBlockSize * 2f))
             {
-                // blocks.Add(new Block(tl, tr, br, bl));
+                cityBlocks.Add(new CityBlock(tl, tr, br, bl));
                 return;
             }
 
@@ -534,6 +565,156 @@ namespace CityGen
             tris.Add(startIdx + 0); tris.Add(startIdx + 2); tris.Add(startIdx + 3);
         }
 
+        /// <summary>
+        /// 모든 블록에 대해 둘레 노드를 추적하고, 도로 폭이 반영된 정밀한 안쪽 다각형을 계산합니다.
+        /// </summary>
+        private void CalculateBlockShapes()
+        {
+            for (int i = 0; i < cityBlocks.Count; i++)
+            {
+                CityBlock block = cityBlocks[i];
+                if (block.tl >= nodes.Count || block.tr >= nodes.Count || block.br >= nodes.Count || block.bl >= nodes.Count) continue;
+
+                // 1. Trace exact perimeter nodes using graph traversal
+                List<int> perimeter = new List<int>();
+                perimeter.Add(block.tl); // Ensure start node is included
+                perimeter.AddRange(FindPathBetweenCorners(block.tl, block.tr));
+                perimeter.AddRange(FindPathBetweenCorners(block.tr, block.br));
+                perimeter.AddRange(FindPathBetweenCorners(block.br, block.bl));
+                perimeter.AddRange(FindPathBetweenCorners(block.bl, block.tl));
+
+                // Remove consecutive duplicates
+                for (int j = perimeter.Count - 1; j > 0; j--)
+                {
+                    if (perimeter[j] == perimeter[j - 1]) perimeter.RemoveAt(j);
+                }
+                // Also ensure the last node isn't the same as the first (closed loop)
+                if (perimeter.Count > 1 && perimeter[0] == perimeter[perimeter.Count - 1]) perimeter.RemoveAt(perimeter.Count - 1);
+
+                block.fullPerimeter = perimeter;
+
+                // 2. Assemble exact inner polygon using directional inward logic
+                Vector3[] polygon = new Vector3[perimeter.Count];
+                for (int j = 0; j < perimeter.Count; j++)
+                {
+                    int curr = perimeter[j];
+                    int prev = perimeter[(j + perimeter.Count - 1) % perimeter.Count];
+                    int next = perimeter[(j + 1) % perimeter.Count];
+
+                    // Calculate inward direction at this node
+                    // For a CCW loop, the inward normal of segment (A -> B) is Cross(up, B - A)
+                    Vector3 inNormalPrev = Vector3.Cross(Vector3.up, (nodes[curr] - nodes[prev]).normalized);
+                    Vector3 inNormalNext = Vector3.Cross(Vector3.up, (nodes[next] - nodes[curr]).normalized);
+                    Vector3 inwardDir = (inNormalPrev + inNormalNext).normalized;
+
+                    polygon[j] = GetInwardJunctionCorner(curr, inwardDir);
+                }
+
+                block.innerPolygon = polygon;
+                cityBlocks[i] = block;
+            }
+        }
+
+        /// <summary>
+        /// 두 코너 노드 사이의 최단 경로(도로 세그먼트 체인)를 찾아 반환합니다. 
+        /// 블록의 한 변을 구성하는 모든 중간 정점들을 수집합니다.
+        /// </summary>
+        private List<int> FindPathBetweenCorners(int startIdx, int endIdx)
+        {
+            List<int> path = new List<int>();
+            if (startIdx == endIdx) return path;
+
+            // BFS to find the shortest path in the road graph
+            Queue<int> queue = new Queue<int>();
+            Dictionary<int, int> parentMap = new Dictionary<int, int>();
+            HashSet<int> visited = new HashSet<int>();
+
+            queue.Enqueue(startIdx);
+            visited.Add(startIdx);
+
+            bool found = false;
+            while (queue.Count > 0)
+            {
+                int curr = queue.Dequeue();
+                if (curr == endIdx)
+                {
+                    found = true;
+                    break;
+                }
+
+                foreach (int neighbor in adjacency[curr])
+                {
+                    if (!visited.Contains(neighbor))
+                    {
+                        visited.Add(neighbor);
+                        parentMap[neighbor] = curr;
+                        queue.Enqueue(neighbor);
+                    }
+                }
+            }
+
+            if (found)
+            {
+                int step = endIdx;
+                while (step != startIdx)
+                {
+                    path.Add(step);
+                    step = parentMap[step];
+                }
+                path.Reverse();
+                // Add startIdx at the beginning? We use AddRange, so we skip the very first startIdx 
+                // to avoid duplication with the previous edge's endIdx.
+                // Except for the first edge of the first block... wait.
+                // If we do: Path(tl,tr) -> Path(tr,br)...
+                // Path(tl,tr) returns [intermediate1, intermediate2, tr]
+                // Path(tr,br) returns [intermediate3, br]
+                // This will work perfectly as a CCW loop.
+            }
+
+            return path;
+        }
+
+        private Vector3 GetInwardJunctionCorner(int nodeIdx, Vector3 inwardDir)
+        {
+            if (!nodeJunctionCorners.ContainsKey(nodeIdx)) return nodes[nodeIdx];
+            
+            Vector3 center = nodes[nodeIdx];
+            Vector3[] corners = nodeJunctionCorners[nodeIdx];
+            Vector3 best = corners[0];
+            float maxDot = Vector3.Dot((best - center).normalized, inwardDir);
+
+            for (int i = 1; i < corners.Length; i++)
+            {
+                float dot = Vector3.Dot((corners[i] - center).normalized, inwardDir);
+                if (dot > maxDot)
+                {
+                    maxDot = dot;
+                    best = corners[i];
+                }
+            }
+            return best;
+        }
+
+        private Vector3 GetClosestJunctionCorner(int nodeIdx, Vector3 target)
+        {
+            if (!nodeJunctionCorners.ContainsKey(nodeIdx)) return nodes[nodeIdx];
+            
+            Vector3[] corners = nodeJunctionCorners[nodeIdx];
+            Vector3 best = corners[0];
+            float minDist = Vector3.SqrMagnitude(best - target);
+
+            for (int i = 1; i < corners.Length; i++)
+            {
+                float d = Vector3.SqrMagnitude(corners[i] - target);
+                if (d < minDist)
+                {
+                    minDist = d;
+                    best = corners[i];
+                }
+            }
+            return best;
+        }
+
 
 
 
@@ -637,6 +818,7 @@ namespace CityGen
             uniqueSegments.Clear();
             adjacency.Clear();
             nodeJunctionCorners.Clear();
+            cityBlocks.Clear();
         }
 
         protected int GetOrAddNode(Vector3 pos)
@@ -735,6 +917,39 @@ namespace CityGen
                 UnityEditor.Handles.color = Color.white;
                 UnityEditor.Handles.Label(nodes[i] + Vector3.up * 0.5f, i.ToString());
 #endif
+            }
+
+            // Draw City Blocks
+            for (int i = 0; i < cityBlocks.Count; i++)
+            {
+                CityBlock b = cityBlocks[i];
+                
+                // 1. Draw core boundary (BFS style corners)
+                if (b.tl < nodes.Count && b.tr < nodes.Count && b.br < nodes.Count && b.bl < nodes.Count)
+                {
+                    Gizmos.color = new Color(0, 0, 1, 0.3f); // Blue for logical rect
+                    Gizmos.DrawLine(nodes[b.tl], nodes[b.tr]);
+                    Gizmos.DrawLine(nodes[b.tr], nodes[b.br]);
+                    Gizmos.DrawLine(nodes[b.br], nodes[b.bl]);
+                    Gizmos.DrawLine(nodes[b.bl], nodes[b.tl]);
+
+                    Vector3 center = (nodes[b.tl] + nodes[b.tr] + nodes[b.br] + nodes[b.bl]) / 4f;
+#if UNITY_EDITOR
+                    UnityEditor.Handles.color = Color.white;
+                    UnityEditor.Handles.Label(center + Vector3.up * 1.5f, $"BLOCK #{i}");
+#endif
+                }
+
+                // 2. Draw Exact Inner Polygon
+                if (b.innerPolygon != null && b.innerPolygon.Length >= 3)
+                {
+                    Gizmos.color = Color.green;
+                    for (int j = 0; j < b.innerPolygon.Length; j++)
+                    {
+                        Gizmos.DrawLine(b.innerPolygon[j], b.innerPolygon[(j + 1) % b.innerPolygon.Length]);
+                        Gizmos.DrawWireCube(b.innerPolygon[j], Vector3.one * 0.5f);
+                    }
+                }
             }
         }
     }

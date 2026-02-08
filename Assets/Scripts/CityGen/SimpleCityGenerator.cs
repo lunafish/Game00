@@ -18,6 +18,10 @@ namespace CityGen
     public int subdivisionDepth = 2; // New: subdivision for lots
     public float minLotArea = 100f; // New: minimum area for a lot
     [Range(0, 0.45f)] public float lotSplitJitter = 0.2f; // New: randomization of split ratio
+    public float minBuildingHeight = 10f;
+    public float maxBuildingHeight = 30f;
+    public Material buildingMaterial;
+    public Material roadMaterial;
         [Range(0, 0.4f)] public float splitJitter = 0.1f;
         [Range(0, 5f)] public float nodeJitter = 1.0f;
         public int maxDepth = 5;
@@ -27,6 +31,12 @@ namespace CityGen
         [Range(0.001f, 2.0f)] public float weldTolerance = 2.0f;
         public MeshFilter meshFilter;
         public MeshRenderer meshRenderer;
+        
+        [Header("디버그 설정 (Debug Settings)")]
+        public bool showRoadNodes = true;
+        public bool showLogicalBlocks = false;
+        public bool showBuildableAreas = true;
+        public bool showSubLots = true;
 
         // 그래프 데이터 (직렬화 가능하도록 속성 추가)
         [SerializeField, HideInInspector] protected List<Vector3> nodes = new List<Vector3>();
@@ -49,7 +59,7 @@ namespace CityGen
             public int tl, tr, br, bl; // Core topological corners
             public List<int> fullPerimeter; // All nodes on the loop (including T-junctions)
             public Vector3[] innerPolygon; // Final road-adjusted vertices
-            public List<Vector3[]> subLots; // New: recursively divided lots
+            public List<Vector3ArrayWrapper> subLots; // New: recursively divided lots
             public CityBlock(int tl, int tr, int br, int bl)
             {
                 this.tl = tl; this.tr = tr; this.br = br; this.bl = bl;
@@ -111,8 +121,9 @@ namespace CityGen
 
             // 6. 블록별 실제 모양(Inner Polygon) 계산
             CalculateBlockShapes();
-        SubdivideAllBlocks(); // New: Divide blocks into sub-lots
+        SubdivideAllBlocks(); 
         GenerateMesh();
+        GenerateBuildingMeshes(); // New: Generate 3D geometry for lots
             sw.Stop();
             UnityEngine.Debug.Log($"도시 생성 완료: {nodes.Count} 노드, {uniqueSegments.Count} 도로 구간 (소요 시간: {sw.ElapsedMilliseconds}ms)");
 
@@ -623,6 +634,109 @@ namespace CityGen
             }
         }
 
+        private void GenerateBuildingMeshes()
+        {
+            // Clear existing buildings
+            Transform container = transform.Find("Buildings");
+            if (container != null) DestroyImmediate(container.gameObject);
+            
+            GameObject buildingRoot = new GameObject("Buildings");
+            buildingRoot.transform.SetParent(this.transform);
+
+            List<Vector3> verts = new List<Vector3>();
+            List<int> tris = new List<int>();
+            List<Vector3> normals = new List<Vector3>();
+
+            foreach (var block in cityBlocks)
+            {
+                if (block.subLots == null) continue;
+
+                foreach (var lot in block.subLots)
+                {
+                    float height = UnityEngine.Random.Range(minBuildingHeight, maxBuildingHeight);
+                    ExtrudeBuilding(lot.array, height, verts, tris, normals);
+                }
+            }
+
+            if (verts.Count > 0)
+            {
+                GameObject meshObj = new GameObject("CityBuildings");
+                meshObj.transform.SetParent(buildingRoot.transform);
+                MeshFilter mf = meshObj.AddComponent<MeshFilter>();
+                MeshRenderer mr = meshObj.AddComponent<MeshRenderer>();
+                mr.material = buildingMaterial != null ? buildingMaterial : (roadMaterial != null ? roadMaterial : meshRenderer.sharedMaterial);
+
+                Mesh mesh = new Mesh();
+                mesh.name = "BuildingMesh";
+                mesh.indexFormat = UnityEngine.Rendering.IndexFormat.UInt32;
+                mesh.SetVertices(verts);
+                mesh.SetTriangles(tris, 0);
+                mesh.SetNormals(normals);
+                mf.mesh = mesh;
+            }
+        }
+
+        private void ExtrudeBuilding(Vector3[] footprint, float height, List<Vector3> verts, List<int> tris, List<Vector3> normals)
+        {
+            if (footprint == null || footprint.Length < 3) return;
+
+            // Ensure consistent winding order (CCW) for outward normals
+            Vector3[] ccwFootprint = EnsureCCW(footprint);
+
+            // 1. Roof (Non-shared vertices for flat shading)
+            int roofStart = verts.Count;
+            for (int i = 0; i < ccwFootprint.Length; i++)
+            {
+                verts.Add(ccwFootprint[i] + Vector3.up * height);
+                normals.Add(Vector3.up);
+            }
+            // Triangulate roof (CCW for Y-up)
+            for (int i = 1; i < ccwFootprint.Length - 1; i++)
+            {
+                tris.Add(roofStart);
+                tris.Add(roofStart + i + 1); // Swapped to match CCW roof
+                tris.Add(roofStart + i);
+            }
+
+            // 2. Walls (Each quad has its own 4 vertices)
+            for (int i = 0; i < ccwFootprint.Length; i++)
+            {
+                Vector3 p1 = ccwFootprint[i];
+                Vector3 p2 = ccwFootprint[(i + 1) % ccwFootprint.Length];
+                
+                // For CCW, Cross(up, p2 - p1) points OUTWARDS
+                Vector3 wallNormal = Vector3.Cross(Vector3.up, (p2 - p1).normalized).normalized;
+
+                int v = verts.Count;
+                // Bottom-Left, Top-Left, Top-Right, Bottom-Right
+                verts.Add(p1);
+                verts.Add(p1 + Vector3.up * height);
+                verts.Add(p2 + Vector3.up * height);
+                verts.Add(p2);
+
+                for (int n = 0; n < 4; n++) normals.Add(wallNormal);
+
+                // Quad triangles (Standard CCW winding)
+                tris.Add(v); tris.Add(v + 1); tris.Add(v + 2);
+                tris.Add(v); tris.Add(v + 2); tris.Add(v + 3);
+            }
+        }
+
+        private Vector3[] EnsureCCW(Vector3[] polygon)
+        {
+            float area = CalculatePolygonArea(polygon, true); // Get signed area
+            if (area < 0) // It's CW, reverse it
+            {
+                Vector3[] reversed = new Vector3[polygon.Length];
+                for (int i = 0; i < polygon.Length; i++)
+                {
+                    reversed[i] = polygon[polygon.Length - 1 - i];
+                }
+                return reversed;
+            }
+            return polygon;
+        }
+
         private void SubdivideAllBlocks()
         {
             for (int i = 0; i < cityBlocks.Count; i++)
@@ -630,19 +744,19 @@ namespace CityGen
                 CityBlock b = cityBlocks[i];
                 if (b.innerPolygon != null && b.innerPolygon.Length >= 3)
                 {
-                    b.subLots = new List<Vector3[]>();
+                    b.subLots = new List<Vector3ArrayWrapper>();
                     SubdividePolygonRecursive(b.innerPolygon, 0, b.subLots);
                     cityBlocks[i] = b;
                 }
             }
         }
 
-        private void SubdividePolygonRecursive(Vector3[] polygon, int depth, List<Vector3[]> results)
+        private void SubdividePolygonRecursive(Vector3[] polygon, int depth, List<Vector3ArrayWrapper> results)
         {
             float area = CalculatePolygonArea(polygon);
             if (depth >= subdivisionDepth || area < minLotArea)
             {
-                results.Add(polygon);
+                results.Add(new Vector3ArrayWrapper { array = polygon });
                 return;
             }
 
@@ -674,7 +788,7 @@ namespace CityGen
             }
             else
             {
-                results.Add(polygon);
+                results.Add(new Vector3ArrayWrapper { array = polygon });
             }
         }
 
@@ -705,7 +819,7 @@ namespace CityGen
             return (sideA.ToArray(), sideB.ToArray());
         }
 
-        private float CalculatePolygonArea(Vector3[] polygon)
+        private float CalculatePolygonArea(Vector3[] polygon, bool signed = false)
         {
             float area = 0f;
             for (int i = 0; i < polygon.Length; i++)
@@ -714,7 +828,8 @@ namespace CityGen
                 Vector3 p2 = polygon[(i + 1) % polygon.Length];
                 area += (p1.x * p2.z - p2.x * p1.z);
             }
-            return Mathf.Abs(area) * 0.5f;
+            float result = area * 0.5f;
+            return signed ? result : Mathf.Abs(result);
         }
 
         private Vector3 GetSpecificRoadCorner(int nodeIdx, int neighborIdx, bool getLeft, bool isStartOfSegment)
@@ -1039,18 +1154,21 @@ namespace CityGen
 
 
             // Draw Junctions
-            for (int i = 0; i < nodes.Count; i++)
+            if (showRoadNodes)
             {
-                if (i >= adjacency.Count) continue;
-                int degree = adjacency[i].Count;
-                if (degree == 0) continue;
+                for (int i = 0; i < nodes.Count; i++)
+                {
+                    if (i >= adjacency.Count) continue;
+                    int degree = adjacency[i].Count;
+                    if (degree == 0) continue;
 
-                Gizmos.color = degree == 1 ? Color.red : (degree == 2 ? Color.yellow : Color.green);
-                Gizmos.DrawWireSphere(nodes[i], 0.15f);
+                    Gizmos.color = degree == 1 ? Color.red : (degree == 2 ? Color.yellow : Color.green);
+                    Gizmos.DrawWireSphere(nodes[i], 0.15f);
 #if UNITY_EDITOR
-                UnityEditor.Handles.color = Color.white;
-                UnityEditor.Handles.Label(nodes[i] + Vector3.up * 0.5f, i.ToString());
+                    UnityEditor.Handles.color = Color.white;
+                    UnityEditor.Handles.Label(nodes[i] + Vector3.up * 0.5f, i.ToString());
 #endif
+                }
             }
 
             // Draw City Blocks
@@ -1059,7 +1177,7 @@ namespace CityGen
                 CityBlock b = cityBlocks[i];
                 
                 // 1. Draw core boundary (BFS style corners)
-                if (b.tl < nodes.Count && b.tr < nodes.Count && b.br < nodes.Count && b.bl < nodes.Count)
+                if (showLogicalBlocks && b.tl < nodes.Count && b.tr < nodes.Count && b.br < nodes.Count && b.bl < nodes.Count)
                 {
                     Gizmos.color = new Color(0, 0, 1, 0.3f); // Blue for logical rect
                     Gizmos.DrawLine(nodes[b.tl], nodes[b.tr]);
@@ -1078,22 +1196,25 @@ namespace CityGen
                 if (b.innerPolygon != null && b.innerPolygon.Length >= 3)
                 {
                     // Draw outer boundary of buildable area
-                    Gizmos.color = new Color(0, 1, 0, 0.5f);
-                    for (int j = 0; j < b.innerPolygon.Length; j++)
+                    if (showBuildableAreas)
                     {
-                        Gizmos.DrawLine(b.innerPolygon[j], b.innerPolygon[(j + 1) % b.innerPolygon.Length]);
-                        Gizmos.DrawWireCube(b.innerPolygon[j], Vector3.one * 0.3f);
+                        Gizmos.color = new Color(0, 1, 0, 0.5f);
+                        for (int j = 0; j < b.innerPolygon.Length; j++)
+                        {
+                            Gizmos.DrawLine(b.innerPolygon[j], b.innerPolygon[(j + 1) % b.innerPolygon.Length]);
+                            Gizmos.DrawWireCube(b.innerPolygon[j], Vector3.one * 0.3f);
+                        }
                     }
 
                     // Draw sub-lots
-                    if (b.subLots != null)
+                    if (showSubLots && b.subLots != null)
                     {
                         Gizmos.color = new Color(1, 1, 0, 0.4f); // Yellow for lots
                         foreach (var lot in b.subLots)
                         {
-                            for (int j = 0; j < lot.Length; j++)
+                            for (int j = 0; j < lot.array.Length; j++)
                             {
-                                Gizmos.DrawLine(lot[j], lot[(j + 1) % lot.Length]);
+                                Gizmos.DrawLine(lot.array[j], lot.array[(j + 1) % lot.array.Length]);
                             }
                         }
                     }

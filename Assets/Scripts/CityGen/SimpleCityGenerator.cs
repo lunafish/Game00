@@ -577,42 +577,77 @@ namespace CityGen
 
                 // 1. Trace exact perimeter nodes using graph traversal
                 List<int> perimeter = new List<int>();
-                perimeter.Add(block.tl); // Ensure start node is included
+                perimeter.Add(block.tl);
                 perimeter.AddRange(FindPathBetweenCorners(block.tl, block.tr));
                 perimeter.AddRange(FindPathBetweenCorners(block.tr, block.br));
                 perimeter.AddRange(FindPathBetweenCorners(block.br, block.bl));
                 perimeter.AddRange(FindPathBetweenCorners(block.bl, block.tl));
 
-                // Remove consecutive duplicates
                 for (int j = perimeter.Count - 1; j > 0; j--)
-                {
                     if (perimeter[j] == perimeter[j - 1]) perimeter.RemoveAt(j);
-                }
-                // Also ensure the last node isn't the same as the first (closed loop)
                 if (perimeter.Count > 1 && perimeter[0] == perimeter[perimeter.Count - 1]) perimeter.RemoveAt(perimeter.Count - 1);
 
                 block.fullPerimeter = perimeter;
 
-                // 2. Assemble exact inner polygon using directional inward logic
-                Vector3[] polygon = new Vector3[perimeter.Count];
+                // 2. Assemble exact inner polygon by collecting corners from both incoming and outgoing segments
+                List<Vector3> polygonVerts = new List<Vector3>();
                 for (int j = 0; j < perimeter.Count; j++)
                 {
-                    int curr = perimeter[j];
                     int prev = perimeter[(j + perimeter.Count - 1) % perimeter.Count];
+                    int curr = perimeter[j];
                     int next = perimeter[(j + 1) % perimeter.Count];
-
-                    // Calculate inward direction at this node
-                    // For a CCW loop, the inward normal of segment (A -> B) is Cross(up, B - A)
-                    Vector3 inNormalPrev = Vector3.Cross(Vector3.up, (nodes[curr] - nodes[prev]).normalized);
-                    Vector3 inNormalNext = Vector3.Cross(Vector3.up, (nodes[next] - nodes[curr]).normalized);
-                    Vector3 inwardDir = (inNormalPrev + inNormalNext).normalized;
-
-                    polygon[j] = GetInwardJunctionCorner(curr, inwardDir);
+                    
+                    // A. End-Left corner of incoming segment (prev -> curr)
+                    polygonVerts.Add(GetSpecificRoadCorner(curr, prev, true, false));
+                    
+                    // B. Start-Left corner of outgoing segment (curr -> next)
+                    polygonVerts.Add(GetSpecificRoadCorner(curr, next, true, true));
                 }
 
-                block.innerPolygon = polygon;
+                // Remove consecutive duplicates (in case incoming and outgoing corners are the same)
+                for (int j = polygonVerts.Count - 1; j > 0; j--)
+                {
+                    if (Vector3.Distance(polygonVerts[j], polygonVerts[j-1]) < 0.001f)
+                        polygonVerts.RemoveAt(j);
+                }
+                if (polygonVerts.Count > 1 && Vector3.Distance(polygonVerts[0], polygonVerts[polygonVerts.Count-1]) < 0.001f)
+                    polygonVerts.RemoveAt(polygonVerts.Count-1);
+
+                block.innerPolygon = polygonVerts.ToArray();
                 cityBlocks[i] = block;
             }
+        }
+
+        private Vector3 GetSpecificRoadCorner(int nodeIdx, int neighborIdx, bool getLeft, bool isStartOfSegment)
+        {
+            if (!nodeJunctionCorners.ContainsKey(nodeIdx)) return nodes[nodeIdx];
+            
+            Vector3 center = nodes[nodeIdx];
+            Vector3 neighborPos = nodes[neighborIdx];
+            Vector3 dir = (neighborPos - center).normalized;
+            Vector3[] corners = nodeJunctionCorners[nodeIdx];
+
+            // 1. Find the two corners facing the neighbor (same logic as GenerateRoadBetweenJunctions)
+            var sorted = corners.Select((p, i) => new { p, mod = Vector3.Dot((p - center).normalized, dir) })
+                                .OrderByDescending(x => x.mod).Take(2).ToArray();
+
+            Vector3 c1 = sorted[0].p;
+            Vector3 c2 = sorted[1].p;
+
+            // 2. Look for the "Left" side relative to the road direction.
+            // If we are looking FROM nodeIdx TO neighborIdx (isStartOfSegment = true):
+            //   dir = (neighborPos - nodeIdx)
+            // If we are looking FROM neighborIdx TO nodeIdx (isStartOfSegment = false):
+            //   dir = (nodeIdx - neighborPos)
+            Vector3 refDir = isStartOfSegment ? dir : -dir;
+
+            float cross1 = Vector3.Cross(refDir, (c1 - center).normalized).y;
+            float cross2 = Vector3.Cross(refDir, (c2 - center).normalized).y;
+
+            // When isStartOfSegment is true, we want the "Left" corner facing NEXT (neighborIdx).
+            // When isStartOfSegment is false, we want the "Left" corner facing PREV (-neighborIdx).
+            if (getLeft) return cross1 > cross2 ? c1 : c2;
+            else return cross1 < cross2 ? c1 : c2;
         }
 
         /// <summary>

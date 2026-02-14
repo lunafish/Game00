@@ -1,6 +1,6 @@
 {
   "dependencies": {
-    "com.ivanmurzak.unity.mcp": "0.44.0",
+    "com.ivanmurzak.unity.mcp": "0.46.4",
     "com.unity.ai.navigation": "2.0.9",
     "com.unity.collab-proxy": "2.11.2",
     "com.unity.ide.rider": "3.0.38",
@@ -52,12 +52,12 @@
       "name": "package.openupm.com",
       "url": "https://package.openupm.com",
       "scopes": [
-        "com.ivanmurzak",
         "extensions.unity",
-        "org.nuget.com.ivanmurzak",
         "org.nuget.microsoft",
         "org.nuget.system",
-        "org.nuget.r3"
+        "org.nuget.r3",
+        "com.ivanmurzak",
+        "org.nuget.com.ivanmurzak"
       ]
     }
   ]

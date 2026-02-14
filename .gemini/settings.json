@@ -1,13 +1,8 @@
 {
   "mcpServers": {
     "ai-game-developer": {
-      "type": "stdio",
-      "command": "/Users/lunafish/Documents/project/Game00/Library/mcp-server/osx-arm64/unity-mcp-server",
-      "args": [
-        "port=54437",
-        "plugin-timeout=10000",
-        "client-transport=stdio"
-      ]
+      "type": "http",
+      "url": "http://localhost:54437"
     }
   }
 }

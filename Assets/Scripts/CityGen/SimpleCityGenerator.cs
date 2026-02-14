@@ -1,57 +1,66 @@
 using System.Collections.Generic;
-using UnityEngine;
 using System.Diagnostics;
 using System.Linq;
+using UnityEngine;
+using Debug = UnityEngine.Debug;
+using Random = UnityEngine.Random;
 
 namespace CityGen
 {
     /// <summary>
     /// 재귀적 분할(BSP) 알고리즘을 사용하여 도시 도로망을 생성하고 메쉬를 형성하는 클래스입니다.
     /// </summary>
-    [RequireComponent(typeof(MeshFilter), typeof(MeshRenderer))]
+    [RequireComponent(typeof(MeshFilter), typeof(MeshRenderer), typeof(MeshCollider))]
     public class SimpleCityGenerator : MonoBehaviour, ISerializationCallbackReceiver
     {
         [Header("분할 설정 (Subdivision Settings)")]
         public int seed = 1234;
         public Vector2 citySize = new Vector2(100, 100);
+        public int maxDepth = 5;
         public float minBlockSize = 20f;
-    public int subdivisionDepth = 2; // New: subdivision for lots
-    public float minLotArea = 100f; // New: minimum area for a lot
-    [Range(0, 0.45f)] public float lotSplitJitter = 0.2f; // New: randomization of split ratio
-    public float minBuildingHeight = 10f;
-    public float maxBuildingHeight = 30f;
-    public Material buildingMaterial;
-    public Material roadMaterial;
         [Range(0, 0.4f)] public float splitJitter = 0.1f;
         [Range(0, 5f)] public float nodeJitter = 1.0f;
-        public int maxDepth = 5;
+
+        [Header("건물 및 부지 설정 (Building & Lot Settings)")]
+        public int subdivisionDepth = 2;
+        public float minLotArea = 100f;
+        [Range(0, 0.45f)] public float lotSplitJitter = 0.2f;
+        
+        public float floorHeight = 3.0f;
+        public int minFloors = 3;
+        public int maxFloors = 10;
+        
+        public Material buildingMaterial;
 
         [Header("메쉬 설정 (Mesh Settings)")]
         public float roadWidth = 2.0f;
+        public Material roadMaterial;
         [Range(0.001f, 2.0f)] public float weldTolerance = 2.0f;
         public MeshFilter meshFilter;
         public MeshRenderer meshRenderer;
-        
+
         [Header("디버그 설정 (Debug Settings)")]
         public bool showRoadNodes = true;
         public bool showLogicalBlocks = false;
         public bool showBuildableAreas = true;
         public bool showSubLots = true;
 
-        // 그래프 데이터 (직렬화 가능하도록 속성 추가)
+        // --- 그래프 데이터 ---
         [SerializeField, HideInInspector] protected List<Vector3> nodes = new List<Vector3>();
         protected HashSet<RoadSegment> uniqueSegments = new HashSet<RoadSegment>();
         protected List<List<int>> adjacency = new List<List<int>>();
+        private Dictionary<int, Vector3[]> _nodeJunctionCorners = new Dictionary<int, Vector3[]>();
+        [SerializeField, HideInInspector] protected List<CityBlock> cityBlocks = new List<CityBlock>();
+        private Transform _buildingRoot;
 
-        private Dictionary<int, Vector3[]> nodeJunctionCorners = new Dictionary<int, Vector3[]>();
 
-        // 직렬화를 위한 임시 보관용 데이터
+        // --- 직렬화 데이터 ---
         [SerializeField, HideInInspector] private List<RoadSegment> serializedSegments = new List<RoadSegment>();
         [SerializeField, HideInInspector] private List<int> junctionKeys = new List<int>();
-        
+        [SerializeField, HideInInspector] private List<Vector3ArrayWrapper> junctionValues = new List<Vector3ArrayWrapper>();
+
         [System.Serializable]
         public struct Vector3ArrayWrapper { public Vector3[] array; }
-        [SerializeField, HideInInspector] private List<Vector3ArrayWrapper> junctionValues = new List<Vector3ArrayWrapper>();
 
         [System.Serializable]
         public struct CityBlock
@@ -68,8 +77,6 @@ namespace CityGen
                 this.subLots = null;
             }
         }
-        [SerializeField, HideInInspector] protected List<CityBlock> cityBlocks = new List<CityBlock>();
-
 
         [System.Serializable]
         public struct RoadSegment : System.IEquatable<RoadSegment>
@@ -91,41 +98,39 @@ namespace CityGen
         public void Generate()
         {
             Stopwatch sw = Stopwatch.StartNew();
-            
+
             SetupComponents();
             ClearGraph();
-            UnityEngine.Random.InitState(seed);
+            Random.InitState(seed);
 
             Rect totalArea = new Rect(-citySize.x / 2f, -citySize.y / 2f, citySize.x, citySize.y);
-            
-            // 1. 초기 외곽 노드 생성
+
+            // 1. 외곽 경계 생성
+            DrawBoundary(totalArea);
+
+            // 2. 재귀적 공간 분할 (도로망 생성)
             int blNode = GetOrAddNode(new Vector3(totalArea.xMin, 0, totalArea.yMin));
             int brNode = GetOrAddNode(new Vector3(totalArea.xMax, 0, totalArea.yMin));
             int trNode = GetOrAddNode(new Vector3(totalArea.xMax, 0, totalArea.yMax));
             int tlNode = GetOrAddNode(new Vector3(totalArea.xMin, 0, totalArea.yMax));
-
-            // 2. 외곽 경계 생성
-            DrawBoundary(totalArea);
-
-            // 3. 재귀적 공간 분할 (코너 정보 동기화)
             Subdivide(totalArea, 0, tlNode, trNode, brNode, blNode);
 
-            // 4. 노드 지터(Jitter) 적용 (자연스러운 그리드 형성)
+            // 3. 노드 정리 및 지터(Jitter) 적용 (자연스러운 그리드 형성)
             JitterNodes();
-
-            // 4. 인접 리스트 재구축
             RebuildAdjacency();
 
-            // // 5. 메쉬 생성 및 최적화
+            // 4. 도로 메쉬 생성
             GenerateMesh();
 
-            // 6. 블록별 실제 모양(Inner Polygon) 계산
+            // 5. 블록 및 건물 부지 계산
             CalculateBlockShapes();
-        SubdivideAllBlocks(); 
-        GenerateMesh();
-        GenerateBuildingMeshes(); // New: Generate 3D geometry for lots
+            SubdivideAllBlocks();
+
+            // 6. 건물 메쉬 생성
+            GenerateBuildingMeshes();
+
             sw.Stop();
-            UnityEngine.Debug.Log($"도시 생성 완료: {nodes.Count} 노드, {uniqueSegments.Count} 도로 구간 (소요 시간: {sw.ElapsedMilliseconds}ms)");
+            Debug.Log($"도시 생성 완료: {nodes.Count} 노드, {uniqueSegments.Count} 도로 구간 (소요 시간: {sw.ElapsedMilliseconds}ms)");
 
 #if UNITY_EDITOR
             // 에디터에서 데이터 변경을 저장하기 위해 더티 플래그 설정
@@ -137,10 +142,6 @@ namespace CityGen
 #endif
         }
 
-        /// <summary>
-        /// 인접한 노드들이 너무 가까울 경우 서로 끌어당겨 통합(Consolidate)하거나 
-        /// 격자를 자연스럽게 조정합니다. (기존 척력 로직에서 통합 로직으로 변경)
-        /// </summary>
         /// <summary>
         /// 1. 가까운 교차로들을 통합(Consolidate)하여 그래프를 단순화하고,
         /// 2. 도로가 겹치지 않는 범위 내에서 안전하게 지터(Jitter)를 적용합니다.
@@ -175,10 +176,10 @@ namespace CityGen
                 if (maxJitter < 0.01f) continue;
 
                 Vector3 randomOffset = new Vector3(
-                    UnityEngine.Random.Range(-1f, 1f),
+                    Random.Range(-1f, 1f),
                     0,
-                    UnityEngine.Random.Range(-1f, 1f)
-                ).normalized * UnityEngine.Random.Range(0, maxJitter);
+                    Random.Range(-1f, 1f)
+                ).normalized * Random.Range(0, maxJitter);
 
                 nodes[i] += randomOffset;
             }
@@ -247,8 +248,6 @@ namespace CityGen
                     }
 
                     // 노드 리스트 갱신
-
-                    // 노드 리스트 갱신
                     nodes = newNodes;
 
                     // 세그먼트 리스트 갱신 (리맵핑 및 중복 제거)
@@ -256,7 +255,7 @@ namespace CityGen
                     foreach (var seg in uniqueSegments)
                     {
                         if (!redirectMap.ContainsKey(seg.a) || !redirectMap.ContainsKey(seg.b)) continue;
-                        
+
                         int newA = redirectMap[seg.a];
                         int newB = redirectMap[seg.b];
 
@@ -266,7 +265,7 @@ namespace CityGen
                         }
                     }
                     uniqueSegments = newSegments;
-                    
+
                     // 인접 리스트 즉시 갱신 (다음 반복이나 Jitter에서 사용)
                     RebuildAdjacency();
                 }
@@ -313,9 +312,9 @@ namespace CityGen
             if (area.width > area.height * 1.5f) horizontalSplit = false;
             else if (area.height > area.width * 1.5f) horizontalSplit = true;
 
-            float splitPos = horizontalSplit 
-                ? area.yMin + area.height * UnityEngine.Random.Range(0.4f - splitJitter, 0.6f + splitJitter)
-                : area.xMin + area.width * UnityEngine.Random.Range(0.4f - splitJitter, 0.6f + splitJitter);
+            float splitPos = horizontalSplit
+                ? area.yMin + area.height * Random.Range(0.4f - splitJitter, 0.6f + splitJitter)
+                : area.xMin + area.width * Random.Range(0.4f - splitJitter, 0.6f + splitJitter);
 
             if (horizontalSplit)
             {
@@ -390,13 +389,13 @@ namespace CityGen
 
             // Deduplicate and Sort
             splitPoints.Sort((a, b) => Vector3.Distance(start, a).CompareTo(Vector3.Distance(start, b)));
-            
+
             for (int i = 0; i < splitPoints.Count - 1; i++)
             {
-                if (Vector3.Distance(splitPoints[i], splitPoints[i+1]) > 0.1f)
+                if (Vector3.Distance(splitPoints[i], splitPoints[i + 1]) > 0.1f)
                 {
                     int a = GetOrAddNode(splitPoints[i]);
-                    int b = GetOrAddNode(splitPoints[i+1]);
+                    int b = GetOrAddNode(splitPoints[i + 1]);
                     uniqueSegments.Add(new RoadSegment(a, b));
                 }
             }
@@ -442,7 +441,7 @@ namespace CityGen
             List<int> finalTris = new List<int>();
 
             // 교차로 데이터 초기화
-            nodeJunctionCorners.Clear();
+            _nodeJunctionCorners.Clear();
 
             // --- Pass 1: 교차로 형상 계산 및 생성 ---
             for (int i = 0; i < nodes.Count; i++)
@@ -466,7 +465,7 @@ namespace CityGen
             mesh.RecalculateNormals();
             mesh.RecalculateBounds();
             meshFilter.mesh = mesh;
-            
+
             // 콜라이더 업데이트
             if (GetComponent<MeshCollider>())
                 GetComponent<MeshCollider>().sharedMesh = mesh;
@@ -517,25 +516,25 @@ namespace CityGen
             tris.Add(startIdx + 0); tris.Add(startIdx + 2); tris.Add(startIdx + 3);
 
             // 데이터 저장
-            nodeJunctionCorners[nodeIdx] = worldCorners;
+            _nodeJunctionCorners[nodeIdx] = worldCorners;
         }
 
         private void GenerateRoadBetweenJunctions(RoadSegment seg, List<Vector3> verts, List<Color> colors, List<int> tris)
         {
-            if (!nodeJunctionCorners.ContainsKey(seg.a) || !nodeJunctionCorners.ContainsKey(seg.b)) return;
+            if (!_nodeJunctionCorners.ContainsKey(seg.a) || !_nodeJunctionCorners.ContainsKey(seg.b)) return;
 
-            Vector3[] cA = nodeJunctionCorners[seg.a];
-            Vector3[] cB = nodeJunctionCorners[seg.b];
+            Vector3[] cA = _nodeJunctionCorners[seg.a];
+            Vector3[] cB = _nodeJunctionCorners[seg.b];
             Vector3 pA = nodes[seg.a];
             Vector3 pB = nodes[seg.b];
 
             // A 교차로에서 B를 향하는 가장 가까운 두 코너 찾기
             // 사각형 코너 중 도로 방향(pB - pA)과 내적했을 때 가장 값이 큰 두 점이 연결점
             Vector3 dir = (pB - pA).normalized;
-            
+
             var sortedA = cA.Select((p, i) => new { p, i, mod = Vector3.Dot((p - pA).normalized, dir) })
                             .OrderByDescending(x => x.mod).Take(2).ToArray();
-            
+
             // B 교차로에서는 A를 향하는 방향(-dir)으로 가장 가까운 두 코너 찾기
             var sortedB = cB.Select((p, i) => new { p, i, mod = Vector3.Dot((p - pB).normalized, -dir) })
                             .OrderByDescending(x => x.mod).Take(2).ToArray();
@@ -557,14 +556,10 @@ namespace CityGen
                 finalB2 = b1;
             }
 
-            // 메쉬 생성 (A1, A2, B1, B2 순서 가정 - Quad)
-            // 면의 방향(Normal)을 위쪽으로 맞추기 위해 외적 등을 확인해야 하지만, 
-            // 2D 평면이므로 단순 정렬로도 충분 (보통 시계방향/반시계방향 일관성 있으면 됨)
-
             // 순서 정렬: A1 -> B1 -> B2 -> A2 (반시계)
             // 벡터 (A2-A1) 외적 (B1-A1) 이 Y축 양수면 OK
             Vector3 cross = Vector3.Cross(finalB1 - finalA1, finalA2 - finalA1);
-            if (cross.y < 0) 
+            if (cross.y < 0)
             {
                 // 뒤집힘
                 Vector3 temp = finalA1; finalA1 = finalA2; finalA2 = temp;
@@ -612,10 +607,10 @@ namespace CityGen
                     int prev = perimeter[(j + perimeter.Count - 1) % perimeter.Count];
                     int curr = perimeter[j];
                     int next = perimeter[(j + 1) % perimeter.Count];
-                    
+
                     // A. End-Left corner of incoming segment (prev -> curr)
                     polygonVerts.Add(GetSpecificRoadCorner(curr, prev, true, false));
-                    
+
                     // B. Start-Left corner of outgoing segment (curr -> next)
                     polygonVerts.Add(GetSpecificRoadCorner(curr, next, true, true));
                 }
@@ -623,11 +618,11 @@ namespace CityGen
                 // Remove consecutive duplicates (in case incoming and outgoing corners are the same)
                 for (int j = polygonVerts.Count - 1; j > 0; j--)
                 {
-                    if (Vector3.Distance(polygonVerts[j], polygonVerts[j-1]) < 0.001f)
+                    if (Vector3.Distance(polygonVerts[j], polygonVerts[j - 1]) < 0.001f)
                         polygonVerts.RemoveAt(j);
                 }
-                if (polygonVerts.Count > 1 && Vector3.Distance(polygonVerts[0], polygonVerts[polygonVerts.Count-1]) < 0.001f)
-                    polygonVerts.RemoveAt(polygonVerts.Count-1);
+                if (polygonVerts.Count > 1 && Vector3.Distance(polygonVerts[0], polygonVerts[polygonVerts.Count - 1]) < 0.001f)
+                    polygonVerts.RemoveAt(polygonVerts.Count - 1);
 
                 block.innerPolygon = polygonVerts.ToArray();
                 cityBlocks[i] = block;
@@ -637,11 +632,13 @@ namespace CityGen
         private void GenerateBuildingMeshes()
         {
             // Clear existing buildings
-            Transform container = transform.Find("Buildings");
-            if (container != null) DestroyImmediate(container.gameObject);
+            if (_buildingRoot != null)
+            {
+                DestroyImmediate(_buildingRoot.gameObject);
+            }
             
-            GameObject buildingRoot = new GameObject("Buildings");
-            buildingRoot.transform.SetParent(this.transform);
+            _buildingRoot = new GameObject("Buildings").transform;
+            _buildingRoot.SetParent(transform);
 
             List<Vector3> verts = new List<Vector3>();
             List<int> tris = new List<int>();
@@ -653,15 +650,16 @@ namespace CityGen
 
                 foreach (var lot in block.subLots)
                 {
-                    float height = UnityEngine.Random.Range(minBuildingHeight, maxBuildingHeight);
-                    ExtrudeBuilding(lot.array, height, verts, tris, normals);
+                    // [Modified] 랜덤 층수 결정
+                    int floors = Random.Range(minFloors, maxFloors + 1);
+                    ExtrudeBuilding(lot.array, floors, verts, tris, normals);
                 }
             }
 
             if (verts.Count > 0)
             {
                 GameObject meshObj = new GameObject("CityBuildings");
-                meshObj.transform.SetParent(buildingRoot.transform);
+                meshObj.transform.SetParent(_buildingRoot);
                 MeshFilter mf = meshObj.AddComponent<MeshFilter>();
                 MeshRenderer mr = meshObj.AddComponent<MeshRenderer>();
                 mr.material = buildingMaterial != null ? buildingMaterial : (roadMaterial != null ? roadMaterial : meshRenderer.sharedMaterial);
@@ -673,52 +671,68 @@ namespace CityGen
                 mesh.SetTriangles(tris, 0);
                 mesh.SetNormals(normals);
                 mf.mesh = mesh;
+
+                // 콜라이더 추가
+                MeshCollider mc = meshObj.AddComponent<MeshCollider>();
+                mc.sharedMesh = mesh;
             }
         }
 
-        private void ExtrudeBuilding(Vector3[] footprint, float height, List<Vector3> verts, List<int> tris, List<Vector3> normals)
+        private void ExtrudeBuilding(Vector3[] footprint, int floors, List<Vector3> verts, List<int> tris, List<Vector3> normals)
         {
             if (footprint == null || footprint.Length < 3) return;
 
             // Ensure consistent winding order (CCW) for outward normals
             Vector3[] ccwFootprint = EnsureCCW(footprint);
+            int corners = ccwFootprint.Length;
 
-            // 1. Roof (Non-shared vertices for flat shading)
-            int roofStart = verts.Count;
-            for (int i = 0; i < ccwFootprint.Length; i++)
+            for (int f = 0; f < floors; f++)
             {
-                verts.Add(ccwFootprint[i] + Vector3.up * height);
-                normals.Add(Vector3.up);
-            }
-            // Triangulate roof (CCW for Y-up)
-            for (int i = 1; i < ccwFootprint.Length - 1; i++)
-            {
-                tris.Add(roofStart);
-                tris.Add(roofStart + i + 1); // Swapped to match CCW roof
-                tris.Add(roofStart + i);
-            }
+                float currentY = f * floorHeight;
+                float nextY = (f + 1) * floorHeight;
 
-            // 2. Walls (Each quad has its own 4 vertices)
-            for (int i = 0; i < ccwFootprint.Length; i++)
-            {
-                Vector3 p1 = ccwFootprint[i];
-                Vector3 p2 = ccwFootprint[(i + 1) % ccwFootprint.Length];
-                
-                // For CCW, Cross(up, p2 - p1) points OUTWARDS
-                Vector3 wallNormal = Vector3.Cross(Vector3.up, (p2 - p1).normalized).normalized;
+                // 1. Walls (항상 생성)
+                for (int i = 0; i < corners; i++)
+                {
+                    Vector3 p1 = ccwFootprint[i];
+                    Vector3 p2 = ccwFootprint[(i + 1) % corners];
+                    
+                    Vector3 wallNormal = Vector3.Cross(Vector3.up, (p2 - p1).normalized).normalized;
 
-                int v = verts.Count;
-                // Bottom-Left, Top-Left, Top-Right, Bottom-Right
-                verts.Add(p1);
-                verts.Add(p1 + Vector3.up * height);
-                verts.Add(p2 + Vector3.up * height);
-                verts.Add(p2);
+                    int v = verts.Count;
+                    
+                    // Bottom-Left, Top-Left, Top-Right, Bottom-Right
+                    verts.Add(p1 + Vector3.up * currentY);
+                    verts.Add(p1 + Vector3.up * nextY);
+                    verts.Add(p2 + Vector3.up * nextY);
+                    verts.Add(p2 + Vector3.up * currentY);
 
-                for (int n = 0; n < 4; n++) normals.Add(wallNormal);
+                    for (int n = 0; n < 4; n++) normals.Add(wallNormal);
 
-                // Quad triangles (Standard CCW winding)
-                tris.Add(v); tris.Add(v + 1); tris.Add(v + 2);
-                tris.Add(v); tris.Add(v + 2); tris.Add(v + 3);
+                    tris.Add(v); tris.Add(v + 1); tris.Add(v + 2);
+                    tris.Add(v); tris.Add(v + 2); tris.Add(v + 3);
+                }
+
+                // 2. Roof (맨 위층만 생성)
+                if (f == floors - 1)
+                {
+                    int roofStart = verts.Count;
+                    for (int i = 0; i < corners; i++)
+                    {
+                        verts.Add(ccwFootprint[i] + Vector3.up * nextY);
+                        normals.Add(Vector3.up);
+                    }
+                    // Simple Fan Triangulation (Convex Polygon 가정)
+                    for (int i = 1; i < corners - 1; i++)
+                    {
+                        tris.Add(roofStart);
+                        tris.Add(roofStart + i + 1);
+                        tris.Add(roofStart + i);
+                    }
+                }
+
+                // 3. Floor (생성하지 않음 - 내부 메쉬 제거)
+                // 맨 아래층 바닥도 지면에 닿아있으므로 생성 불필요
             }
         }
 
@@ -764,11 +778,11 @@ namespace CityGen
             Bounds b = new Bounds(polygon[0], Vector3.zero);
             foreach (var p in polygon) b.Encapsulate(p);
 
-            float ratio = 0.5f + UnityEngine.Random.Range(-lotSplitJitter, lotSplitJitter);
-            
+            float ratio = 0.5f + Random.Range(-lotSplitJitter, lotSplitJitter);
+
             Vector3 splitPoint;
             Vector3 splitDir;
-            
+
             if (b.size.x > b.size.z)
             {
                 splitPoint = new Vector3(b.min.x + b.size.x * ratio, b.center.y, b.center.z);
@@ -779,7 +793,7 @@ namespace CityGen
                 splitPoint = new Vector3(b.center.x, b.center.y, b.min.z + b.size.z * ratio);
                 splitDir = Vector3.forward;
             }
-            
+
             var split = SplitPolygon(polygon, splitPoint, splitDir);
             if (split.Item1 != null && split.Item2 != null && split.Item1.Length >= 3 && split.Item2.Length >= 3)
             {
@@ -834,12 +848,12 @@ namespace CityGen
 
         private Vector3 GetSpecificRoadCorner(int nodeIdx, int neighborIdx, bool getLeft, bool isStartOfSegment)
         {
-            if (!nodeJunctionCorners.ContainsKey(nodeIdx)) return nodes[nodeIdx];
-            
+            if (!_nodeJunctionCorners.ContainsKey(nodeIdx)) return nodes[nodeIdx];
+
             Vector3 center = nodes[nodeIdx];
             Vector3 neighborPos = nodes[neighborIdx];
             Vector3 dir = (neighborPos - center).normalized;
-            Vector3[] corners = nodeJunctionCorners[nodeIdx];
+            Vector3[] corners = _nodeJunctionCorners[nodeIdx];
 
             // 1. Find the two corners facing the neighbor (same logic as GenerateRoadBetweenJunctions)
             var sorted = corners.Select((p, i) => new { p, mod = Vector3.Dot((p - center).normalized, dir) })
@@ -849,24 +863,17 @@ namespace CityGen
             Vector3 c2 = sorted[1].p;
 
             // 2. Look for the "Left" side relative to the road direction.
-            // If we are looking FROM nodeIdx TO neighborIdx (isStartOfSegment = true):
-            //   dir = (neighborPos - nodeIdx)
-            // If we are looking FROM neighborIdx TO nodeIdx (isStartOfSegment = false):
-            //   dir = (nodeIdx - neighborPos)
             Vector3 refDir = isStartOfSegment ? dir : -dir;
 
             float cross1 = Vector3.Cross(refDir, (c1 - center).normalized).y;
             float cross2 = Vector3.Cross(refDir, (c2 - center).normalized).y;
 
-            // When isStartOfSegment is true, we want the "Left" corner facing NEXT (neighborIdx).
-            // When isStartOfSegment is false, we want the "Left" corner facing PREV (-neighborIdx).
             if (getLeft) return cross1 > cross2 ? c1 : c2;
             else return cross1 < cross2 ? c1 : c2;
         }
 
         /// <summary>
-        /// 두 코너 노드 사이의 최단 경로(도로 세그먼트 체인)를 찾아 반환합니다. 
-        /// 블록의 한 변을 구성하는 모든 중간 정점들을 수집합니다.
+        /// 두 코너 노드 사이의 최단 경로(도로 세그먼트 체인)를 찾아 반환합니다.
         /// </summary>
         private List<int> FindPathBetweenCorners(int startIdx, int endIdx)
         {
@@ -911,61 +918,10 @@ namespace CityGen
                     step = parentMap[step];
                 }
                 path.Reverse();
-                // Add startIdx at the beginning? We use AddRange, so we skip the very first startIdx 
-                // to avoid duplication with the previous edge's endIdx.
-                // Except for the first edge of the first block... wait.
-                // If we do: Path(tl,tr) -> Path(tr,br)...
-                // Path(tl,tr) returns [intermediate1, intermediate2, tr]
-                // Path(tr,br) returns [intermediate3, br]
-                // This will work perfectly as a CCW loop.
             }
 
             return path;
         }
-
-        private Vector3 GetInwardJunctionCorner(int nodeIdx, Vector3 inwardDir)
-        {
-            if (!nodeJunctionCorners.ContainsKey(nodeIdx)) return nodes[nodeIdx];
-            
-            Vector3 center = nodes[nodeIdx];
-            Vector3[] corners = nodeJunctionCorners[nodeIdx];
-            Vector3 best = corners[0];
-            float maxDot = Vector3.Dot((best - center).normalized, inwardDir);
-
-            for (int i = 1; i < corners.Length; i++)
-            {
-                float dot = Vector3.Dot((corners[i] - center).normalized, inwardDir);
-                if (dot > maxDot)
-                {
-                    maxDot = dot;
-                    best = corners[i];
-                }
-            }
-            return best;
-        }
-
-        private Vector3 GetClosestJunctionCorner(int nodeIdx, Vector3 target)
-        {
-            if (!nodeJunctionCorners.ContainsKey(nodeIdx)) return nodes[nodeIdx];
-            
-            Vector3[] corners = nodeJunctionCorners[nodeIdx];
-            Vector3 best = corners[0];
-            float minDist = Vector3.SqrMagnitude(best - target);
-
-            for (int i = 1; i < corners.Length; i++)
-            {
-                float d = Vector3.SqrMagnitude(corners[i] - target);
-                if (d < minDist)
-                {
-                    minDist = d;
-                    best = corners[i];
-                }
-            }
-            return best;
-        }
-
-
-
 
         private void SetupComponents()
         {
@@ -984,80 +940,15 @@ namespace CityGen
                 Material m = new Material(urpLit);
                 m.name = "Road_Material";
                 m.color = new Color(0.2f, 0.2f, 0.2f); // Dark road surface
-                
+
                 // URP Lit properties (if using URP)
                 if (urpLit.name.Contains("Universal Render Pipeline"))
                 {
                     m.SetFloat("_Roughness", 0.8f);
                     m.SetFloat("_Metallic", 0.0f);
                 }
-                
+
                 meshRenderer.sharedMaterials = new Material[] { m };
-            }
-        }
-
-
-
-        /// <summary>
-        /// 격자 공간 분할을 사용하여 지정된 거리(Tolerance) 내의 중복 정점들을 병합합니다.
-        /// </summary>
-        private void WeldVertices(Mesh mesh, bool logResult = true, float ratio = 1.0f)
-        {
-            Vector3[] oldVerts = mesh.vertices;
-            Color[] oldColors = mesh.colors;
-            List<Vector3> newVerts = new List<Vector3>();
-            List<Color> newColors = new List<Color>();
-            
-            int submeshCount = mesh.subMeshCount;
-            List<int[]> newSubmeshTris = new List<int[]>();
-            
-            // Scaled quantization to allow stable floating point comparison
-            float invTol = 1f / Mathf.Max(0.001f, weldTolerance * ratio);
-            Dictionary<Vector3Int, int> weldMap = new Dictionary<Vector3Int, int>();
-
-            for (int subIdx = 0; subIdx < submeshCount; subIdx++)
-            {
-                int[] oldTris = mesh.GetTriangles(subIdx);
-                int[] newTris = new int[oldTris.Length];
-
-                for (int i = 0; i < oldTris.Length; i++)
-                {
-                    int oldVIdx = oldTris[i];
-                    Vector3 pos = oldVerts[oldVIdx];
-                    
-                    Vector3Int qPos = new Vector3Int(
-                        Mathf.RoundToInt(pos.x * invTol),
-                        Mathf.RoundToInt(pos.y * invTol),
-                        Mathf.RoundToInt(pos.z * invTol)
-                    );
-
-                    if (!weldMap.TryGetValue(qPos, out int newVIdx))
-                    {
-                        newVIdx = newVerts.Count;
-                        newVerts.Add(pos);
-                        newColors.Add(oldColors.Length > oldVIdx ? oldColors[oldVIdx] : Color.white);
-                        weldMap.Add(qPos, newVIdx);
-                    }
-                    newTris[i] = newVIdx;
-                }
-                newSubmeshTris.Add(newTris);
-            }
-
-            mesh.Clear();
-            mesh.vertices = newVerts.ToArray();
-            mesh.colors = newColors.ToArray();
-            mesh.subMeshCount = submeshCount;
-            for (int i = 0; i < submeshCount; i++)
-            {
-                mesh.SetTriangles(newSubmeshTris[i], i);
-            }
-
-            if (logResult)
-            {
-                int originalCount = oldVerts.Length;
-                int weldedCount = newVerts.Count;
-                float reduction = originalCount > 0 ? (1f - (float)weldedCount / originalCount) * 100f : 0f;
-                UnityEngine.Debug.Log($"[메쉬 최적화] 병합 완료: 정점 수 {originalCount} -> {weldedCount} ({reduction:F1}% 감소)");
             }
         }
 
@@ -1066,7 +957,7 @@ namespace CityGen
             nodes.Clear();
             uniqueSegments.Clear();
             adjacency.Clear();
-            nodeJunctionCorners.Clear();
+            _nodeJunctionCorners.Clear();
             cityBlocks.Clear();
         }
 
@@ -1081,20 +972,6 @@ namespace CityGen
             return nodes.Count - 1;
         }
 
-        protected bool AddSegmentIfValid(int a, int b)
-        {
-            if (a == b) return false;
-            RoadSegment seg = new RoadSegment(a, b);
-            if (uniqueSegments.Add(seg))
-            {
-                while (adjacency.Count <= Mathf.Max(a, b)) adjacency.Add(new List<int>());
-                adjacency[a].Add(b);
-                adjacency[b].Add(a);
-                return true;
-            }
-            return false;
-        }
-
         #region Serialization
         public void OnBeforeSerialize()
         {
@@ -1105,7 +982,7 @@ namespace CityGen
             // Dictionary -> List 변환
             junctionKeys.Clear();
             junctionValues.Clear();
-            foreach (var kvp in nodeJunctionCorners)
+            foreach (var kvp in _nodeJunctionCorners)
             {
                 if (kvp.Value == null) continue;
                 junctionKeys.Add(kvp.Key);
@@ -1123,12 +1000,12 @@ namespace CityGen
             }
 
             // List -> Dictionary 복구
-            nodeJunctionCorners.Clear();
+            _nodeJunctionCorners.Clear();
             if (junctionKeys != null && junctionValues != null && junctionKeys.Count == junctionValues.Count)
             {
                 for (int i = 0; i < junctionKeys.Count; i++)
                 {
-                    nodeJunctionCorners[junctionKeys[i]] = junctionValues[i].array;
+                    _nodeJunctionCorners[junctionKeys[i]] = junctionValues[i].array;
                 }
             }
 
@@ -1175,7 +1052,7 @@ namespace CityGen
             for (int i = 0; i < cityBlocks.Count; i++)
             {
                 CityBlock b = cityBlocks[i];
-                
+
                 // 1. Draw core boundary (BFS style corners)
                 if (showLogicalBlocks && b.tl < nodes.Count && b.tr < nodes.Count && b.br < nodes.Count && b.bl < nodes.Count)
                 {

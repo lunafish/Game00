@@ -25,8 +25,10 @@ namespace CityGen
         public int subdivisionDepth = 2;
         public float minLotArea = 100f;
         [Range(0, 0.45f)] public float lotSplitJitter = 0.2f;
-        public float minBuildingHeight = 5f;
-        public float maxBuildingHeight = 20f;
+        
+        public float floorHeight = 3.0f;
+        public int minFloors = 2;
+        public int maxFloors = 10;
         
         public Material buildingMaterial;
 
@@ -654,38 +656,50 @@ namespace CityGen
             List<int> allTris = new List<int>();
             List<Vector2> allUvs = new List<Vector2>();
             
-            // 디버그용 리스트 초기화
             _debugLotVerts.Clear();
-            
             int vertOffset = 0;
 
-            // 모든 블록의 서브 부지(Lot) 순회
             foreach (var block in cityBlocks)
             {
                 if (block.subLots == null || block.subLots.Count == 0) continue;
 
-                foreach (var lotWrapper in block.subLots)
+                // 1. 블록 내 모든 부지에 층수 사전 할당
+                int[] lotFloors = new int[block.subLots.Count];
+                for (int i = 0; i < block.subLots.Count; i++)
+                    lotFloors[i] = Random.Range(minFloors, maxFloors + 1);
+
+                // 2. 엣지 공유 정보 맵핑 (엣지 -> 해당 엣지를 가진 부지들의 층수 리스트)
+                var edgeToFloors = new Dictionary<EdgeKey, List<int>>();
+                for (int i = 0; i < block.subLots.Count; i++)
                 {
-                    Vector3[] poly = lotWrapper.array;
+                    Vector3[] poly = block.subLots[i].array;
+                    if (poly == null) continue;
+                    for (int j = 0; j < poly.Length; j++)
+                    {
+                        EdgeKey key = new EdgeKey(poly[j], poly[(j + 1) % poly.Length]);
+                        if (!edgeToFloors.ContainsKey(key)) edgeToFloors[key] = new List<int>();
+                        edgeToFloors[key].Add(lotFloors[i]);
+                    }
+                }
+
+                // 3. 메쉬 생성
+                for (int i = 0; i < block.subLots.Count; i++)
+                {
+                    Vector3[] poly = block.subLots[i].array;
                     if (poly == null || poly.Length < 3) continue;
 
-                    // 랜덤 높이 설정
-                    float height = Random.Range(minBuildingHeight, maxBuildingHeight);
+                    int myFloors = lotFloors[i];
+                    float totalHeight = myFloors * floorHeight;
 
-                    // --- 1. 지붕(Roof) 메쉬 생성 ---
-                    // 정점 추가
+                    // --- 지붕 생성 ---
                     int roofStartIdx = vertOffset;
                     for (int j = 0; j < poly.Length; j++)
                     {
-                        Vector3 pos = poly[j] + Vector3.up * height; 
+                        Vector3 pos = poly[j] + Vector3.up * totalHeight; 
                         allVerts.Add(pos);
                         allUvs.Add(new Vector2(pos.x, pos.z) * 0.5f);
-                        _debugLotVerts.Add(pos);
                     }
                     vertOffset += poly.Length;
-
-                    // 지붕 삼각형 (Convex Polygon Fan)
-                    // 뒤집힘 해결: 순서를 반대로 변경 (0, j, j+1)
                     for (int j = 1; j < poly.Length - 1; j++)
                     {
                         allTris.Add(roofStartIdx + 0);
@@ -693,87 +707,78 @@ namespace CityGen
                         allTris.Add(roofStartIdx + j + 1);
                     }
 
-                    // --- 2. 벽면(Wall) 메쉬 생성 ---
-                    // 각 변마다 별도의 정점 4개를 사용하여 Flat Shading (정점 공유 X)
+                    // --- 층별 외벽 생성 (컬링 적용) ---
                     for (int j = 0; j < poly.Length; j++)
                     {
                         Vector3 p1 = poly[j];
                         Vector3 p2 = poly[(j + 1) % poly.Length];
+                        EdgeKey key = new EdgeKey(p1, p2);
 
-                        // 바닥점 (Base)
-                        Vector3 b1 = p1 + Vector3.up * 0.02f; // Z-fighting 방지용 약간 띄움
-                        Vector3 b2 = p2 + Vector3.up * 0.02f;
+                        // 이웃 건물 중 나를 제외한 가장 높은 층수 확인
+                        int neighborMaxFloors = 0;
+                        if (edgeToFloors.TryGetValue(key, out var floorsList))
+                        {
+                            foreach (int fCount in floorsList)
+                            {
+                                if (fCount != myFloors) // 단순 비교 (동일 층수 부지가 여러 개일 경우를 대비해 로직 개선 가능)
+                                {
+                                    neighborMaxFloors = Mathf.Max(neighborMaxFloors, fCount);
+                                }
+                                else if (floorsList.Count(x => x == myFloors) > 1)
+                                {
+                                    // 나와 층수가 같은 건물이 공유하고 있다면, 그 층까지는 컬링
+                                    neighborMaxFloors = myFloors; 
+                                }
+                            }
+                        }
 
-                        // 지붕점 (Top)
-                        Vector3 t1 = p1 + Vector3.up * height;
-                        Vector3 t2 = p2 + Vector3.up * height;
+                        // 이웃 건물보다 높은 층에서만 벽면 생성
+                        for (int f = neighborMaxFloors; f < myFloors; f++)
+                        {
+                            float bottomY = f * floorHeight;
+                            float topY = (f + 1) * floorHeight;
 
-                        // 벽면 정점 4개 추가
-                        // 순서: BL, BR, TR, TL (CCW for outward facing)
-                        // b1 -> b2 -> t2 -> t1
-                        
-                        allVerts.Add(b1); // 0
-                        allVerts.Add(b2); // 1
-                        allVerts.Add(t2); // 2
-                        allVerts.Add(t1); // 3
+                            allVerts.Add(p1 + Vector3.up * bottomY);
+                            allVerts.Add(p2 + Vector3.up * bottomY);
+                            allVerts.Add(p2 + Vector3.up * topY);
+                            allVerts.Add(p1 + Vector3.up * topY);
 
-                        // UVs (World Space XZ or Wall Length/Height)
-                        float len = Vector3.Distance(p1, p2);
-                        allUvs.Add(new Vector2(0, 0));
-                        allUvs.Add(new Vector2(len, 0));
-                        allUvs.Add(new Vector2(len, height));
-                        allUvs.Add(new Vector2(0, height));
+                            float len = Vector3.Distance(p1, p2);
+                            allUvs.Add(new Vector2(0, 0));
+                            allUvs.Add(new Vector2(len, 0));
+                            allUvs.Add(new Vector2(len, floorHeight));
+                            allUvs.Add(new Vector2(0, floorHeight));
 
-                        // 삼각형 인덱스 (Quad -> 2 Tris)
-                        // 뒤집힘 해결: 순서를 반대로 변경 (0->1->2, 0->2->3)
-                        allTris.Add(vertOffset + 0);
-                        allTris.Add(vertOffset + 1);
-                        allTris.Add(vertOffset + 2);
+                            allTris.Add(vertOffset + 0);
+                            allTris.Add(vertOffset + 1);
+                            allTris.Add(vertOffset + 2);
+                            allTris.Add(vertOffset + 0);
+                            allTris.Add(vertOffset + 2);
+                            allTris.Add(vertOffset + 3);
 
-                        allTris.Add(vertOffset + 0);
-                        allTris.Add(vertOffset + 2);
-                        allTris.Add(vertOffset + 3);
-
-                        vertOffset += 4;
+                            vertOffset += 4;
+                        }
                     }
                 }
             }
 
             if (allVerts.Count == 0) return;
 
-            // 메쉬 생성
             Mesh lotMesh = new Mesh();
-            lotMesh.name = "Lots_Mesh";
-            if (allVerts.Count > 65000) 
-                lotMesh.indexFormat = UnityEngine.Rendering.IndexFormat.UInt32;
-
+            lotMesh.name = "CityBuildings_Mesh";
+            if (allVerts.Count > 65000) lotMesh.indexFormat = UnityEngine.Rendering.IndexFormat.UInt32;
             lotMesh.vertices = allVerts.ToArray();
             lotMesh.triangles = allTris.ToArray();
             lotMesh.uv = allUvs.ToArray();
             lotMesh.RecalculateNormals();
             lotMesh.RecalculateBounds();
 
-            // 게임 오브젝트 생성 및 컴포넌트 설정
-            GameObject lotsObj = new GameObject("LotMesh");
+            GameObject lotsObj = new GameObject("BuildingMesh");
             lotsObj.transform.SetParent(_buildingRoot, false);
-
-            MeshFilter mf = lotsObj.AddComponent<MeshFilter>();
-            mf.mesh = lotMesh;
-
+            lotsObj.AddComponent<MeshFilter>().mesh = lotMesh;
             MeshRenderer mr = lotsObj.AddComponent<MeshRenderer>();
-            if (buildingMaterial != null)
-            {
-                mr.sharedMaterial = buildingMaterial;
-            }
-            else
-            {
-                // 기본 재질 (URP Lit 시도 후 Standard)
-                Shader s = Shader.Find("Universal Render Pipeline/Lit");
-                if (s == null) s = Shader.Find("Standard");
-                Material m = new Material(s);
-                m.color = new Color(0.4f, 0.4f, 0.45f);
-                mr.sharedMaterial = m;
-            }
+            mr.sharedMaterial = buildingMaterial != null ? buildingMaterial : meshRenderer.sharedMaterial;
+            lotsObj.AddComponent<MeshCollider>().sharedMesh = lotMesh;
         }
 
         private void LogLotConnectivity()
@@ -1169,6 +1174,20 @@ namespace CityGen
             nodes.Add(pos);
             adjacency.Add(new List<int>());
             return nodes.Count - 1;
+        }
+
+        private struct EdgeKey : System.IEquatable<EdgeKey>
+        {
+            public Vector3Int a, b;
+            public EdgeKey(Vector3 v1, Vector3 v2)
+            {
+                Vector3Int q1 = Vector3Int.RoundToInt(v1 * 100f);
+                Vector3Int q2 = Vector3Int.RoundToInt(v2 * 100f);
+                if (q1.x < q2.x || (q1.x == q2.x && q1.z < q2.z)) { a = q1; b = q2; }
+                else { a = q2; b = q1; }
+            }
+            public bool Equals(EdgeKey other) => a == other.a && b == other.b;
+            public override int GetHashCode() => System.HashCode.Combine(a, b);
         }
 
         #region Serialization

@@ -26,7 +26,8 @@ namespace CityGen
         public float minLotArea = 100f;
         [Range(0, 0.45f)] public float lotSplitJitter = 0.2f;
         
-        public float floorHeight = 3.0f;
+        public float minFloorHeight = 2.5f;
+        public float maxFloorHeight = 4.5f;
         public int minFloors = 2;
         public int maxFloors = 10;
         
@@ -663,22 +664,27 @@ namespace CityGen
             {
                 if (block.subLots == null || block.subLots.Count == 0) continue;
 
-                // 1. 블록 내 모든 부지에 층수 사전 할당
+                // 1. 블록 내 모든 부지에 층수 및 층 높이 사전 할당
                 int[] lotFloors = new int[block.subLots.Count];
+                float[] lotFloorHeights = new float[block.subLots.Count];
                 for (int i = 0; i < block.subLots.Count; i++)
+                {
                     lotFloors[i] = Random.Range(minFloors, maxFloors + 1);
+                    lotFloorHeights[i] = Random.Range(minFloorHeight, maxFloorHeight);
+                }
 
-                // 2. 엣지 공유 정보 맵핑 (엣지 -> 해당 엣지를 가진 부지들의 층수 리스트)
-                var edgeToFloors = new Dictionary<EdgeKey, List<int>>();
+                // 2. 엣지 공유 정보 맵핑 (엣지 -> 해당 엣지를 가진 부지들의 절대 높이 리스트)
+                var edgeToHeights = new Dictionary<EdgeKey, List<float>>();
                 for (int i = 0; i < block.subLots.Count; i++)
                 {
                     Vector3[] poly = block.subLots[i].array;
                     if (poly == null) continue;
+                    float totalHeight = lotFloors[i] * lotFloorHeights[i];
                     for (int j = 0; j < poly.Length; j++)
                     {
                         EdgeKey key = new EdgeKey(poly[j], poly[(j + 1) % poly.Length]);
-                        if (!edgeToFloors.ContainsKey(key)) edgeToFloors[key] = new List<int>();
-                        edgeToFloors[key].Add(lotFloors[i]);
+                        if (!edgeToHeights.ContainsKey(key)) edgeToHeights[key] = new List<float>();
+                        edgeToHeights[key].Add(totalHeight);
                     }
                 }
 
@@ -689,13 +695,14 @@ namespace CityGen
                     if (poly == null || poly.Length < 3) continue;
 
                     int myFloors = lotFloors[i];
-                    float totalHeight = myFloors * floorHeight;
+                    float myFloorHeight = lotFloorHeights[i];
+                    float myTotalHeight = myFloors * myFloorHeight;
 
                     // --- 지붕 생성 ---
                     int roofStartIdx = vertOffset;
                     for (int j = 0; j < poly.Length; j++)
                     {
-                        Vector3 pos = poly[j] + Vector3.up * totalHeight; 
+                        Vector3 pos = poly[j] + Vector3.up * myTotalHeight; 
                         allVerts.Add(pos);
                         allUvs.Add(new Vector2(pos.x, pos.z) * 0.5f);
                     }
@@ -707,60 +714,50 @@ namespace CityGen
                         allTris.Add(roofStartIdx + j + 1);
                     }
 
-                    // --- 층별 외벽 생성 (컬링 적용) ---
+                    // --- 층별 외벽 생성 (최적화: 1층 별도, 2층 이상 통합) ---
                     for (int j = 0; j < poly.Length; j++)
                     {
                         Vector3 p1 = poly[j];
                         Vector3 p2 = poly[(j + 1) % poly.Length];
                         EdgeKey key = new EdgeKey(p1, p2);
 
-                        // 이웃 건물 중 나를 제외한 가장 높은 층수 확인
-                        int neighborMaxFloors = 0;
-                        if (edgeToFloors.TryGetValue(key, out var floorsList))
+                        float neighborMaxHeight = 0;
+                        if (edgeToHeights.TryGetValue(key, out var heightsList))
                         {
-                            foreach (int fCount in floorsList)
+                            foreach (float h in heightsList)
                             {
-                                if (fCount != myFloors) // 단순 비교 (동일 층수 부지가 여러 개일 경우를 대비해 로직 개선 가능)
+                                if (Mathf.Abs(h - myTotalHeight) > 0.01f || heightsList.Count(x => Mathf.Abs(x - myTotalHeight) < 0.01f) > 1)
                                 {
-                                    neighborMaxFloors = Mathf.Max(neighborMaxFloors, fCount);
-                                }
-                                else if (floorsList.Count(x => x == myFloors) > 1)
-                                {
-                                    // 나와 층수가 같은 건물이 공유하고 있다면, 그 층까지는 컬링
-                                    neighborMaxFloors = myFloors; 
+                                    neighborMaxHeight = Mathf.Max(neighborMaxHeight, h);
                                 }
                             }
                         }
 
-                        // 이웃 건물보다 높은 층에서만 벽면 생성
-                        for (int f = neighborMaxFloors; f < myFloors; f++)
+                        // 1. 1층 처리 (0 ~ myFloorHeight)
+                        float f1Bottom = 0;
+                        float f1Top = myFloorHeight;
+                        if (f1Top > neighborMaxHeight + 0.01f)
                         {
-                            float bottomY = f * floorHeight;
-                            float topY = (f + 1) * floorHeight;
+                            float actualBottom = Mathf.Max(f1Bottom, neighborMaxHeight);
+                            AddWallQuad(allVerts, allUvs, allTris, ref vertOffset, p1, p2, actualBottom, f1Top);
+                        }
 
-                            allVerts.Add(p1 + Vector3.up * bottomY);
-                            allVerts.Add(p2 + Vector3.up * bottomY);
-                            allVerts.Add(p2 + Vector3.up * topY);
-                            allVerts.Add(p1 + Vector3.up * topY);
-
-                            float len = Vector3.Distance(p1, p2);
-                            allUvs.Add(new Vector2(0, 0));
-                            allUvs.Add(new Vector2(len, 0));
-                            allUvs.Add(new Vector2(len, floorHeight));
-                            allUvs.Add(new Vector2(0, floorHeight));
-
-                            allTris.Add(vertOffset + 0);
-                            allTris.Add(vertOffset + 1);
-                            allTris.Add(vertOffset + 2);
-                            allTris.Add(vertOffset + 0);
-                            allTris.Add(vertOffset + 2);
-                            allTris.Add(vertOffset + 3);
-
-                            vertOffset += 4;
+                        // 2. 2층 이상 통합 처리 (myFloorHeight ~ myTotalHeight)
+                        if (myFloors > 1)
+                        {
+                            float restBottom = myFloorHeight;
+                            float restTop = myTotalHeight;
+                            if (restTop > neighborMaxHeight + 0.01f)
+                            {
+                                // 2층 시작점보다 이웃 건물이 높다면 이웃 건물 높이부터 시작
+                                float actualBottom = Mathf.Max(restBottom, neighborMaxHeight);
+                                AddWallQuad(allVerts, allUvs, allTris, ref vertOffset, p1, p2, actualBottom, restTop);
+                            }
                         }
                     }
                 }
             }
+
 
             if (allVerts.Count == 0) return;
 
@@ -779,6 +776,30 @@ namespace CityGen
             MeshRenderer mr = lotsObj.AddComponent<MeshRenderer>();
             mr.sharedMaterial = buildingMaterial != null ? buildingMaterial : meshRenderer.sharedMaterial;
             lotsObj.AddComponent<MeshCollider>().sharedMesh = lotMesh;
+        }
+
+        private void AddWallQuad(List<Vector3> verts, List<Vector2> uvs, List<int> tris, ref int offset, Vector3 p1, Vector3 p2, float bottomY, float topY)
+        {
+            verts.Add(p1 + Vector3.up * bottomY);
+            verts.Add(p2 + Vector3.up * bottomY);
+            verts.Add(p2 + Vector3.up * topY);
+            verts.Add(p1 + Vector3.up * topY);
+
+            float len = Vector3.Distance(p1, p2);
+            float h = topY - bottomY;
+            uvs.Add(new Vector2(0, 0));
+            uvs.Add(new Vector2(len, 0));
+            uvs.Add(new Vector2(len, h));
+            uvs.Add(new Vector2(0, h));
+
+            tris.Add(offset + 0);
+            tris.Add(offset + 1);
+            tris.Add(offset + 2);
+            tris.Add(offset + 0);
+            tris.Add(offset + 2);
+            tris.Add(offset + 3);
+
+            offset += 4;
         }
 
         private void LogLotConnectivity()

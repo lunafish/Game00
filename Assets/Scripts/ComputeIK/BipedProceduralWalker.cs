@@ -263,8 +263,14 @@ namespace ComputeIK
         {
             if (IsStepping()) return;
 
-            float angleL = Vector3.Angle(transform.rotation * Vector3.left, (currentFootPosL - transform.position).normalized);
-            float angleR = Vector3.Angle(transform.rotation * Vector3.right, (currentFootPosR - transform.position).normalized);
+            // [Modified] 각도 계산 시 캐릭터의 로컬 평면에 투영하여 판단 (벽 타기 대응)
+            Vector3 toFootL = currentFootPosL - transform.position;
+            Vector3 toFootR = currentFootPosR - transform.position;
+            Vector3 toFootLFlat = Vector3.ProjectOnPlane(toFootL, transform.up);
+            Vector3 toFootRFlat = Vector3.ProjectOnPlane(toFootR, transform.up);
+
+            float angleL = Vector3.Angle(transform.rotation * Vector3.left, toFootLFlat.normalized);
+            float angleR = Vector3.Angle(transform.rotation * Vector3.right, toFootRFlat.normalized);
 
             // [Move Speed Sync]
             float dynamicDuration = stepDuration;
@@ -282,11 +288,16 @@ namespace ComputeIK
                 SurfaceData footSurface = ResolvePredictiveSurface(predictionSteps, desiredPosL);
                 bool wantToMove = velocity.magnitude > 0.1f;
                 bool tooRotated = angleL > stepAngle;
-                bool crossed = Vector3.Dot(transform.rotation * Vector3.right, (currentFootPosL - transform.position).normalized) > 0.15f;
-                bool wayBehind = Vector3.Dot(transform.forward, (currentFootPosL - transform.position).normalized) < -0.4f;
+                
+                // [Modified] crossed 계산 시 캐릭터의 로컬 평면에 투영하여 판단 (벽 타기 대응)
+                bool crossed = Vector3.Dot(transform.rotation * Vector3.right, toFootLFlat.normalized) > 0.15f;
+                
+                // [Modified] wayBehind 계산 시 캐릭터의 로컬 평면에 투영하여 판단 (벽 타기 대응)
+                bool wayBehind = Vector3.Dot(transform.forward, toFootLFlat.normalized) < -0.4f;
 
                 if (wantToMove || tooRotated || crossed || wayBehind)
                 {
+                    // Debug.Log($"[Left Step] Move:{wantToMove}, Rot:{tooRotated}({angleL:F1}), Cross:{crossed}, Behind:{wayBehind}");
                     StartCoroutine(MoveFoot(true, footSurface.point, dynamicDuration));
                     isLeftStepping = false;
                 }
@@ -296,11 +307,16 @@ namespace ComputeIK
                 SurfaceData footSurface = ResolvePredictiveSurface(predictionSteps + 1, desiredPosR);
                 bool wantToMove = velocity.magnitude > 0.1f;
                 bool tooRotated = angleR > stepAngle;
-                bool crossed = Vector3.Dot(transform.rotation * Vector3.left, (currentFootPosR - transform.position).normalized) > 0.15f;
-                bool wayBehind = Vector3.Dot(transform.forward, (currentFootPosR - transform.position).normalized) < -0.4f;
+                
+                // [Modified] crossed 계산 시 캐릭터의 로컬 평면에 투영하여 판단 (벽 타기 대응)
+                bool crossed = Vector3.Dot(transform.rotation * Vector3.left, toFootRFlat.normalized) > 0.15f;
+                
+                // [Modified] wayBehind 계산 시 캐릭터의 로컬 평면에 투영하여 판단 (벽 타기 대응)
+                bool wayBehind = Vector3.Dot(transform.forward, toFootRFlat.normalized) < -0.4f;
 
                 if (wantToMove || tooRotated || crossed || wayBehind)
                 {
+                    // Debug.Log($"[Right Step] Move:{wantToMove}, Rot:{tooRotated}({angleR:F1}), Cross:{crossed}, Behind:{wayBehind}");
                     StartCoroutine(MoveFoot(false, footSurface.point, dynamicDuration));
                     isLeftStepping = true;
                 }

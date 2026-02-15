@@ -25,10 +25,8 @@ namespace CityGen
         public int subdivisionDepth = 2;
         public float minLotArea = 100f;
         [Range(0, 0.45f)] public float lotSplitJitter = 0.2f;
-        
-        public float floorHeight = 3.0f;
-        public int minFloors = 3;
-        public int maxFloors = 10;
+        public float minBuildingHeight = 5f;
+        public float maxBuildingHeight = 20f;
         
         public Material buildingMaterial;
 
@@ -44,6 +42,8 @@ namespace CityGen
         public bool showLogicalBlocks = false;
         public bool showBuildableAreas = true;
         public bool showSubLots = true;
+        public bool showLotVertices = false; // New: 바닥 메쉬 정점 확인용
+        public bool debugRefineLogic = false; // New: T-Junction 보정 로직 디버그
 
         // --- 그래프 데이터 ---
         [SerializeField, HideInInspector] protected List<Vector3> nodes = new List<Vector3>();
@@ -52,6 +52,9 @@ namespace CityGen
         private Dictionary<int, Vector3[]> _nodeJunctionCorners = new Dictionary<int, Vector3[]>();
         [SerializeField, HideInInspector] protected List<CityBlock> cityBlocks = new List<CityBlock>();
         private Transform _buildingRoot;
+        
+        // 디버그용 정점 리스트
+        private List<Vector3> _debugLotVerts = new List<Vector3>();
 
 
         // --- 직렬화 데이터 ---
@@ -90,7 +93,7 @@ namespace CityGen
             public bool Equals(RoadSegment other) => a == other.a && b == other.b;
             public override int GetHashCode() => System.HashCode.Combine(a, b);
         }
-
+        
         /// <summary>
         /// 도시 생성 프로세스를 시작합니다.
         /// </summary>
@@ -126,8 +129,14 @@ namespace CityGen
             CalculateBlockShapes();
             SubdivideAllBlocks();
 
-            // 6. 건물 메쉬 생성
+            // 6. 부지 정점 보정 (T-Junction 해결)
+            RefineLotShapes();
+
+            // 7. 건물 부지 메쉬 생성
             GenerateBuildingMeshes();
+            
+            // 8. 연결 정보 로그 출력
+            LogLotConnectivity();
 
             sw.Stop();
             Debug.Log($"도시 생성 완료: {nodes.Count} 노드, {uniqueSegments.Count} 도로 구간 (소요 시간: {sw.ElapsedMilliseconds}ms)");
@@ -631,109 +640,299 @@ namespace CityGen
 
         private void GenerateBuildingMeshes()
         {
-            // Clear existing buildings
+            // 기존 건물 루트 제거
             if (_buildingRoot != null)
             {
-                DestroyImmediate(_buildingRoot.gameObject);
+                if (Application.isPlaying) Destroy(_buildingRoot.gameObject);
+                else DestroyImmediate(_buildingRoot.gameObject);
             }
             
             _buildingRoot = new GameObject("Buildings").transform;
-            _buildingRoot.SetParent(transform);
+            _buildingRoot.SetParent(transform, false);
 
-            List<Vector3> verts = new List<Vector3>();
-            List<int> tris = new List<int>();
-            List<Vector3> normals = new List<Vector3>();
+            List<Vector3> allVerts = new List<Vector3>();
+            List<int> allTris = new List<int>();
+            List<Vector2> allUvs = new List<Vector2>();
+            
+            // 디버그용 리스트 초기화
+            _debugLotVerts.Clear();
+            
+            int vertOffset = 0;
 
+            // 모든 블록의 서브 부지(Lot) 순회
             foreach (var block in cityBlocks)
             {
-                if (block.subLots == null) continue;
+                if (block.subLots == null || block.subLots.Count == 0) continue;
 
-                foreach (var lot in block.subLots)
+                foreach (var lotWrapper in block.subLots)
                 {
-                    // [Modified] 랜덤 층수 결정
-                    int floors = Random.Range(minFloors, maxFloors + 1);
-                    ExtrudeBuilding(lot.array, floors, verts, tris, normals);
+                    Vector3[] poly = lotWrapper.array;
+                    if (poly == null || poly.Length < 3) continue;
+
+                    // 랜덤 높이 설정
+                    float height = Random.Range(minBuildingHeight, maxBuildingHeight);
+
+                    // --- 1. 지붕(Roof) 메쉬 생성 ---
+                    // 정점 추가
+                    int roofStartIdx = vertOffset;
+                    for (int j = 0; j < poly.Length; j++)
+                    {
+                        Vector3 pos = poly[j] + Vector3.up * height; 
+                        allVerts.Add(pos);
+                        allUvs.Add(new Vector2(pos.x, pos.z) * 0.5f);
+                        _debugLotVerts.Add(pos);
+                    }
+                    vertOffset += poly.Length;
+
+                    // 지붕 삼각형 (Convex Polygon Fan)
+                    // 뒤집힘 해결: 순서를 반대로 변경 (0, j, j+1)
+                    for (int j = 1; j < poly.Length - 1; j++)
+                    {
+                        allTris.Add(roofStartIdx + 0);
+                        allTris.Add(roofStartIdx + j);
+                        allTris.Add(roofStartIdx + j + 1);
+                    }
+
+                    // --- 2. 벽면(Wall) 메쉬 생성 ---
+                    // 각 변마다 별도의 정점 4개를 사용하여 Flat Shading (정점 공유 X)
+                    for (int j = 0; j < poly.Length; j++)
+                    {
+                        Vector3 p1 = poly[j];
+                        Vector3 p2 = poly[(j + 1) % poly.Length];
+
+                        // 바닥점 (Base)
+                        Vector3 b1 = p1 + Vector3.up * 0.02f; // Z-fighting 방지용 약간 띄움
+                        Vector3 b2 = p2 + Vector3.up * 0.02f;
+
+                        // 지붕점 (Top)
+                        Vector3 t1 = p1 + Vector3.up * height;
+                        Vector3 t2 = p2 + Vector3.up * height;
+
+                        // 벽면 정점 4개 추가
+                        // 순서: BL, BR, TR, TL (CCW for outward facing)
+                        // b1 -> b2 -> t2 -> t1
+                        
+                        allVerts.Add(b1); // 0
+                        allVerts.Add(b2); // 1
+                        allVerts.Add(t2); // 2
+                        allVerts.Add(t1); // 3
+
+                        // UVs (World Space XZ or Wall Length/Height)
+                        float len = Vector3.Distance(p1, p2);
+                        allUvs.Add(new Vector2(0, 0));
+                        allUvs.Add(new Vector2(len, 0));
+                        allUvs.Add(new Vector2(len, height));
+                        allUvs.Add(new Vector2(0, height));
+
+                        // 삼각형 인덱스 (Quad -> 2 Tris)
+                        // 뒤집힘 해결: 순서를 반대로 변경 (0->1->2, 0->2->3)
+                        allTris.Add(vertOffset + 0);
+                        allTris.Add(vertOffset + 1);
+                        allTris.Add(vertOffset + 2);
+
+                        allTris.Add(vertOffset + 0);
+                        allTris.Add(vertOffset + 2);
+                        allTris.Add(vertOffset + 3);
+
+                        vertOffset += 4;
+                    }
                 }
             }
 
-            if (verts.Count > 0)
+            if (allVerts.Count == 0) return;
+
+            // 메쉬 생성
+            Mesh lotMesh = new Mesh();
+            lotMesh.name = "Lots_Mesh";
+            if (allVerts.Count > 65000) 
+                lotMesh.indexFormat = UnityEngine.Rendering.IndexFormat.UInt32;
+
+            lotMesh.vertices = allVerts.ToArray();
+            lotMesh.triangles = allTris.ToArray();
+            lotMesh.uv = allUvs.ToArray();
+            lotMesh.RecalculateNormals();
+            lotMesh.RecalculateBounds();
+
+            // 게임 오브젝트 생성 및 컴포넌트 설정
+            GameObject lotsObj = new GameObject("LotMesh");
+            lotsObj.transform.SetParent(_buildingRoot, false);
+
+            MeshFilter mf = lotsObj.AddComponent<MeshFilter>();
+            mf.mesh = lotMesh;
+
+            MeshRenderer mr = lotsObj.AddComponent<MeshRenderer>();
+            if (buildingMaterial != null)
             {
-                GameObject meshObj = new GameObject("CityBuildings");
-                meshObj.transform.SetParent(_buildingRoot);
-                MeshFilter mf = meshObj.AddComponent<MeshFilter>();
-                MeshRenderer mr = meshObj.AddComponent<MeshRenderer>();
-                mr.material = buildingMaterial != null ? buildingMaterial : (roadMaterial != null ? roadMaterial : meshRenderer.sharedMaterial);
-
-                Mesh mesh = new Mesh();
-                mesh.name = "BuildingMesh";
-                mesh.indexFormat = UnityEngine.Rendering.IndexFormat.UInt32;
-                mesh.SetVertices(verts);
-                mesh.SetTriangles(tris, 0);
-                mesh.SetNormals(normals);
-                mf.mesh = mesh;
-
-                // 콜라이더 추가
-                MeshCollider mc = meshObj.AddComponent<MeshCollider>();
-                mc.sharedMesh = mesh;
+                mr.sharedMaterial = buildingMaterial;
+            }
+            else
+            {
+                // 기본 재질 (URP Lit 시도 후 Standard)
+                Shader s = Shader.Find("Universal Render Pipeline/Lit");
+                if (s == null) s = Shader.Find("Standard");
+                Material m = new Material(s);
+                m.color = new Color(0.4f, 0.4f, 0.45f);
+                mr.sharedMaterial = m;
             }
         }
 
-        private void ExtrudeBuilding(Vector3[] footprint, int floors, List<Vector3> verts, List<int> tris, List<Vector3> normals)
+        private void LogLotConnectivity()
         {
-            if (footprint == null || footprint.Length < 3) return;
+            System.Text.StringBuilder sb = new System.Text.StringBuilder();
+            sb.AppendLine("=== Lot Connectivity Report ===");
 
-            // Ensure consistent winding order (CCW) for outward normals
-            Vector3[] ccwFootprint = EnsureCCW(footprint);
-            int corners = ccwFootprint.Length;
+            int totalBlocksWithGaps = 0;
 
-            for (int f = 0; f < floors; f++)
+            for (int i = 0; i < cityBlocks.Count; i++)
             {
-                float currentY = f * floorHeight;
-                float nextY = (f + 1) * floorHeight;
+                var block = cityBlocks[i];
+                if (block.subLots == null || block.subLots.Count == 0) continue;
 
-                // 1. Walls (항상 생성)
-                for (int i = 0; i < corners; i++)
+                Dictionary<string, int> edgeCounts = new Dictionary<string, int>();
+                Dictionary<string, Vector3> edgeDirs = new Dictionary<string, Vector3>();
+
+                // 정밀도 조정 (0.01f 단위)
+                string VecKey(Vector3 v) => $"{v.x:F2},{v.z:F2}";
+                string EdgeKey(Vector3 v1, Vector3 v2)
                 {
-                    Vector3 p1 = ccwFootprint[i];
-                    Vector3 p2 = ccwFootprint[(i + 1) % corners];
-                    
-                    Vector3 wallNormal = Vector3.Cross(Vector3.up, (p2 - p1).normalized).normalized;
-
-                    int v = verts.Count;
-                    
-                    // Bottom-Left, Top-Left, Top-Right, Bottom-Right
-                    verts.Add(p1 + Vector3.up * currentY);
-                    verts.Add(p1 + Vector3.up * nextY);
-                    verts.Add(p2 + Vector3.up * nextY);
-                    verts.Add(p2 + Vector3.up * currentY);
-
-                    for (int n = 0; n < 4; n++) normals.Add(wallNormal);
-
-                    tris.Add(v); tris.Add(v + 1); tris.Add(v + 2);
-                    tris.Add(v); tris.Add(v + 2); tris.Add(v + 3);
+                    string k1 = VecKey(v1);
+                    string k2 = VecKey(v2);
+                    return string.Compare(k1, k2) < 0 ? $"{k1}|{k2}" : $"{k2}|{k1}";
                 }
 
-                // 2. Roof (맨 위층만 생성)
-                if (f == floors - 1)
+                foreach (var lot in block.subLots)
                 {
-                    int roofStart = verts.Count;
-                    for (int i = 0; i < corners; i++)
+                    Vector3[] poly = lot.array;
+                    if (poly == null) continue;
+                    for (int j = 0; j < poly.Length; j++)
                     {
-                        verts.Add(ccwFootprint[i] + Vector3.up * nextY);
-                        normals.Add(Vector3.up);
-                    }
-                    // Simple Fan Triangulation (Convex Polygon 가정)
-                    for (int i = 1; i < corners - 1; i++)
-                    {
-                        tris.Add(roofStart);
-                        tris.Add(roofStart + i + 1);
-                        tris.Add(roofStart + i);
+                        Vector3 p1 = poly[j];
+                        Vector3 p2 = poly[(j + 1) % poly.Length];
+                        string key = EdgeKey(p1, p2);
+
+                        if (!edgeCounts.ContainsKey(key))
+                        {
+                            edgeCounts[key] = 0;
+                            edgeDirs[key] = (p2 - p1).normalized;
+                        }
+                        edgeCounts[key]++;
                     }
                 }
 
-                // 3. Floor (생성하지 않음 - 내부 메쉬 제거)
-                // 맨 아래층 바닥도 지면에 닿아있으므로 생성 불필요
+                // 공유되지 않은 엣지(Count == 1) 찾기
+                List<string> openEdges = new List<string>();
+                foreach(var kvp in edgeCounts)
+                {
+                    if(kvp.Value == 1) openEdges.Add(kvp.Key);
+                }
+
+                if (openEdges.Count > 0)
+                {
+                    totalBlocksWithGaps++;
+                    sb.AppendLine($"[Block {i}] has {openEdges.Count} open edges (Boundary or Gap).");
+                    // 처음 몇 개만 샘플링하여 방향 출력
+                    for(int k=0; k<Mathf.Min(openEdges.Count, 10); k++)
+                    {
+                        string key = openEdges[k];
+                        Vector3 dir = edgeDirs[key];
+                        sb.AppendLine($"  - Edge {key} | Dir: {dir}");
+                    }
+                    if(openEdges.Count > 10) sb.AppendLine($"  ... and {openEdges.Count - 10} more.");
+                }
             }
+            Debug.Log(sb.ToString());
+        }
+
+        private void RefineLotShapes()
+        {
+            for (int i = 0; i < cityBlocks.Count; i++)
+            {
+                CityBlock block = cityBlocks[i];
+                if (block.subLots == null || block.subLots.Count == 0) continue;
+
+                // 1. Collect all vertices in the block to a unique list
+                List<Vector3> allVerts = new List<Vector3>();
+                foreach (var lot in block.subLots)
+                {
+                    if (lot.array != null) 
+                    {
+                        foreach(var v in lot.array) allVerts.Add(v);
+                    }
+                }
+
+                // 2. Refine each lot
+                List<Vector3ArrayWrapper> newSubLots = new List<Vector3ArrayWrapper>();
+                foreach (var lot in block.subLots)
+                {
+                    if (lot.array == null) continue;
+                    Vector3[] poly = lot.array;
+                    List<Vector3> refinedPoly = new List<Vector3>();
+
+                    for (int j = 0; j < poly.Length; j++)
+                    {
+                        Vector3 p1 = poly[j];
+                        Vector3 p2 = poly[(j + 1) % poly.Length];
+                        
+                        refinedPoly.Add(p1);
+
+                        if (debugRefineLogic)
+                            Debug.Log($"[Refine] Block {i} Segment: {p1.ToString("F3")} -> {p2.ToString("F3")}");
+
+                        // Find vertices on this segment
+                        List<Vector3> pointsOnSegment = new List<Vector3>();
+                        foreach (var v in allVerts)
+                        {
+                            // Skip if v is p1 or p2
+                            if (Vector3.Distance(v, p1) < 0.01f || Vector3.Distance(v, p2) < 0.01f) continue;
+
+                            // Check if v is on segment p1-p2
+                            if (IsPointOnSegment(v, p1, p2))
+                            {
+                                if (debugRefineLogic)
+                                    Debug.Log($"    -> Found Vertex on Segment: {v.ToString("F3")}");
+
+                                // Check for duplicates in pointsOnSegment
+                                bool exists = false;
+                                foreach(var added in pointsOnSegment)
+                                {
+                                    if(Vector3.Distance(v, added) < 0.01f) { exists = true; break; }
+                                }
+                                if(!exists) pointsOnSegment.Add(v);
+                            }
+                        }
+
+                        if (pointsOnSegment.Count > 0)
+                        {
+                            // Sort by distance from p1
+                            pointsOnSegment.Sort((a, b) => Vector3.SqrMagnitude(a - p1).CompareTo(Vector3.SqrMagnitude(b - p1)));
+                            refinedPoly.AddRange(pointsOnSegment);
+                        }
+                    }
+                    newSubLots.Add(new Vector3ArrayWrapper { array = refinedPoly.ToArray() });
+                }
+                
+                block.subLots = newSubLots;
+                cityBlocks[i] = block;
+            }
+        }
+
+        private bool IsPointOnSegment(Vector3 p, Vector3 a, Vector3 b)
+        {
+            Vector3 ab = b - a;
+            float sqrLen = ab.sqrMagnitude;
+            if (sqrLen < 1e-9f) return false;
+
+            // Project p onto ab, computing parameterized position t
+            float t = Vector3.Dot(p - a, ab) / sqrLen;
+
+            // Check if t is within the segment (excluding endpoints with a small epsilon)
+            if (t < 0.01f || t > 0.99f) return false;
+
+            // Compute the projection point
+            Vector3 proj = a + t * ab;
+
+            // Check distance from the line
+            return (p - proj).sqrMagnitude < (0.05f * 0.05f);
         }
 
         private Vector3[] EnsureCCW(Vector3[] polygon)
@@ -1095,6 +1294,16 @@ namespace CityGen
                             }
                         }
                     }
+                }
+            }
+            
+            // Draw Lot Vertices (Debug)
+            if (showLotVertices && _debugLotVerts != null)
+            {
+                Gizmos.color = new Color(1, 0, 1, 0.8f); // Magenta
+                foreach (var v in _debugLotVerts)
+                {
+                    Gizmos.DrawSphere(v, 0.1f);
                 }
             }
         }

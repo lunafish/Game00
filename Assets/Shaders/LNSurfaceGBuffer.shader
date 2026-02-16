@@ -74,7 +74,7 @@ Shader "Custom/LNSurfaceGBuffer"
             float4 GBuffer2 : SV_Target2; // Depth
             float4 GBuffer3 : SV_Target3; // Mask
             float4 GBuffer4 : SV_Target4; // Extra Data (Metallic, SpecularStrength, Packed(Subsurface, Anisotropic))
-            float4 GBuffer5 : SV_Target5; // Extra Data 2 (Smoothness, Shadow, Unused, Unused)
+            float4 GBuffer5 : SV_Target5; // Extra Data 2 (Smoothness, Shadow, DiffuseWrap, Unused)
         };
 
         FragmentOutput frag(Varyings input)
@@ -117,8 +117,8 @@ Shader "Custom/LNSurfaceGBuffer"
 
             output.GBuffer4 = float4(_Metallic, specularStrength, packedB, 1.0);
             
-            // GBuffer5: Smoothness (R), Shadow (G), Unused (BA)
-            output.GBuffer5 = float4(_Smoothness, shadow, 1.0, 1.0);
+            // GBuffer5: Smoothness (R), Shadow (G), DiffuseWrap (B), Unused (A)
+            output.GBuffer5 = float4(_Smoothness, shadow, _DiffuseWrap, 1.0);
 
             return output;
         }

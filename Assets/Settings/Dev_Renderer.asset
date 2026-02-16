@@ -97,7 +97,7 @@ MonoBehaviour:
     lightingModel: 1
     enableSSS: 1
     intensity: 1
-    thicknessScale: 4
+    thicknessScale: 10
     renderPassEvent: 500
 --- !u!114 &8311532915064548623
 MonoBehaviour:

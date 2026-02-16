@@ -9,7 +9,7 @@ Texture2D<float4> _LNSurface_Mask;         // R: Mask
 Texture2D<float4> _LNSurface_Front_Depth; // R: Linear Depth
 Texture2D<float4> _LNSurface_Back_Depth;  // R: Linear Depth (Back face)
 Texture2D<float4> _LNSurface_Front_Extra; // R: Metallic, G: SpecularStrength, B: Packed(Subsurface, Anisotropic), A: Unused
-Texture2D<float4> _LNSurface_Front_Extra2; // R: Smoothness, G: Shadow, BA: Unused
+Texture2D<float4> _LNSurface_Front_Extra2; // R: Smoothness, G: Shadow, B: DiffuseWrap, A: Unused
 Texture2D<float4> _SceneColor;             // Scene Color (Background)
 
 // Params
@@ -117,7 +117,8 @@ void CSMain (uint3 id : SV_DispatchThreadID)
     float metallic = gbufferExtra.r;
     float specularStrength = gbufferExtra.g;
     float smoothness = gbufferExtra2.r;
-    float shadow = gbufferExtra2.g; // Read Shadow
+    float shadow = gbufferExtra2.g; 
+    float diffuseWrap = gbufferExtra2.b; // Read Diffuse Wrap
     
     // Unpack B Channel (Subsurface 4bit + Anisotropic 4bit)
     float packedB = gbufferExtra.b * 255.0;
@@ -127,7 +128,10 @@ void CSMain (uint3 id : SV_DispatchThreadID)
     // Normal Unpack (0..1 -> -1..1)
     float3 normalWS = normalize(gbuffer1.rgb * 2.0 - 1.0);
     float3 lightDir = normalize(_MainLightDirection.xyz);
-    float NdotL = saturate(dot(normalWS, lightDir)); 
+    
+    // Apply Diffuse Wrap to NdotL
+    float rawNdotL = dot(normalWS, lightDir);
+    float NdotL = saturate((rawNdotL + diffuseWrap) / (1.0 + diffuseWrap));
 
     float3 diffuseColor = float3(0, 0, 0);
     float3 specularColor = float3(0, 0, 0);
@@ -137,9 +141,9 @@ void CSMain (uint3 id : SV_DispatchThreadID)
     {
         // Half Lambert: (dot(N, L) * 0.5) + 0.5
         // Use unclamped dot for wrap
-        float NdotL_Wrap = dot(normalWS, lightDir); 
-        float halfLambert = NdotL_Wrap * 0.5 + 0.5;
-        diffuseColor = albedo * halfLambert * _MainLightColor.rgb * shadow; // Apply Shadow
+        float NdotL_Wrap = rawNdotL; 
+        float halfLambert = NdotL_Wrap * (1.0 - diffuseWrap) + diffuseWrap;
+        diffuseColor = albedo * halfLambert * _MainLightColor.rgb * shadow;
         
         // Simple Ambient for Half Lambert
         ambientColor = SampleSH(normalWS) * albedo;

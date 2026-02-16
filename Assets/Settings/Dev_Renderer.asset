@@ -15,11 +15,10 @@ MonoBehaviour:
   m_Active: 1
   settings:
     layerMask:
-      serializedVersion: 2
       m_Bits: 4294967295
     computeShader: {fileID: 7200000, guid: dd814543100a84132a5a400fb5b0c729, type: 3}
-    intensity: 0.25
-    thicknessScale: 8
+    intensity: 1.5
+    thicknessScale: 5
     renderPassEvent: 500
 --- !u!114 &11400000
 MonoBehaviour:
@@ -47,8 +46,8 @@ MonoBehaviour:
     probeVolumeBlendStatesCS: {fileID: 7200000, guid: b9a23f869c4fd45f19c5ada54dd82176, type: 3}
   m_RendererFeatures:
   - {fileID: 8311532915064548623}
-  - {fileID: -8826677736187045534}
-  m_RendererFeatureMap: 0fad635d267f587362d9b85b5d578185
+  - {fileID: 1235885436445359287}
+  m_RendererFeatureMap: 0fad635d267f5873b77c67a641bf2611
   m_UseNativeRenderPass: 1
   xrSystemData: {fileID: 0}
   postProcessData: {fileID: 0}
@@ -77,6 +76,29 @@ MonoBehaviour:
   m_DepthTextureFormat: 0
   m_AccurateGbufferNormals: 0
   m_IntermediateTextureMode: 0
+--- !u!114 &1235885436445359287
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 1c187630bc7b44b2b951e08083f9e9cc, type: 3}
+  m_Name: LNSurfaceFeature
+  m_EditorClassIdentifier: Assembly-CSharp::LNSurfaceFeature
+  m_Active: 1
+  settings:
+    layerMask:
+      serializedVersion: 2
+      m_Bits: 4294967295
+    lightingComputeShader: {fileID: 7200000, guid: 882c8abbaf1e64165a0ab4587a14e525, type: 3}
+    lightingModel: 1
+    enableSSS: 0
+    intensity: 1
+    thicknessScale: 8
+    renderPassEvent: 500
 --- !u!114 &8311532915064548623
 MonoBehaviour:
   m_ObjectHideFlags: 0

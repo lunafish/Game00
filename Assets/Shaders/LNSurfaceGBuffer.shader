@@ -1,4 +1,4 @@
-Shader "Custom/SSSSGBuffer"
+Shader "Custom/LNSurfaceGBuffer"
 {
     Properties
     {
@@ -7,6 +7,9 @@ Shader "Custom/SSSSGBuffer"
         _SSSMask("SSS Mask", Range(0, 1)) = 1.0
         _ShadowStrength("Shadow Strength", Range(0, 1)) = 1.0
         _Smoothness("Smoothness", Range(0.0, 1.0)) = 0.5
+        _Metallic("Metallic", Range(0.0, 1.0)) = 0.0
+        _Subsurface("Subsurface", Range(0.0, 1.0)) = 0.0
+        _Anisotropic("Anisotropic", Range(0.0, 1.0)) = 0.0
         _SpecularColor("Specular Color", Color) = (1, 1, 1, 1)
         _FresnelPower("Fresnel Power", Range(0.1, 10.0)) = 5.0
         _FresnelStrength("Fresnel Strength", Range(0, 5)) = 0.5
@@ -44,6 +47,9 @@ Shader "Custom/SSSSGBuffer"
             float _SSSMask;
             float _ShadowStrength;
             float _Smoothness;
+            float _Metallic;
+            float _Subsurface;
+            float _Anisotropic;
             float4 _SpecularColor;
             float _FresnelPower;
             float _FresnelStrength;
@@ -66,6 +72,8 @@ Shader "Custom/SSSSGBuffer"
             float4 GBuffer1 : SV_Target1; // Normal
             float4 GBuffer2 : SV_Target2; // Depth
             float4 GBuffer3 : SV_Target3; // Mask
+            float4 GBuffer4 : SV_Target4; // Extra Data (Metallic, SpecularStrength, Packed(Subsurface, Anisotropic))
+            float4 GBuffer5 : SV_Target5; // Extra Data 2 (Smoothness)
         };
 
         FragmentOutput frag(Varyings input)
@@ -73,7 +81,10 @@ Shader "Custom/SSSSGBuffer"
             FragmentOutput output;
             float4 color = SAMPLE_TEXTURE2D(_BaseMap, sampler_BaseMap, input.uv) * _BaseColor;
             
-            output.GBuffer0 = float4(color.rgb, 1.0); // 알파는 사용하지 않으므로 1.0
+            // GBuffer0: Albedo (RGB), Unused (A) -> Set to 1.0
+            output.GBuffer0 = float4(color.rgb, 1.0); 
+
+            // GBuffer1: Normal (RGB), Unused (A) -> Set to 1.0
             output.GBuffer1 = float4(normalize(input.normalWS) * 0.5 + 0.5, 1.0);
             
             // View-space Z를 사용한 Linear Eye Depth
@@ -81,14 +92,33 @@ Shader "Custom/SSSSGBuffer"
             float linearDepth = -positionVS.z;
             output.GBuffer2 = float4(linearDepth.xxx, 1.0);
             
-            // GBuffer3에 SSS 마스크 출력
-            output.GBuffer3 = float4(_SSSMask.xxx, 1.0);
+            // GBuffer3: LNSurface Mask (R), Fresnel Strength (G), Fresnel Power (B), Unused (A)
+            output.GBuffer3 = float4(_SSSMask, _FresnelStrength / 5.0, _FresnelPower / 10.0, 1.0);
+
+            // GBuffer4 Packing
+            // R: Metallic
+            // G: Specular Strength
+            // B: Packed (Subsurface 4bit + Anisotropic 4bit)
+            // A: Unused -> 1.0
+            
+            float specularStrength = max(max(_SpecularColor.r, _SpecularColor.g), _SpecularColor.b);
+            
+            // Pack Subsurface (0..1) and Anisotropic (0..1) into 8 bits (0..255)
+            // Subsurface: High 4 bits, Anisotropic: Low 4 bits
+            float packedSubsurface = floor(_Subsurface * 15.0 + 0.5); 
+            float packedAnisotropic = floor(_Anisotropic * 15.0 + 0.5);
+            float packedB = (packedSubsurface * 16.0 + packedAnisotropic) / 255.0;
+
+            output.GBuffer4 = float4(_Metallic, specularStrength, packedB, 1.0);
+            
+            // GBuffer5: Smoothness (R), Unused (GBA)
+            output.GBuffer5 = float4(_Smoothness, 1.0, 1.0, 1.0);
 
             return output;
         }
         ENDHLSL
 
-        // 1. UniversalForward 패스 (Half Lambert + 그림자 수신)
+        // 1. UniversalForward 패스
         Pass
         {
             Name "UniversalForward"
@@ -98,7 +128,6 @@ Shader "Custom/SSSSGBuffer"
             #pragma vertex vert_forward
             #pragma fragment frag_forward
             
-            // Shadow keywords
             #pragma multi_compile _ _MAIN_LIGHT_SHADOWS _MAIN_LIGHT_SHADOWS_CASCADE _MAIN_LIGHT_SHADOWS_SCREEN
             #pragma multi_compile _ _SHADOWS_SOFT
             
@@ -106,7 +135,7 @@ Shader "Custom/SSSSGBuffer"
 
             Varyings vert_forward(Attributes input)
             {
-                return vert(input); // Reuse existing vert logic
+                return vert(input);
             }
 
             half4 frag_forward(Varyings input) : SV_Target
@@ -117,43 +146,25 @@ Shader "Custom/SSSSGBuffer"
                 half3 viewDirWS = GetWorldSpaceViewDir(input.positionWS.xyz);
                 half3 normalWS = normalize(input.normalWS);
 
-                // 1. Half Lambert (Diffuse)
-                float NdotL = dot(normalWS, mainLight.direction);
-                float halfLambert = NdotL * _DiffuseWrap + (1.0 - _DiffuseWrap);
-                halfLambert = halfLambert * halfLambert; 
-                
+                float NdotL = saturate(dot(normalWS, mainLight.direction));
                 half shadow = mainLight.shadowAttenuation;
-                shadow = smoothstep(-0.2, 1.2, shadow);
-                shadow = lerp(1.0, shadow, _ShadowStrength);
                 
-                // 2. Specular (Blinn-Phong)
-                half3 halfDir = normalize(mainLight.direction + viewDirWS);
-                float NdotH = saturate(dot(normalWS, halfDir));
-                float shininess = exp2(10.0 * _Smoothness + 1.0);
-                float specularTerm = pow(NdotH, shininess);
-                half3 specular = _SpecularColor.rgb * specularTerm * mainLight.color * shadow;
-
-                // 3. Fresnel
-                float NdotV = saturate(dot(normalWS, viewDirWS));
-                float fresnelTerm = pow(1.0 - NdotV, _FresnelPower);
-                half3 fresnel = _SpecularColor.rgb * fresnelTerm * _FresnelStrength;
-
-                // Combine
                 half4 albedo = SAMPLE_TEXTURE2D(_BaseMap, sampler_BaseMap, input.uv) * _BaseColor;
-                half3 diffuse = albedo.rgb * halfLambert * mainLight.color * shadow;
+                half3 ambient = SampleSH(normalWS) * albedo.rgb;
+                half3 diffuse = albedo.rgb * mainLight.color * NdotL * shadow;
                 
-                return half4(diffuse + specular + fresnel, albedo.a);
+                return half4(diffuse + ambient, albedo.a);
             }
             ENDHLSL
         }
 
-        // 2. ShadowCaster 패스 (그림자 투사)
+        // 2. ShadowCaster 패스
         Pass
         {
             Name "ShadowCaster"
             Tags { "LightMode" = "ShadowCaster" }
             ColorMask 0
-            Cull Front // 아티팩트를 줄이기 위해 그림자 캐스터에는 Front Culling 사용
+            Cull Front
             
             HLSLPROGRAM
             #pragma vertex vert_shadow
@@ -193,8 +204,8 @@ Shader "Custom/SSSSGBuffer"
 
         Pass
         {
-            Name "SSSS_Front"
-            Tags { "LightMode" = "SSSS_Front" }
+            Name "LNSurface_Front"
+            Tags { "LightMode" = "LNSurface_Front" }
             Cull Back
             ZTest LEqual
             ZWrite On
@@ -207,8 +218,8 @@ Shader "Custom/SSSSGBuffer"
 
         Pass
         {
-            Name "SSSS_Back"
-            Tags { "LightMode" = "SSSS_Back" }
+            Name "LNSurface_Back"
+            Tags { "LightMode" = "LNSurface_Back" }
             Cull Front
             ZTest Greater
             ZWrite Off

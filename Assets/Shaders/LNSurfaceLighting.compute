@@ -1,0 +1,240 @@
+#pragma kernel CSMain
+
+RWTexture2D<float4> _Result;
+
+// Textures
+Texture2D<float4> _LNSurface_Front_Color;  // RGB: Albedo, A: Unused
+Texture2D<float4> _LNSurface_Front_Normal; // RGB: Normal, A: Unused
+Texture2D<float4> _LNSurface_Mask;         // R: Mask
+Texture2D<float4> _LNSurface_Front_Depth; // R: Linear Depth
+Texture2D<float4> _LNSurface_Back_Depth;  // R: Linear Depth (Back face)
+Texture2D<float4> _LNSurface_Front_Extra; // R: Metallic, G: SpecularStrength, B: Packed(Subsurface, Anisotropic), A: Unused
+Texture2D<float4> _LNSurface_Front_Extra2; // R: Smoothness, GBA: Unused
+
+// Params
+float2 _ScreenParams;
+float4 _MainLightDirection;
+float4 _MainLightColor;
+float _SSS_Intensity;    // SSS Intensity
+float _SSS_ThicknessScale; // SSS Thickness Scale
+float _EnableSSS;          // Toggle SSS
+
+// SH Params
+float4 unity_SHAr;
+float4 unity_SHAg;
+float4 unity_SHAb;
+float4 unity_SHBr;
+float4 unity_SHBg;
+float4 unity_SHBb;
+float4 unity_SHC;
+
+// Unused params definitions kept to prevent C# from potentially complaining/warnings
+float4x4 _InverseViewProjectionMatrix; 
+float4x4 _InverseProjectionMatrix;
+float4x4 _CameraToWorldMatrix;
+int _LightingModel; // 0: HalfLambert, 1: DisneyBRDF
+
+#ifndef PI
+#define PI 3.14159265359f
+#endif
+
+// --- Local Disney BRDF Functions (Safe Naming) ---
+float Local_Sqr(float x) { return x * x; }
+
+float Local_SchlickFresnel(float u)
+{
+    float m = clamp(1.0 - u, 0.0, 1.0);
+    float m2 = m * m;
+    return m2 * m2 * m; // pow(m, 5)
+}
+
+float Local_GTR2(float NdotH, float a)
+{
+    float a2 = a * a;
+    float t = 1.0 + (a2 - 1.0) * NdotH * NdotH;
+    return a2 / (PI * t * t);
+}
+
+float Local_G_Smith(float NdotV, float NdotL, float alpha)
+{
+    float a = Local_Sqr(alpha);
+    float k = Local_Sqr(alpha + 1.0) * 0.125; // Direct Light
+    float g1 = NdotV / (NdotV * (1.0 - k) + k);
+    float g2 = NdotL / (NdotL * (1.0 - k) + k);
+    return g1 * g2;
+}
+
+// SH Evaluation Function (Matches Unity's ShadeSH9)
+float3 SampleSH(float3 normal)
+{
+    float4 n = float4(normal, 1.0);
+    float3 x1, x2, x3;
+    
+    // Linear + Constant
+    x1.r = dot(unity_SHAr, n);
+    x1.g = dot(unity_SHAg, n);
+    x1.b = dot(unity_SHAb, n);
+    
+    // Quadratic polynomials
+    float4 vB = n.xyzz * n.yzzx;
+    x2.r = dot(unity_SHBr, vB);
+    x2.g = dot(unity_SHBg, vB);
+    x2.b = dot(unity_SHBb, vB);
+    
+    // Final Quadratic term
+    float vC = n.x * n.x - n.y * n.y;
+    x3 = unity_SHC.rgb * vC;
+    
+    return max(0, x1 + x2 + x3);
+}
+// ------------------------------------------------
+
+[numthreads(8, 8, 1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _ScreenParams.x || id.y >= _ScreenParams.y)
+        return;
+
+    // Mask Check
+    float mask = _LNSurface_Mask[id.xy].r;
+    if (mask <= 0.001)
+    {
+        _Result[id.xy] = float4(0, 0, 0, 0); 
+        return;
+    }
+
+    // 1. Read Data
+    float4 gbuffer0 = _LNSurface_Front_Color[id.xy];
+    float4 gbuffer1 = _LNSurface_Front_Normal[id.xy];
+    float4 gbufferExtra = _LNSurface_Front_Extra[id.xy];
+    float4 gbufferExtra2 = _LNSurface_Front_Extra2[id.xy];
+    
+    // Unpack Data
+    float3 albedo = gbuffer0.rgb;
+    
+    float metallic = gbufferExtra.r;
+    float specularStrength = gbufferExtra.g;
+    float smoothness = gbufferExtra2.r;
+    
+    // Unpack B Channel (Subsurface 4bit + Anisotropic 4bit)
+    float packedB = gbufferExtra.b * 255.0;
+    float subsurface = floor(packedB / 16.0) / 15.0;
+    float anisotropic = (packedB - floor(packedB / 16.0) * 16.0) / 15.0;
+    
+    // Normal Unpack (0..1 -> -1..1)
+    float3 normalWS = normalize(gbuffer1.rgb * 2.0 - 1.0);
+    float3 lightDir = normalize(_MainLightDirection.xyz);
+    float NdotL = saturate(dot(normalWS, lightDir)); 
+
+    float3 diffuseColor = float3(0, 0, 0);
+    float3 specularColor = float3(0, 0, 0);
+    float3 ambientColor = float3(0, 0, 0);
+
+    if (_LightingModel == 0) // Half Lambert
+    {
+        // Half Lambert: (dot(N, L) * 0.5) + 0.5
+        // Use unclamped dot for wrap
+        float NdotL_Wrap = dot(normalWS, lightDir); 
+        float halfLambert = NdotL_Wrap * 0.5 + 0.5;
+        diffuseColor = albedo * halfLambert * _MainLightColor.rgb;
+        
+        // Simple Ambient for Half Lambert
+        ambientColor = SampleSH(normalWS) * albedo;
+        
+        specularColor = float3(0, 0, 0); // No specular in simplified mode
+    }
+    else // Disney BRDF
+    {
+        // 1. Reconstruct World Position for View Direction
+        float2 uv = id.xy / _ScreenParams;
+        float linearDepth = _LNSurface_Front_Depth[id.xy].r; // Linear Depth
+        
+        float fovScaleX = _InverseProjectionMatrix._m00;
+        float fovScaleY = _InverseProjectionMatrix._m11;
+        
+        float4 clipPos;
+        clipPos.xy = uv * 2.0 - 1.0;
+        clipPos.y *= -1.0; 
+        clipPos.z = 0; 
+        clipPos.w = 1;
+
+        float3 viewPos;
+        viewPos.z = -linearDepth; 
+        viewPos.x = clipPos.x * fovScaleX * -viewPos.z; 
+        viewPos.y = clipPos.y * fovScaleY * -viewPos.z;
+        
+        float3 worldPos = mul(_CameraToWorldMatrix, float4(viewPos, 1.0)).xyz;
+        float3 cameraPosWS = float3(_CameraToWorldMatrix._m03, _CameraToWorldMatrix._m13, _CameraToWorldMatrix._m23);
+        float3 viewDir = normalize(cameraPosWS - worldPos);
+        
+        // 2. BRDF Params
+        float roughness = 1.0 - smoothness;
+        roughness = max(roughness * roughness, 0.001);
+        float alpha = roughness; 
+        
+        float3 halfDir = normalize(lightDir + viewDir);
+        float NdotV = saturate(abs(dot(normalWS, viewDir)) + 1e-5);
+        float NdotH = saturate(dot(normalWS, halfDir));
+        float LdotH = saturate(dot(lightDir, halfDir));
+        
+        // Diffuse (Disney)
+        float FD90 = 0.5 + 2.0 * smoothness * LdotH * LdotH;
+        float lightScatter = 1.0 + (FD90 - 1.0) * Local_SchlickFresnel(NdotL);
+        float viewScatter = 1.0 + (FD90 - 1.0) * Local_SchlickFresnel(NdotV);
+        
+        // Base Diffuse (Lambert-like with Fresnel)
+        float baseDiffuse = lightScatter * viewScatter;
+
+        // Subsurface Diffuse (Retro-reflective approximation)
+        float FSS90 = LdotH * LdotH * smoothness;
+        float FSS = (1.0 + (FSS90 - 1.0) * Local_SchlickFresnel(NdotL)) * 
+                    (1.0 + (FSS90 - 1.0) * Local_SchlickFresnel(NdotV));
+        float ssDiffuse = 1.25 * (FSS * (1.0 / (NdotL + NdotV + 0.0001) - 0.5) + 0.5);
+
+        // Blend based on Subsurface parameter
+        float finalDiffuseFactor = lerp(baseDiffuse, ssDiffuse, subsurface);
+        
+        // Metallic Workflow: Diffuse is black for metals
+        float3 diffuseTerm = albedo * finalDiffuseFactor * NdotL * _MainLightColor.rgb;
+        diffuseColor = diffuseTerm * (1.0 - metallic);
+        
+        // Ambient (SH)
+        // Ambient is also affected by Metallic (Metals have no diffuse ambient)
+        float3 sh = SampleSH(normalWS);
+        ambientColor = sh * albedo * (1.0 - metallic);
+        
+        // Specular (Disney/GTR2/Smith)
+        float D = Local_GTR2(NdotH, alpha);
+        
+        // F0 Calculation
+        // Dielectric: 0.08 * specularStrength (approx 0.04 default)
+        // Metal: Albedo color
+        float3 F0 = lerp(0.08 * specularStrength * float3(1,1,1), albedo, metallic);
+        
+        float FH = Local_SchlickFresnel(LdotH);
+        float3 F = lerp(F0, float3(1,1,1), FH); // Fresnel
+        float G = Local_G_Smith(NdotV, NdotL, 0.25);
+        
+        float3 specTerm = (D * F * G) / (4.0 * NdotL * NdotV + 0.0001);
+        specularColor = max(0, specTerm) * _MainLightColor.rgb * NdotL * PI; 
+    }
+    
+    float3 sssColor = float3(0, 0, 0);
+    
+    // 4. SSS (Back-scattering / Translucency)
+    if (_EnableSSS > 0.5)
+    {
+        float frontDepth = _LNSurface_Front_Depth[id.xy].r;
+        float backDepth = _LNSurface_Back_Depth[id.xy].r;
+        float thickness = max(0, backDepth - frontDepth) * _SSS_ThicknessScale;
+        
+        float rawNdotL = dot(normalWS, lightDir);
+        float backLightFactor = saturate((-rawNdotL + 0.2) * 2.0); 
+        
+        float sssIntensity = _SSS_Intensity * (1.0 + backLightFactor);
+        sssColor = exp(-thickness * sssIntensity) * albedo.rgb * _MainLightColor.rgb * backLightFactor;
+    }
+
+    // Output
+    _Result[id.xy] = float4(diffuseColor + ambientColor + specularColor + sssColor, 1.0);
+}

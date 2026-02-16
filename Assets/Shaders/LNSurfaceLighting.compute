@@ -16,6 +16,11 @@ Texture2D<float4> _SceneColor;             // Scene Color (Background)
 float2 _ScreenParams;
 float4 _MainLightDirection;
 float4 _MainLightColor;
+int _AdditionalLightCount;
+float4 _AdditionalLightPositions[16];
+float4 _AdditionalLightColors[16];
+float4 _AdditionalLightAttenuations[16]; // x: 1/range^2, y: 1
+
 float _SSS_Intensity;    // SSS Intensity
 float _SSS_ThicknessScale; // SSS Thickness Scale
 float _EnableSSS;          // Toggle SSS
@@ -29,7 +34,7 @@ float4 unity_SHBg;
 float4 unity_SHBb;
 float4 unity_SHC;
 
-// Unused params definitions kept to prevent C# from potentially complaining/warnings
+// Matrix Params
 float4x4 _InverseViewProjectionMatrix; 
 float4x4 _InverseProjectionMatrix;
 float4x4 _CameraToWorldMatrix;
@@ -63,6 +68,14 @@ float Local_G_Smith(float NdotV, float NdotL, float alpha)
     float g1 = NdotV / (NdotV * (1.0 - k) + k);
     float g2 = NdotL / (NdotL * (1.0 - k) + k);
     return g1 * g2;
+}
+
+// Distance Attenuation
+float GetDistanceAttenuation(float3 lightDir, float4 attenuation)
+{
+    float d2 = dot(lightDir, lightDir);
+    float rangeCheck = saturate(1.0 - d2 * attenuation.x);
+    return rangeCheck * rangeCheck / (d2 + 0.01);
 }
 
 // SH Evaluation Function (Matches Unity's ShadeSH9)
@@ -113,140 +126,134 @@ void CSMain (uint3 id : SV_DispatchThreadID)
     
     // Unpack Data
     float3 albedo = gbuffer0.rgb;
-    
     float metallic = gbufferExtra.r;
     float specularStrength = gbufferExtra.g;
     float smoothness = gbufferExtra2.r;
     float shadow = gbufferExtra2.g; 
-    float diffuseWrap = gbufferExtra2.b; // Read Diffuse Wrap
+    float diffuseWrap = gbufferExtra2.b;
     
     // Unpack B Channel (Subsurface 4bit + Anisotropic 4bit)
     float packedB = gbufferExtra.b * 255.0;
     float subsurface = floor(packedB / 16.0) / 15.0;
     float anisotropic = (packedB - floor(packedB / 16.0) * 16.0) / 15.0;
     
-    // Normal Unpack (0..1 -> -1..1)
+    // Normal Unpack
     float3 normalWS = normalize(gbuffer1.rgb * 2.0 - 1.0);
-    float3 lightDir = normalize(_MainLightDirection.xyz);
     
-    // Apply Diffuse Wrap to NdotL
-    float rawNdotL = dot(normalWS, lightDir);
-    float NdotL = saturate((rawNdotL + diffuseWrap) / (1.0 + diffuseWrap));
-
-    float3 diffuseColor = float3(0, 0, 0);
-    float3 specularColor = float3(0, 0, 0);
-    float3 ambientColor = float3(0, 0, 0);
-
-    if (_LightingModel == 0) // Half Lambert
-    {
-        // Half Lambert: (dot(N, L) * 0.5) + 0.5
-        // Use unclamped dot for wrap
-        float NdotL_Wrap = rawNdotL; 
-        float halfLambert = NdotL_Wrap * (1.0 - diffuseWrap) + diffuseWrap;
-        diffuseColor = albedo * halfLambert * _MainLightColor.rgb * shadow;
-        
-        // Simple Ambient for Half Lambert
-        ambientColor = SampleSH(normalWS) * albedo;
-        
-        specularColor = float3(0, 0, 0); // No specular in simplified mode
-    }
-    else // Disney BRDF
-    {
-        // 1. Reconstruct World Position for View Direction
-        float2 uv = id.xy / _ScreenParams;
-        float linearDepth = _LNSurface_Front_Depth[id.xy].r; // Linear Depth
-        
-        float fovScaleX = _InverseProjectionMatrix._m00;
-        float fovScaleY = _InverseProjectionMatrix._m11;
-        
-        float4 clipPos;
-        clipPos.xy = uv * 2.0 - 1.0;
-        clipPos.y *= -1.0; 
-        clipPos.z = 0; 
-        clipPos.w = 1;
-
-        float3 viewPos;
-        viewPos.z = -linearDepth; 
-        viewPos.x = clipPos.x * fovScaleX * -viewPos.z; 
-        viewPos.y = clipPos.y * fovScaleY * -viewPos.z;
-        
-        float3 worldPos = mul(_CameraToWorldMatrix, float4(viewPos, 1.0)).xyz;
-        float3 cameraPosWS = float3(_CameraToWorldMatrix._m03, _CameraToWorldMatrix._m13, _CameraToWorldMatrix._m23);
-        float3 viewDir = normalize(cameraPosWS - worldPos);
-        
-        // 2. BRDF Params
-        float roughness = 1.0 - smoothness;
-        roughness = max(roughness * roughness, 0.001);
-        float alpha = roughness; 
-        
-        float3 halfDir = normalize(lightDir + viewDir);
-        float NdotV = saturate(abs(dot(normalWS, viewDir)) + 1e-5);
-        float NdotH = saturate(dot(normalWS, halfDir));
-        float LdotH = saturate(dot(lightDir, halfDir));
-        
-        // Diffuse (Disney)
-        float FD90 = 0.5 + 2.0 * smoothness * LdotH * LdotH;
-        float lightScatter = 1.0 + (FD90 - 1.0) * Local_SchlickFresnel(NdotL);
-        float viewScatter = 1.0 + (FD90 - 1.0) * Local_SchlickFresnel(NdotV);
-        
-        // Base Diffuse (Lambert-like with Fresnel)
-        float baseDiffuse = lightScatter * viewScatter;
-
-        // Subsurface Diffuse (Retro-reflective approximation)
-        float FSS90 = LdotH * LdotH * smoothness;
-        float FSS = (1.0 + (FSS90 - 1.0) * Local_SchlickFresnel(NdotL)) * 
-                    (1.0 + (FSS90 - 1.0) * Local_SchlickFresnel(NdotV));
-        float ssDiffuse = 1.25 * (FSS * (1.0 / (NdotL + NdotV + 0.0001) - 0.5) + 0.5);
-
-        // Blend based on Subsurface parameter
-        float finalDiffuseFactor = lerp(baseDiffuse, ssDiffuse, subsurface);
-        
-        // Metallic Workflow: Diffuse is black for metals
-        // Apply Shadow to Diffuse
-        float3 diffuseTerm = albedo * finalDiffuseFactor * NdotL * _MainLightColor.rgb * shadow;
-        diffuseColor = diffuseTerm * (1.0 - metallic);
-        
-        // Ambient (SH)
-        // Ambient is also affected by Metallic (Metals have no diffuse ambient)
-        float3 sh = SampleSH(normalWS);
-        ambientColor = sh * albedo * (1.0 - metallic);
-        
-        // Specular (Disney/GTR2/Smith)
-        float D = Local_GTR2(NdotH, alpha);
-        
-        // F0 Calculation
-        // Dielectric: 0.08 * specularStrength (approx 0.04 default)
-        // Metal: Albedo color
-        float3 F0 = lerp(0.08 * specularStrength * float3(1,1,1), albedo, metallic);
-        
-        float FH = Local_SchlickFresnel(LdotH);
-        float3 F = lerp(F0, float3(1,1,1), FH); // Fresnel
-        float G = Local_G_Smith(NdotV, NdotL, 0.25);
-        
-        float3 specTerm = (D * F * G) / (4.0 * NdotL * NdotV + 0.0001);
-        // Apply Shadow to Specular
-        specularColor = max(0, specTerm) * _MainLightColor.rgb * NdotL * PI * shadow; 
-    }
+    // 2. Reconstruct World Position
+    float2 uv = (float2(id.xy) + 0.5) / _ScreenParams;
+    float linearDepth = _LNSurface_Front_Depth[id.xy].r;
     
-    float3 sssColor = float3(0, 0, 0);
+    float fovScaleX = _InverseProjectionMatrix._m00;
+    float fovScaleY = _InverseProjectionMatrix._m11;
     
-    // 4. SSS (Back-scattering / Translucency)
-    if (_EnableSSS > 0.5)
+    float4 clipPos;
+    clipPos.xy = uv * 2.0 - 1.0;
+    clipPos.z = 0; 
+    clipPos.w = 1;
+
+    float3 viewPos;
+    viewPos.z = -linearDepth; 
+    viewPos.x = clipPos.x * fovScaleX * -viewPos.z; 
+    viewPos.y = clipPos.y * fovScaleY * -viewPos.z;
+    
+    float3 worldPos = mul(_CameraToWorldMatrix, float4(viewPos, 1.0)).xyz;
+    float3 cameraPosWS = float3(_CameraToWorldMatrix._m03, _CameraToWorldMatrix._m13, _CameraToWorldMatrix._m23);
+    float3 viewDir = normalize(cameraPosWS - worldPos);
+
+    float3 totalDiffuse = float3(0, 0, 0);
+    float3 totalSpecular = float3(0, 0, 0);
+    float3 totalSSS = float3(0, 0, 0);
+
+    // 3. Lighting Loop (Main Light + Additional Lights)
+    uint lightLoopCount = (uint)(_AdditionalLightCount + 1);
+    for (uint i = 0; i < lightLoopCount; ++i)
     {
-        float frontDepth = _LNSurface_Front_Depth[id.xy].r;
-        float backDepth = _LNSurface_Back_Depth[id.xy].r;
-        float thickness = max(0, backDepth - frontDepth) * _SSS_ThicknessScale;
-        
+        float3 lightColor;
+        float3 lightDir;
+        float atten = 1.0;
+
+        if (i == 0) // Main Light
+        {
+            lightDir = normalize(_MainLightDirection.xyz);
+            lightColor = _MainLightColor.rgb;
+            atten = shadow;
+        }
+        else // Additional Light
+        {
+            uint lightIdx = i - 1;
+            float3 lightPos = _AdditionalLightPositions[lightIdx].xyz;
+            float3 lightToPos = lightPos - worldPos;
+            float distSq = dot(lightToPos, lightToPos);
+            lightDir = normalize(lightToPos);
+            
+            atten = GetDistanceAttenuation(lightToPos, _AdditionalLightAttenuations[lightIdx]);
+            lightColor = _AdditionalLightColors[lightIdx].rgb;
+        }
+
+        // Apply Diffuse Wrap
         float rawNdotL = dot(normalWS, lightDir);
-        float backLightFactor = saturate((-rawNdotL + 0.2) * 2.0); 
-        
-        float sssIntensity = _SSS_Intensity * (1.0 + backLightFactor);
-        // SSS is usually affected by shadow too (if the back side is in shadow)
-        // But for translucency, we might want light to pass through even if front is shadowed?
-        // Let's apply shadow for correctness (if light is blocked before hitting the object)
-        sssColor = exp(-thickness * sssIntensity) * albedo.rgb * _MainLightColor.rgb * backLightFactor * shadow;
+        float NdotL = saturate((rawNdotL + diffuseWrap) / (1.0 + diffuseWrap));
+
+        if (_LightingModel == 0) // Half Lambert
+        {
+            float halfLambert = rawNdotL * (1.0 - diffuseWrap) + diffuseWrap;
+            totalDiffuse += albedo * halfLambert * lightColor * atten;
+        }
+        else // Disney BRDF
+        {
+            float roughness = 1.0 - smoothness;
+            roughness = max(roughness * roughness, 0.001);
+            float alpha = roughness; 
+            
+            float3 halfDir = normalize(lightDir + viewDir);
+            float NdotV = saturate(abs(dot(normalWS, viewDir)) + 1e-5);
+            float NdotH = saturate(dot(normalWS, halfDir));
+            float LdotH = saturate(dot(lightDir, halfDir));
+            
+            // Diffuse (Disney)
+            float FD90 = 0.5 + 2.0 * smoothness * LdotH * LdotH;
+            float lightScatter = 1.0 + (FD90 - 1.0) * Local_SchlickFresnel(NdotL);
+            float viewScatter = 1.0 + (FD90 - 1.0) * Local_SchlickFresnel(NdotV);
+            float baseDiffuse = lightScatter * viewScatter;
+
+            // Subsurface Diffuse
+            float FSS90 = LdotH * LdotH * smoothness;
+            float FSS = (1.0 + (FSS90 - 1.0) * Local_SchlickFresnel(NdotL)) * 
+                        (1.0 + (FSS90 - 1.0) * Local_SchlickFresnel(NdotV));
+            float ssDiffuse = 1.25 * (FSS * (1.0 / (NdotL + NdotV + 0.0001) - 0.5) + 0.5);
+
+            float finalDiffuseFactor = lerp(baseDiffuse, ssDiffuse, subsurface);
+            float3 diffuseTerm = albedo * finalDiffuseFactor * NdotL * lightColor * atten;
+            totalDiffuse += diffuseTerm * (1.0 - metallic);
+            
+            // Specular
+            float D = Local_GTR2(NdotH, alpha);
+            float3 F0 = lerp(0.08 * specularStrength * float3(1,1,1), albedo, metallic);
+            float FH = Local_SchlickFresnel(LdotH);
+            float3 F = lerp(F0, float3(1,1,1), FH);
+            float G = Local_G_Smith(NdotV, NdotL, 0.25);
+            
+            float3 specTerm = (D * F * G) / (4.0 * NdotL * NdotV + 0.0001);
+            totalSpecular += max(0, specTerm) * lightColor * NdotL * PI * atten;
+        }
+
+        // 4. SSS
+        if (_EnableSSS > 0.5)
+        {
+            float frontDepth = _LNSurface_Front_Depth[id.xy].r;
+            float backDepth = _LNSurface_Back_Depth[id.xy].r;
+            float thickness = max(0, backDepth - frontDepth) * _SSS_ThicknessScale;
+            
+            float backLightFactor = saturate((-rawNdotL + 0.2) * 2.0); 
+            float sssIntensity = _SSS_Intensity * (1.0 + backLightFactor);
+            totalSSS += exp(-thickness * sssIntensity) * albedo.rgb * lightColor * backLightFactor * atten;
+        }
     }
 
-    // Output
-    _Result[id.xy] = float4(diffuseColor + ambientColor + specularColor + sssColor, 1.0);
+    // Ambient (SH) - Calculated once
+    float3 ambientColor = SampleSH(normalWS) * albedo * (1.0 - metallic);
+
+    // Final Output
+    _Result[id.xy] = float4(totalDiffuse + ambientColor + totalSpecular + totalSSS, 1.0);
 }

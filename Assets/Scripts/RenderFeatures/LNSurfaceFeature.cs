@@ -89,8 +89,14 @@ public class LNSurfaceFeature : ScriptableRendererFeature
             internal float enableSSS; 
             internal int lightingModel; // 0: HalfLambert, 1: DisneyBRDF
             internal Vector2 screenParams;
+            // Light Data
             internal Vector4 mainLightDirection;  
             internal Vector4 mainLightColor;
+            internal int additionalLightCount;
+            internal Vector4[] additionalLightPositions;
+            internal Vector4[] additionalLightColors;
+            internal Vector4[] additionalLightAttenuations;
+
             internal Matrix4x4 cameraToWorldMatrix;
             internal Matrix4x4 inverseProjectionMatrix;
             
@@ -109,7 +115,7 @@ public class LNSurfaceFeature : ScriptableRendererFeature
             UniversalResourceData resourceData = frameData.Get<UniversalResourceData>();
             UniversalCameraData cameraData = frameData.Get<UniversalCameraData>();
             UniversalRenderingData renderingData = frameData.Get<UniversalRenderingData>();
-            // UniversalLightData lightData = frameData.Get<UniversalLightData>(); 
+            UniversalLightData lightData = frameData.Get<UniversalLightData>(); 
 
             var desc = cameraData.cameraTargetDescriptor;
             desc.depthBufferBits = 0; 
@@ -152,46 +158,55 @@ public class LNSurfaceFeature : ScriptableRendererFeature
             {
                 using (var builder = renderGraph.AddComputePass<ComputePassData>("LNSurface Lighting Pass", out var passData))
                 {
+                    passData.compute = _settings.lightingComputeShader;
+                    passData.kernel = _settings.lightingComputeShader.FindKernel("CSMain");
+
                     var resultDesc = cameraData.cameraTargetDescriptor;
                     resultDesc.depthBufferBits = 0; // Fix: Disable depth buffer for Compute Shader output
                     resultDesc.enableRandomWrite = true;
                     // Fix: Ensure format supports Random Write (sRGB usually doesn't). Use FP16 or similar.
                     resultDesc.graphicsFormat = UnityEngine.Experimental.Rendering.GraphicsFormat.R16G16B16A16_SFloat;
-                    RenderingUtils.ReAllocateIfNeeded(ref _resultHandle, resultDesc);
+                    RenderingUtils.ReAllocateHandleIfNeeded(ref _resultHandle, resultDesc, name: "_LNSurface_LightingResult");
 
-                    passData.compute = _settings.lightingComputeShader;
-                    passData.kernel = _kernelLighting;
-                    passData.screenParams = new Vector2(resultDesc.width, resultDesc.height);
                     passData.cameraToWorldMatrix = cameraData.camera.cameraToWorldMatrix;
                     passData.inverseProjectionMatrix = Matrix4x4.Inverse(cameraData.camera.projectionMatrix);
+                    passData.screenParams = new Vector4(resultDesc.width, resultDesc.height, 1.0f / resultDesc.width, 1.0f / resultDesc.height);
 
-                    // Light Data - Dynamic
-                    Light mainLight = RenderSettings.sun;
-                    if (mainLight == null)
+                    // Main Light
+                    Vector4 mainLightDir = new Vector4(0, 1, 0, 0);
+                    Vector4 mainLightCol = Vector4.zero;
+
+                    if (lightData.mainLightIndex != -1)
                     {
-                        var lights = Object.FindObjectsByType<Light>(FindObjectsSortMode.None);
-                        foreach (var light in lights)
-                        {
-                            if (light.type == LightType.Directional)
-                            {
-                                mainLight = light;
-                                break;
-                            }
-                        }
+                        var light = lightData.visibleLights[lightData.mainLightIndex];
+                        mainLightDir = -light.localToWorldMatrix.GetColumn(2);
+                        mainLightCol = light.finalColor;
                     }
 
-                    Vector4 mainLightDir = new Vector4(0, 0, 1, 0);
-                    Vector4 mainLightCol = Vector4.one;
-
-                    if (mainLight != null)
-                    {
-                        // Direction TO light source (-forward)
-                        mainLightDir = -mainLight.transform.forward;
-                        mainLightCol = mainLight.color * mainLight.intensity;
-                    }
-                    
                     passData.mainLightDirection = mainLightDir;
                     passData.mainLightColor = mainLightCol;
+
+                    // Additional Lights
+                    passData.additionalLightPositions = new Vector4[16];
+                    passData.additionalLightColors = new Vector4[16];
+                    passData.additionalLightAttenuations = new Vector4[16];
+
+                    int addCount = 0;
+                    for (int i = 0; i < lightData.visibleLights.Length && addCount < 16; i++)
+                    {
+                        if (i == lightData.mainLightIndex)
+                            continue;
+
+                        var light = lightData.visibleLights[i];
+                        passData.additionalLightPositions[addCount] = light.localToWorldMatrix.GetColumn(3);
+                        passData.additionalLightColors[addCount] = light.finalColor;
+                        
+                        float rangeSq = light.range * light.range;
+                        passData.additionalLightAttenuations[addCount] = new Vector4(1.0f / Mathf.Max(rangeSq, 0.0001f), 1.0f, 0, 0);
+                        
+                        addCount++;
+                    }
+                    passData.additionalLightCount = addCount;
                     passData.intensity = _settings.intensity;
                     passData.thicknessScale = _settings.thicknessScale;
                     passData.enableSSS = _settings.enableSSS ? 1.0f : 0.0f; 
@@ -252,6 +267,12 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                         context.cmd.SetComputeVectorParam(data.compute, "_ScreenParams", data.screenParams);
                         context.cmd.SetComputeVectorParam(data.compute, "_MainLightDirection", data.mainLightDirection);
                         context.cmd.SetComputeVectorParam(data.compute, "_MainLightColor", data.mainLightColor);
+                        
+                        // Additional Lights
+                        context.cmd.SetComputeIntParam(data.compute, "_AdditionalLightCount", data.additionalLightCount);
+                        context.cmd.SetComputeVectorArrayParam(data.compute, "_AdditionalLightPositions", data.additionalLightPositions);
+                        context.cmd.SetComputeVectorArrayParam(data.compute, "_AdditionalLightColors", data.additionalLightColors);
+                        context.cmd.SetComputeVectorArrayParam(data.compute, "_AdditionalLightAttenuations", data.additionalLightAttenuations);
                         
                         // SSS Params
                         context.cmd.SetComputeFloatParam(data.compute, "_SSS_Intensity", data.intensity);

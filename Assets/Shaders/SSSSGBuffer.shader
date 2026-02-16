@@ -6,6 +6,11 @@ Shader "Custom/SSSSGBuffer"
         _BaseColor("Base Color", Color) = (1,1,1,1)
         _SSSMask("SSS Mask", Range(0, 1)) = 1.0
         _ShadowStrength("Shadow Strength", Range(0, 1)) = 1.0
+        _Smoothness("Smoothness", Range(0.0, 1.0)) = 0.5
+        _SpecularColor("Specular Color", Color) = (1, 1, 1, 1)
+        _FresnelPower("Fresnel Power", Range(0.1, 10.0)) = 5.0
+        _FresnelStrength("Fresnel Strength", Range(0, 5)) = 0.5
+        _DiffuseWrap("Diffuse Wrap", Range(0.0, 1.0)) = 0.25
     }
 
     SubShader
@@ -38,6 +43,11 @@ Shader "Custom/SSSSGBuffer"
             float4 _BaseColor;
             float _SSSMask;
             float _ShadowStrength;
+            float _Smoothness;
+            float4 _SpecularColor;
+            float _FresnelPower;
+            float _FresnelStrength;
+            float _DiffuseWrap;
         CBUFFER_END
 
         Varyings vert(Attributes input)
@@ -104,26 +114,35 @@ Shader "Custom/SSSSGBuffer"
                 float4 shadowCoord = TransformWorldToShadowCoord(input.positionWS.xyz);
                 Light mainLight = GetMainLight(shadowCoord);
                 
-                // Half Lambert 계산
-                float3 normal = normalize(input.normalWS);
-                float NdotL = dot(normal, mainLight.direction);
-                float halfLambert = NdotL * 0.5 + 0.5;
-                halfLambert = halfLambert * halfLambert; // 부드러운 감쇠를 위해 제곱
+                half3 viewDirWS = GetWorldSpaceViewDir(input.positionWS.xyz);
+                half3 normalWS = normalize(input.normalWS);
+
+                // 1. Half Lambert (Diffuse)
+                float NdotL = dot(normalWS, mainLight.direction);
+                float halfLambert = NdotL * _DiffuseWrap + (1.0 - _DiffuseWrap);
+                halfLambert = halfLambert * halfLambert; 
                 
                 half shadow = mainLight.shadowAttenuation;
-                
-                // 그림자 경계 부드럽게 처리
                 shadow = smoothstep(-0.2, 1.2, shadow);
-                
-                // 그림자 강도 적용
-                // 강도(Strength)에 따라 1.0(그림자 없음)과 실제 그림자 값 사이를 보간
                 shadow = lerp(1.0, shadow, _ShadowStrength);
                 
-                // 합성: 알베도 * HalfLambert * 그림자 * 조명색상
+                // 2. Specular (Blinn-Phong)
+                half3 halfDir = normalize(mainLight.direction + viewDirWS);
+                float NdotH = saturate(dot(normalWS, halfDir));
+                float shininess = exp2(10.0 * _Smoothness + 1.0);
+                float specularTerm = pow(NdotH, shininess);
+                half3 specular = _SpecularColor.rgb * specularTerm * mainLight.color * shadow;
+
+                // 3. Fresnel
+                float NdotV = saturate(dot(normalWS, viewDirWS));
+                float fresnelTerm = pow(1.0 - NdotV, _FresnelPower);
+                half3 fresnel = _SpecularColor.rgb * fresnelTerm * _FresnelStrength;
+
+                // Combine
                 half4 albedo = SAMPLE_TEXTURE2D(_BaseMap, sampler_BaseMap, input.uv) * _BaseColor;
-                float3 lighting = halfLambert * mainLight.color * shadow;
+                half3 diffuse = albedo.rgb * halfLambert * mainLight.color * shadow;
                 
-                return float4(albedo.rgb * lighting, albedo.a);
+                return half4(diffuse + specular + fresnel, albedo.a);
             }
             ENDHLSL
         }

@@ -633,7 +633,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 8a9c89a4344834a0baef5666a3766b64, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::SimpleCameraController
-  target: {fileID: 0}
+  target: {fileID: 9042430814769268461}
   offset: {x: 0, y: 2, z: 0}
   sensitivityX: 2
   sensitivityY: 0.2

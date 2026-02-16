@@ -18,8 +18,8 @@ MonoBehaviour:
       serializedVersion: 2
       m_Bits: 4294967295
     computeShader: {fileID: 7200000, guid: dd814543100a84132a5a400fb5b0c729, type: 3}
-    intensity: 1
-    thicknessScale: 6.9
+    intensity: 0.25
+    thicknessScale: 8
     renderPassEvent: 500
 --- !u!114 &11400000
 MonoBehaviour:

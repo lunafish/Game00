@@ -109,7 +109,7 @@ public class LNSurfaceFeature : ScriptableRendererFeature
             UniversalResourceData resourceData = frameData.Get<UniversalResourceData>();
             UniversalCameraData cameraData = frameData.Get<UniversalCameraData>();
             UniversalRenderingData renderingData = frameData.Get<UniversalRenderingData>();
-            UniversalLightData lightData = frameData.Get<UniversalLightData>(); 
+            // UniversalLightData lightData = frameData.Get<UniversalLightData>(); 
 
             var desc = cameraData.cameraTargetDescriptor;
             desc.depthBufferBits = 0; 
@@ -165,15 +165,29 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                     passData.cameraToWorldMatrix = cameraData.camera.cameraToWorldMatrix;
                     passData.inverseProjectionMatrix = Matrix4x4.Inverse(cameraData.camera.projectionMatrix);
 
-                    // Light Data - Fetching from UniversalLightData
+                    // Light Data - Dynamic
+                    Light mainLight = RenderSettings.sun;
+                    if (mainLight == null)
+                    {
+                        var lights = Object.FindObjectsByType<Light>(FindObjectsSortMode.None);
+                        foreach (var light in lights)
+                        {
+                            if (light.type == LightType.Directional)
+                            {
+                                mainLight = light;
+                                break;
+                            }
+                        }
+                    }
+
                     Vector4 mainLightDir = new Vector4(0, 0, 1, 0);
                     Vector4 mainLightCol = Vector4.one;
 
-                    if (lightData.mainLightIndex >= 0)
+                    if (mainLight != null)
                     {
-                        var mainLight = renderingData.cullResults.visibleLights[lightData.mainLightIndex];
-                        mainLightDir = -mainLight.localToWorldMatrix.GetColumn(2); // Forward direction of light
-                        mainLightCol = mainLight.finalColor;
+                        // Direction TO light source (-forward)
+                        mainLightDir = -mainLight.transform.forward;
+                        mainLightCol = mainLight.color * mainLight.intensity;
                     }
                     
                     passData.mainLightDirection = mainLightDir;
@@ -190,6 +204,7 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                     passData.mask = mask;
                     passData.extra = frontExtra;
                     passData.extra2 = frontExtra2;
+                    passData.sceneColor = resourceData.activeColorTexture; // Bind Scene Color
                     
                     passData.result = renderGraph.ImportTexture(_resultHandle);
                     lightingResult = passData.result;
@@ -219,6 +234,7 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                     builder.UseTexture(passData.mask);
                     builder.UseTexture(passData.extra);
                     builder.UseTexture(passData.extra2);
+                    builder.UseTexture(passData.sceneColor); // Use Scene Color
                     builder.UseTexture(passData.result, AccessFlags.Write);
 
                     builder.SetRenderFunc((ComputePassData data, ComputeGraphContext context) =>
@@ -230,6 +246,7 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Mask", data.mask);
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Front_Extra", data.extra);
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Front_Extra2", data.extra2);
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_SceneColor", data.sceneColor); // Set Scene Color
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_Result", data.result);
 
                         context.cmd.SetComputeVectorParam(data.compute, "_ScreenParams", data.screenParams);

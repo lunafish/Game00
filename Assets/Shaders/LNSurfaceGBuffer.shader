@@ -22,6 +22,7 @@ Shader "Custom/LNSurfaceGBuffer"
 
         HLSLINCLUDE
         #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
+        #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Lighting.hlsl"
 
         struct Attributes
         {
@@ -73,7 +74,7 @@ Shader "Custom/LNSurfaceGBuffer"
             float4 GBuffer2 : SV_Target2; // Depth
             float4 GBuffer3 : SV_Target3; // Mask
             float4 GBuffer4 : SV_Target4; // Extra Data (Metallic, SpecularStrength, Packed(Subsurface, Anisotropic))
-            float4 GBuffer5 : SV_Target5; // Extra Data 2 (Smoothness)
+            float4 GBuffer5 : SV_Target5; // Extra Data 2 (Smoothness, Shadow, Unused, Unused)
         };
 
         FragmentOutput frag(Varyings input)
@@ -81,6 +82,11 @@ Shader "Custom/LNSurfaceGBuffer"
             FragmentOutput output;
             float4 color = SAMPLE_TEXTURE2D(_BaseMap, sampler_BaseMap, input.uv) * _BaseColor;
             
+            // Shadow Calculation
+            float4 shadowCoord = TransformWorldToShadowCoord(input.positionWS.xyz);
+            Light mainLight = GetMainLight(shadowCoord);
+            float shadow = mainLight.shadowAttenuation;
+
             // GBuffer0: Albedo (RGB), Unused (A) -> Set to 1.0
             output.GBuffer0 = float4(color.rgb, 1.0); 
 
@@ -111,8 +117,8 @@ Shader "Custom/LNSurfaceGBuffer"
 
             output.GBuffer4 = float4(_Metallic, specularStrength, packedB, 1.0);
             
-            // GBuffer5: Smoothness (R), Unused (GBA)
-            output.GBuffer5 = float4(_Smoothness, 1.0, 1.0, 1.0);
+            // GBuffer5: Smoothness (R), Shadow (G), Unused (BA)
+            output.GBuffer5 = float4(_Smoothness, shadow, 1.0, 1.0);
 
             return output;
         }
@@ -131,7 +137,7 @@ Shader "Custom/LNSurfaceGBuffer"
             #pragma multi_compile _ _MAIN_LIGHT_SHADOWS _MAIN_LIGHT_SHADOWS_CASCADE _MAIN_LIGHT_SHADOWS_SCREEN
             #pragma multi_compile _ _SHADOWS_SOFT
             
-            #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Lighting.hlsl"
+            // Lighting.hlsl included in HLSLINCLUDE
 
             Varyings vert_forward(Attributes input)
             {
@@ -213,6 +219,11 @@ Shader "Custom/LNSurfaceGBuffer"
             HLSLPROGRAM
             #pragma vertex vert
             #pragma fragment frag
+            
+            // Shadow keywords needed for GetMainLight()
+            #pragma multi_compile _ _MAIN_LIGHT_SHADOWS _MAIN_LIGHT_SHADOWS_CASCADE _MAIN_LIGHT_SHADOWS_SCREEN
+            #pragma multi_compile _ _SHADOWS_SOFT
+
             ENDHLSL
         }
 

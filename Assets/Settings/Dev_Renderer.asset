@@ -1,5 +1,26 @@
 %YAML 1.1
 %TAG !u! tag:unity3d.com,2011:
+--- !u!114 &-8826677736187045534
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 29a804937259347949953dac140b4706, type: 3}
+  m_Name: ScreenSpaceSSSFeature
+  m_EditorClassIdentifier: Assembly-CSharp::ScreenSpaceSSSFeature
+  m_Active: 1
+  settings:
+    layerMask:
+      serializedVersion: 2
+      m_Bits: 4294967295
+    computeShader: {fileID: 7200000, guid: dd814543100a84132a5a400fb5b0c729, type: 3}
+    intensity: 1
+    thicknessScale: 6.9
+    renderPassEvent: 500
 --- !u!114 &11400000
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -26,7 +47,8 @@ MonoBehaviour:
     probeVolumeBlendStatesCS: {fileID: 7200000, guid: b9a23f869c4fd45f19c5ada54dd82176, type: 3}
   m_RendererFeatures:
   - {fileID: 8311532915064548623}
-  m_RendererFeatureMap: 0fad635d267f5873
+  - {fileID: -8826677736187045534}
+  m_RendererFeatureMap: 0fad635d267f587362d9b85b5d578185
   m_UseNativeRenderPass: 1
   xrSystemData: {fileID: 0}
   postProcessData: {fileID: 0}

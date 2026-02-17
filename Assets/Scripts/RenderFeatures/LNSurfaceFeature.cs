@@ -28,6 +28,12 @@ public class LNSurfaceFeature : ScriptableRendererFeature
         [Range(0.01f, 1.0f)] public float ssrStepSize = 0.1f;
         [Range(0.01f, 1.0f)] public float ssrThickness = 0.1f;
 
+        [Header("Ambient Occlusion")]
+        public bool enableSSAO = true;
+        [Range(0.01f, 5.0f)] public float ssaoRadius = 0.5f;
+        [Range(0f, 10f)] public float ssaoIntensity = 1.0f;
+        [Range(4, 32)] public int ssaoSampleCount = 16;
+
         public RenderPassEvent renderPassEvent = RenderPassEvent.AfterRenderingTransparents;
     }
 
@@ -90,6 +96,7 @@ public class LNSurfaceFeature : ScriptableRendererFeature
             internal TextureHandle mask; 
             internal TextureHandle extra; // GBuffer4: Metallic, SpecularStrength, Packed(Subsurface, Anisotropic)
             internal TextureHandle extra2; // GBuffer5: Smoothness
+            internal TextureHandle ssaoTexture; // SSAO Blurred Result
             internal TextureHandle result; // Input/Output
             
             internal float intensity;
@@ -103,6 +110,12 @@ public class LNSurfaceFeature : ScriptableRendererFeature
             internal int ssrMaxSteps;
             internal float ssrStepSize;
             internal float ssrThickness;
+
+            // SSAO Params
+            internal float enableSSAO;
+            internal float ssaoRadius;
+            internal float ssaoIntensity;
+            internal int ssaoSampleCount;
             // Light Data
             internal Vector4 mainLightDirection;  
             internal Vector4 mainLightColor;
@@ -154,6 +167,13 @@ public class LNSurfaceFeature : ScriptableRendererFeature
             maskDesc.graphicsFormat = UnityEngine.Experimental.Rendering.GraphicsFormat.R8G8B8A8_UNorm; // ARGB32
             TextureHandle mask = UniversalRenderer.CreateRenderGraphTexture(renderGraph, maskDesc, "LNSurface_Mask", false);
 
+            // SSAO Textures (R8 for performance)
+            var aoDesc = desc;
+            aoDesc.graphicsFormat = UnityEngine.Experimental.Rendering.GraphicsFormat.R8_UNorm;
+            aoDesc.enableRandomWrite = true;
+            TextureHandle aoRaw = UniversalRenderer.CreateRenderGraphTexture(renderGraph, aoDesc, "LNSurface_AO_Raw", false);
+            TextureHandle aoBlurred = UniversalRenderer.CreateRenderGraphTexture(renderGraph, aoDesc, "LNSurface_AO_Blurred", false);
+
             // 2. Front Pass
             RenderGBuffer(renderGraph, frameData, "Front", "LNSurface_Front", frontColor, frontNormal, frontDepth, mask, frontExtra, frontExtra2, true);
 
@@ -162,10 +182,87 @@ public class LNSurfaceFeature : ScriptableRendererFeature
             {
                 RenderGBuffer(renderGraph, frameData, "Back", "LNSurface_Back", backColor, backNormal, backDepth, mask, backExtra, backExtra2, false);
             }
-            else
+
+            // 4. SSAO Calculation Pass
+            if (_settings.enableSSAO)
             {
-               // If disabled, we might want to clear backDepth or just leave it. 
-               // For safety in shader reading, let's clear it if possible, but creating it is enough if we don't read garbage.
+                using (var builder = renderGraph.AddComputePass<ComputePassData>("LNSurface SSAO Pass", out var passData))
+                {
+                    passData.compute = _settings.lightingComputeShader;
+                    passData.kernel = _settings.lightingComputeShader.FindKernel("CS_SSAO");
+                    
+                    passData.frontDepth = frontDepth;
+                    passData.backDepth = backDepth;
+                    passData.frontNormal = frontNormal;
+                    passData.mask = mask; // Assign mask
+                    passData.result = aoRaw;
+
+                    builder.UseTexture(passData.frontDepth);
+                    builder.UseTexture(passData.backDepth);
+                    builder.UseTexture(passData.frontNormal);
+                    builder.UseTexture(passData.mask); // Add UseTexture for mask
+                    builder.UseTexture(passData.result, AccessFlags.Write);
+                    
+                    passData.cameraToWorldMatrix = cameraData.camera.cameraToWorldMatrix;
+                    passData.worldToCameraMatrix = cameraData.camera.worldToCameraMatrix;
+                    passData.projectionMatrix = GL.GetGPUProjectionMatrix(cameraData.camera.projectionMatrix, false);
+                    passData.screenParams = new Vector4(desc.width, desc.height, 1.0f / desc.width, 1.0f / desc.height);
+                    passData.enableSSAO = _settings.enableSSAO ? 1.0f : 0.0f;
+                    passData.ssaoRadius = _settings.ssaoRadius;
+                    passData.ssaoIntensity = _settings.ssaoIntensity;
+                    passData.ssaoSampleCount = _settings.ssaoSampleCount;
+
+                    builder.SetRenderFunc((ComputePassData data, ComputeGraphContext context) =>
+                    {
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Front_Depth", data.frontDepth);
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Back_Depth", data.backDepth);
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Front_Normal", data.frontNormal);
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Mask", data.mask); // Bind Mask
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_Result_AO", data.result);
+                        
+                        context.cmd.SetComputeVectorParam(data.compute, "_ScreenParams", data.screenParams);
+                        context.cmd.SetComputeMatrixParam(data.compute, "_CameraToWorldMatrix", data.cameraToWorldMatrix);
+                        context.cmd.SetComputeMatrixParam(data.compute, "_WorldToCameraMatrix", data.worldToCameraMatrix);
+                        context.cmd.SetComputeMatrixParam(data.compute, "_ProjectionMatrix", data.projectionMatrix);
+                        context.cmd.SetComputeFloatParam(data.compute, "_EnableSSAO", data.enableSSAO);
+                        context.cmd.SetComputeFloatParam(data.compute, "_SSAO_Radius", data.ssaoRadius);
+                        context.cmd.SetComputeFloatParam(data.compute, "_SSAO_Intensity", data.ssaoIntensity);
+                        context.cmd.SetComputeIntParam(data.compute, "_SSAO_SampleCount", data.ssaoSampleCount);
+                        
+                        int gx = Mathf.CeilToInt(data.screenParams.x / 8.0f);
+                        int gy = Mathf.CeilToInt(data.screenParams.y / 8.0f);
+                        context.cmd.DispatchCompute(data.compute, data.kernel, gx, gy, 1);
+                    });
+                }
+
+                // 5. SSAO Bilateral Blur Pass
+                using (var builder = renderGraph.AddComputePass<ComputePassData>("LNSurface SSAO Blur Pass", out var passData))
+                {
+                    passData.compute = _settings.lightingComputeShader;
+                    passData.kernel = _settings.lightingComputeShader.FindKernel("CS_SSAO_Blur");
+                    
+                    passData.frontDepth = frontDepth;
+                    passData.extra = aoRaw; // Use extra for RAW AO
+                    passData.result = aoBlurred;
+                    
+                    builder.UseTexture(passData.frontDepth);
+                    builder.UseTexture(passData.extra);
+                    builder.UseTexture(passData.result, AccessFlags.Write);
+                    
+                    passData.screenParams = new Vector4(desc.width, desc.height, 1.0f / desc.width, 1.0f / desc.height);
+
+                    builder.SetRenderFunc((ComputePassData data, ComputeGraphContext context) =>
+                    {
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Front_Depth", data.frontDepth);
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_AO_Raw", data.extra);
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_Result_AO", data.result);
+                        context.cmd.SetComputeVectorParam(data.compute, "_ScreenParams", data.screenParams);
+                        
+                        int gx = Mathf.CeilToInt(data.screenParams.x / 8.0f);
+                        int gy = Mathf.CeilToInt(data.screenParams.y / 8.0f);
+                        context.cmd.DispatchCompute(data.compute, data.kernel, gx, gy, 1);
+                    });
+                }
             }
 
             // 4. Lighting Pass (Disney BRDF)
@@ -186,8 +283,8 @@ public class LNSurfaceFeature : ScriptableRendererFeature
 
                     passData.cameraToWorldMatrix = cameraData.camera.cameraToWorldMatrix;
                     passData.worldToCameraMatrix = cameraData.camera.worldToCameraMatrix;
-                    passData.projectionMatrix = cameraData.camera.projectionMatrix;
-                    passData.inverseProjectionMatrix = Matrix4x4.Inverse(cameraData.camera.projectionMatrix);
+                    passData.projectionMatrix = GL.GetGPUProjectionMatrix(cameraData.camera.projectionMatrix, false);
+                    passData.inverseProjectionMatrix = passData.projectionMatrix.inverse;
                     passData.screenParams = new Vector4(resultDesc.width, resultDesc.height, 1.0f / resultDesc.width, 1.0f / resultDesc.height);
 
                     // SSR Params
@@ -209,6 +306,13 @@ public class LNSurfaceFeature : ScriptableRendererFeature
 
                     passData.mainLightDirection = mainLightDir;
                     passData.mainLightColor = mainLightCol;
+                    
+                    // Bind SSAO Blurred Texture if enabled
+                    if (_settings.enableSSAO)
+                    {
+                        passData.ssaoTexture = aoBlurred; // Use dedicated field for Blurred AO
+                    }
+                    passData.enableSSAO = _settings.enableSSAO ? 1.0f : 0.0f;
 
                     // Additional Lights
                     passData.additionalLightPositions = new Vector4[16];
@@ -235,6 +339,12 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                     passData.thicknessScale = _settings.thicknessScale;
                     passData.enableSSS = _settings.enableSSS ? 1.0f : 0.0f; 
                     passData.lightingModel = (int)_settings.lightingModel;
+
+                    // SSAO Init
+                    passData.enableSSAO = _settings.enableSSAO ? 1.0f : 0.0f;
+                    passData.ssaoRadius = _settings.ssaoRadius;
+                    passData.ssaoIntensity = _settings.ssaoIntensity;
+                    passData.ssaoSampleCount = _settings.ssaoSampleCount;
 
                     passData.frontColor = frontColor;
                     passData.frontNormal = frontNormal; 
@@ -276,6 +386,10 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                     builder.UseTexture(passData.extra);
                     builder.UseTexture(passData.extra2);
                     builder.UseTexture(passData.sceneColor); // Use Scene Color
+                    if (_settings.enableSSAO)
+                    {
+                        builder.UseTexture(passData.ssaoTexture);
+                    }
                     builder.UseTexture(passData.result, AccessFlags.Write);
 
                     builder.SetRenderFunc((ComputePassData data, ComputeGraphContext context) =>
@@ -327,6 +441,14 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                         context.cmd.SetComputeIntParam(data.compute, "_SSR_MaxSteps", data.ssrMaxSteps);
                         context.cmd.SetComputeFloatParam(data.compute, "_SSR_StepSize", data.ssrStepSize);
                         context.cmd.SetComputeFloatParam(data.compute, "_SSR_Thickness", data.ssrThickness);
+                        context.cmd.SetComputeFloatParam(data.compute, "_EnableSSAO", data.enableSSAO);
+                        context.cmd.SetComputeFloatParam(data.compute, "_SSAO_Intensity", data.ssaoIntensity);
+                        context.cmd.SetComputeIntParam(data.compute, "_SSAO_SampleCount", data.ssaoSampleCount);
+                        
+                        if (data.enableSSAO > 0.5f)
+                        {
+                            context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_AO_Blurred", data.ssaoTexture);
+                        }
 
                         int groupsX = Mathf.CeilToInt(data.screenParams.x / 8.0f);
                         int groupsY = Mathf.CeilToInt(data.screenParams.y / 8.0f);

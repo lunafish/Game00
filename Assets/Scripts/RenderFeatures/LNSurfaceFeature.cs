@@ -182,11 +182,6 @@ public class LNSurfaceFeature : ScriptableRendererFeature
             TextureHandle ssrRaw = UniversalRenderer.CreateRenderGraphTexture(renderGraph, ssrDesc, "LNSurface_SSR_Raw", false);
             TextureHandle ssrBlurred = UniversalRenderer.CreateRenderGraphTexture(renderGraph, ssrDesc, "LNSurface_SSR_Blurred", false);
 
-            var sceneDesc = desc;
-            sceneDesc.useMipMap = true;
-            sceneDesc.autoGenerateMips = true;
-            TextureHandle sceneColorWithMips = UniversalRenderer.CreateRenderGraphTexture(renderGraph, sceneDesc, "LNSurface_SceneColor_Mips", false);
-
             // 2. Front Pass
             RenderGBuffer(renderGraph, frameData, "Front", "LNSurface_Front", frontColor, frontNormal, frontDepth, mask, frontExtra, frontExtra2, true);
 
@@ -278,14 +273,6 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                 }
             }
 
-            // 5.5 Prepare Scene Color with Mips for SSR
-            if (_settings.enableSSR)
-            {
-                RenderGraphUtils.BlitMaterialParameters mipBlitParams = new(resourceData.activeColorTexture, sceneColorWithMips, 
-                    Blitter.GetBlitMaterial(TextureDimension.Tex2D), 0);
-                renderGraph.AddBlitPass(mipBlitParams, "LNSurface Prepare Mipmaps");
-            }
-
             // 6. SSR Calculation Pass
             if (_settings.enableSSR && _settings.lightingComputeShader != null)
             {
@@ -298,7 +285,7 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                     passData.frontDepth = frontDepth;
                     passData.backDepth = backDepth;
                     passData.backColor = backColor;
-                    passData.sceneColor = sceneColorWithMips; // Use Mipmapped Texture
+                    passData.sceneColor = resourceData.activeColorTexture; // Use Active Color Texture directly
                     passData.mask = mask;
                     passData.extra2 = frontExtra2; // Smoothness
                     passData.result = ssrRaw;
@@ -472,7 +459,7 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                     passData.frontDepth = frontDepth;
                     passData.backDepth = backDepth; 
                     passData.backColor = backColor;
-                    passData.sceneColor = sceneColorWithMips; // Use Mipmapped Texture
+                    passData.sceneColor = resourceData.activeColorTexture; // Use Active Color Texture
                     passData.mask = mask;
                     passData.extra = frontExtra;
                     passData.extra2 = frontExtra2;

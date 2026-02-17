@@ -1,52 +1,60 @@
 #pragma kernel CSMain
 
+// 최종 결과를 저장할 렌더 타겟
 RWTexture2D<float4> _Result;
 
-// Textures
-Texture2D<float4> _LNSurface_Front_Color;  // RGB: Albedo, A: Unused
-Texture2D<float4> _LNSurface_Front_Normal; // RGB: Normal, A: Unused
-Texture2D<float4> _LNSurface_Mask;         // R: Mask
-Texture2D<float4> _LNSurface_Front_Depth; // R: Linear Depth
-Texture2D<float4> _LNSurface_Back_Depth;  // R: Linear Depth (Back face)
-Texture2D<float4> _LNSurface_Front_Extra; // R: Metallic, G: SpecularStrength, B: Packed(Subsurface, Anisotropic), A: Unused
-Texture2D<float4> _LNSurface_Front_Extra2; // R: Smoothness, G: Shadow, B: DiffuseWrap, A: Unused
-Texture2D<float4> _SceneColor;             // Scene Color (Background)
+// --- 입력 텍스처 (GBuffer 자료형) ---
+Texture2D<float4> _LNSurface_Front_Color;  // RGB: 알베도(Albedo), A: 미사용
+Texture2D<float4> _LNSurface_Front_Normal; // RGB: 월드 공간 노멀, A: 미사용
+Texture2D<float4> _LNSurface_Mask;         // R: 렌더링 대상 마스크 (0~1)
+Texture2D<float4> _LNSurface_Front_Depth; // R: 선형 깊이 (앞면)
+Texture2D<float4> _LNSurface_Back_Depth;  // R: 선형 깊이 (뒷면 - SSS 및 SSR 두께 판정용)
+Texture2D<float4> _LNSurface_Back_Color;  // RGB: 뒷면 컬러 (SSR 반사 시 가려진 뒷면 샘플링용)
+Texture2D<float4> _LNSurface_Front_Extra; // R: 금속성(Metallic), G: 스펙큘러 강도, B: SSS/Aniso 패킹 데이터
+Texture2D<float4> _LNSurface_Front_Extra2; // R: 매끄러움(Smoothness), G: 그림자(Shadow), B: 확산광 감싸기(DiffuseWrap)
+Texture2D<float4> _SceneColor;             // 배경 씬 컬러 (SSR 반사 소스)
+SamplerState painter_linear_clamp_sampler;
 
-// Params
-float2 _ScreenParams;
-float4 _MainLightDirection;
-float4 _MainLightColor;
-int _AdditionalLightCount;
+// --- 전역 파라미터 ---
+float2 _ScreenParams;     // 화면 해상도
+float4 _MainLightDirection; // 메인 라이트 방향
+float4 _MainLightColor;     // 메인 라이트 색상 및 강도
+int _AdditionalLightCount;  // 추가 라이트 개수 (최대 16)
 float4 _AdditionalLightPositions[16];
 float4 _AdditionalLightColors[16];
-float4 _AdditionalLightAttenuations[16]; // x: 1/range^2, y: 1
+float4 _AdditionalLightAttenuations[16]; // x: 거리 감쇠 역제곱, y: 미사용
 
-float _SSS_Intensity;    // SSS Intensity
-float _SSS_ThicknessScale; // SSS Thickness Scale
-float _EnableSSS;          // Toggle SSS
+// 하부표면 산란(SSS) 설정
+float _SSS_Intensity;     // SSS 강도
+float _SSS_ThicknessScale; // 두께 계수
+float _EnableSSS;          // SSS 활성화 여부
 
-// SH Params
-float4 unity_SHAr;
-float4 unity_SHAg;
-float4 unity_SHAb;
-float4 unity_SHBr;
-float4 unity_SHBg;
-float4 unity_SHBb;
+// 구면 조화 함수(SH) - Ambient Light 연산용
+float4 unity_SHAr, unity_SHAg, unity_SHAb;
+float4 unity_SHBr, unity_SHBg, unity_SHBb;
 float4 unity_SHC;
 
-// Matrix Params
-float4x4 _InverseViewProjectionMatrix; 
-float4x4 _InverseProjectionMatrix;
-float4x4 _CameraToWorldMatrix;
-int _LightingModel; // 0: HalfLambert, 1: DisneyBRDF
+// 행렬 데이터
+float4x4 _InverseProjectionMatrix; // 뷰 공간 재구성을 위한 투영 역행렬
+float4x4 _CameraToWorldMatrix;      // 뷰 -> 월드 변환
+float4x4 _WorldToCameraMatrix;      // 월드 -> 뷰 변환
+float4x4 _ProjectionMatrix;         // 월드 -> 클립 변환
+int _LightingModel; // 조명 모델 선택 (0: HalfLambert, 1: DisneyBRDF)
+
+// 화면 공간 반사(SSR) 설정
+float _EnableSSR;      // SSR 활성화 여부
+int _SSR_MaxSteps;     // 최대 레이마칭 단계
+float _SSR_StepSize;    // 레이 전진 보폭
+float _SSR_Thickness;   // 충돌 판정 두께 임계값
 
 #ifndef PI
 #define PI 3.14159265359f
 #endif
 
-// --- Local Disney BRDF Functions (Safe Naming) ---
+// --- Disney BRDF 유틸리티 함수 ---
 float Local_Sqr(float x) { return x * x; }
 
+// Schlick Fresnel 근사식
 float Local_SchlickFresnel(float u)
 {
     float m = clamp(1.0 - u, 0.0, 1.0);
@@ -54,6 +62,7 @@ float Local_SchlickFresnel(float u)
     return m2 * m2 * m; // pow(m, 5)
 }
 
+// GTR2 분포 함수 (GGX 코어)
 float Local_GTR2(float NdotH, float a)
 {
     float a2 = a * a;
@@ -61,16 +70,17 @@ float Local_GTR2(float NdotH, float a)
     return a2 / (PI * t * t);
 }
 
+// Smith 기하 차폐 함수 (Smith Geometric Shadowing)
 float Local_G_Smith(float NdotV, float NdotL, float alpha)
 {
     float a = Local_Sqr(alpha);
-    float k = Local_Sqr(alpha + 1.0) * 0.125; // Direct Light
+    float k = Local_Sqr(alpha + 1.0) * 0.125; // 직접 조명 모드
     float g1 = NdotV / (NdotV * (1.0 - k) + k);
     float g2 = NdotL / (NdotL * (1.0 - k) + k);
     return g1 * g2;
 }
 
-// Distance Attenuation
+// 점광원 거리 감쇠 계산
 float GetDistanceAttenuation(float3 lightDir, float4 attenuation)
 {
     float d2 = dot(lightDir, lightDir);
@@ -78,72 +88,32 @@ float GetDistanceAttenuation(float3 lightDir, float4 attenuation)
     return rangeCheck * rangeCheck / (d2 + 0.01);
 }
 
-// SH Evaluation Function (Matches Unity's ShadeSH9)
+// Unity의 ShadeSH9과 동일한 방식으로 Ambient(주변광) 계산
 float3 SampleSH(float3 normal)
 {
     float4 n = float4(normal, 1.0);
     float3 x1, x2, x3;
     
-    // Linear + Constant
     x1.r = dot(unity_SHAr, n);
     x1.g = dot(unity_SHAg, n);
     x1.b = dot(unity_SHAb, n);
     
-    // Quadratic polynomials
     float4 vB = n.xyzz * n.yzzx;
     x2.r = dot(unity_SHBr, vB);
     x2.g = dot(unity_SHBg, vB);
     x2.b = dot(unity_SHBb, vB);
     
-    // Final Quadratic term
     float vC = n.x * n.x - n.y * n.y;
     x3 = unity_SHC.rgb * vC;
     
     return max(0, x1 + x2 + x3);
 }
-// ------------------------------------------------
 
-[numthreads(8, 8, 1)]
-void CSMain (uint3 id : SV_DispatchThreadID)
+// --- SSR 헬퍼 함수 ---
+
+// 선형 깊이와 UV를 사용하여 뷰 공간(View Space) 좌표 복구
+float3 GetViewSpacePos(float2 uv, float linearDepth)
 {
-    if (id.x >= _ScreenParams.x || id.y >= _ScreenParams.y)
-        return;
-
-    // Mask Check
-    float mask = _LNSurface_Mask[id.xy].r;
-    if (mask <= 0.001)
-    {
-        // Output Scene Color (Background)
-        _Result[id.xy] = _SceneColor[id.xy]; 
-        return;
-    }
-
-    // 1. Read Data
-    float4 gbuffer0 = _LNSurface_Front_Color[id.xy];
-    float4 gbuffer1 = _LNSurface_Front_Normal[id.xy];
-    float4 gbufferExtra = _LNSurface_Front_Extra[id.xy];
-    float4 gbufferExtra2 = _LNSurface_Front_Extra2[id.xy];
-    
-    // Unpack Data
-    float3 albedo = gbuffer0.rgb;
-    float metallic = gbufferExtra.r;
-    float specularStrength = gbufferExtra.g;
-    float smoothness = gbufferExtra2.r;
-    float shadow = gbufferExtra2.g; 
-    float diffuseWrap = gbufferExtra2.b;
-    
-    // Unpack B Channel (Subsurface 4bit + Anisotropic 4bit)
-    float packedB = gbufferExtra.b * 255.0;
-    float subsurface = floor(packedB / 16.0) / 15.0;
-    float anisotropic = (packedB - floor(packedB / 16.0) * 16.0) / 15.0;
-    
-    // Normal Unpack
-    float3 normalWS = normalize(gbuffer1.rgb * 2.0 - 1.0);
-    
-    // 2. Reconstruct World Position
-    float2 uv = (float2(id.xy) + 0.5) / _ScreenParams;
-    float linearDepth = _LNSurface_Front_Depth[id.xy].r;
-    
     float fovScaleX = _InverseProjectionMatrix._m00;
     float fovScaleY = _InverseProjectionMatrix._m11;
     
@@ -156,16 +126,133 @@ void CSMain (uint3 id : SV_DispatchThreadID)
     viewPos.z = -linearDepth; 
     viewPos.x = clipPos.x * fovScaleX * -viewPos.z; 
     viewPos.y = clipPos.y * fovScaleY * -viewPos.z;
+    return viewPos;
+}
+
+// 뷰 공간 좌표를 다시 화면 UV 좌표로 투영
+float3 ProjectViewPos(float3 viewPos)
+{
+    float4 clipPos = mul(_ProjectionMatrix, float4(viewPos, 1.0));
+    float3 ndcPos = clipPos.xyz / clipPos.w;
+    return float3(ndcPos.xy * 0.5 + 0.5, ndcPos.z);
+}
+
+/**
+ * 정밀 SSR 레이마칭 엔진
+ * @param startPosVS: 시작 위치 (뷰 공간)
+ * @param rayDirVS: 반사 레이 방향 (뷰 공간)
+ * @param hitUV: 충돌 시 화면 UV 결과값
+ * @param hitBack: 뒷면(Back face) 충돌 여부
+ */
+bool Raymarch(float3 startPosVS, float3 rayDirVS, out float2 hitUV, out bool hitBack)
+{
+    float3 currentPosVS = startPosVS;
+    float stepSize = _SSR_StepSize;
+    hitBack = false;
     
+    for (int i = 0; i < _SSR_MaxSteps; i++)
+    {
+        currentPosVS += rayDirVS * stepSize;
+        
+        float3 screenPos = ProjectViewPos(currentPosVS);
+        if (screenPos.x < 0 || screenPos.x > 1 || screenPos.y < 0 || screenPos.y > 1)
+            return false;
+            
+        uint2 id = uint2(screenPos.xy * _ScreenParams);
+        float frontDepth = _LNSurface_Front_Depth[id].r;
+        float backDepth = _LNSurface_Back_Depth[id].r;
+        
+        float currentDepth = -currentPosVS.z;
+        
+        // 레이가 물체의 두께(앞면과 뒷면 사이 볼륨) 안에 진입했는지 확인
+        if (currentDepth >= frontDepth && currentDepth <= backDepth + _SSR_Thickness)
+        {
+            // 교점 정밀화를 위한 이진 탐색 (Binary Search Refinement)
+            float3 prevPosVS = currentPosVS - rayDirVS * stepSize;
+            for (int j = 0; j < 4; j++)
+            {
+                float3 midPosVS = (prevPosVS + currentPosVS) * 0.5;
+                float3 midScreenPos = ProjectViewPos(midPosVS);
+                uint2 midId = uint2(midScreenPos.xy * _ScreenParams);
+                float midFront = _LNSurface_Front_Depth[midId].r;
+                float midBack = _LNSurface_Back_Depth[midId].r;
+                float midDepth = -midPosVS.z;
+                
+                if (midDepth >= midFront && midDepth <= midBack + _SSR_Thickness)
+                    currentPosVS = midPosVS;
+                else
+                    prevPosVS = midPosVS;
+            }
+            
+            float3 finalScreenPos = ProjectViewPos(currentPosVS);
+            uint2 finalId = uint2(finalScreenPos.xy * _ScreenParams);
+            float fDepth = _LNSurface_Front_Depth[finalId].r;
+            float bDepth = _LNSurface_Back_Depth[finalId].r;
+            float cDepth = -currentPosVS.z;
+
+            hitUV = finalScreenPos.xy;
+            // 앞면 보다는 뒷면에 더 가까운지, 그리고 실제 뒷면 깊이 데이터가 유효한지 판단
+            hitBack = (abs(cDepth - bDepth) < abs(cDepth - fDepth)) && (bDepth > fDepth);
+            return true;
+        }
+    }
+    return false;
+}
+
+// ------------------------------------------------
+
+[numthreads(8, 8, 1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    // 화면 범위를 벗어나는 스레드 제외
+    if (id.x >= _ScreenParams.x || id.y >= _ScreenParams.y)
+        return;
+
+    // 마스크 체크 (렌더링 대상이 아닌 배경 처리)
+    float mask = _LNSurface_Mask[id.xy].r;
+    if (mask <= 0.001)
+    {
+        _Result[id.xy] = _SceneColor[id.xy]; 
+        return;
+    }
+
+    // 1. GBuffer 데이터 읽기 및 압축 해제
+    float4 gbuffer0 = _LNSurface_Front_Color[id.xy];
+    float4 gbuffer1 = _LNSurface_Front_Normal[id.xy];
+    float4 gbufferExtra = _LNSurface_Front_Extra[id.xy];
+    float4 gbufferExtra2 = _LNSurface_Front_Extra2[id.xy];
+    
+    float3 albedo = gbuffer0.rgb;
+    float metallic = gbufferExtra.r;
+    float specularStrength = gbufferExtra.g;
+    float smoothness = gbufferExtra2.r;
+    float shadow = gbufferExtra2.g; 
+    float diffuseWrap = gbufferExtra2.b;
+    
+    // Extra B 채널의 패킹 데이터 해제 (Subsurface 4bit + Anisotropic 4bit)
+    float packedB = gbufferExtra.b * 255.0;
+    float subsurface = floor(packedB / 16.0) / 15.0;
+    float anisotropic = (packedB - floor(packedB / 16.0) * 16.0) / 15.0;
+    
+    // 0~1 범위의 노멀을 -1~1 범위로 변환
+    float3 normalWS = normalize(gbuffer1.rgb * 2.0 - 1.0);
+    
+    // 2. 월드 공간 좌표 재구성
+    float2 uv = (float2(id.xy) + 0.5) / _ScreenParams;
+    float linearDepth = _LNSurface_Front_Depth[id.xy].r;
+    
+    float3 viewPos = GetViewSpacePos(uv, linearDepth);
     float3 worldPos = mul(_CameraToWorldMatrix, float4(viewPos, 1.0)).xyz;
+    
+    // 카메라 위치 추출 및 시선 방향 계산
     float3 cameraPosWS = float3(_CameraToWorldMatrix._m03, _CameraToWorldMatrix._m13, _CameraToWorldMatrix._m23);
     float3 viewDir = normalize(cameraPosWS - worldPos);
 
-    float3 totalDiffuse = float3(0, 0, 0);
-    float3 totalSpecular = float3(0, 0, 0);
-    float3 totalSSS = float3(0, 0, 0);
+    float3 totalDiffuse = 0;
+    float3 totalSpecular = 0;
+    float3 totalSSS = 0;
 
-    // 3. Lighting Loop (Main Light + Additional Lights)
+    // 3. 조명 루프 (메인 라이트 + 추가 라이트)
     uint lightLoopCount = (uint)(_AdditionalLightCount + 1);
     for (uint i = 0; i < lightLoopCount; ++i)
     {
@@ -173,34 +260,32 @@ void CSMain (uint3 id : SV_DispatchThreadID)
         float3 lightDir;
         float atten = 1.0;
 
-        if (i == 0) // Main Light
+        if (i == 0) // 메인 라이트 처리
         {
             lightDir = normalize(_MainLightDirection.xyz);
             lightColor = _MainLightColor.rgb;
-            atten = shadow;
+            atten = shadow; // 그림자 데이터 적용
         }
-        else // Additional Light
+        else // 추가 점광원/스포트 라이트 처리
         {
             uint lightIdx = i - 1;
             float3 lightPos = _AdditionalLightPositions[lightIdx].xyz;
             float3 lightToPos = lightPos - worldPos;
-            float distSq = dot(lightToPos, lightToPos);
             lightDir = normalize(lightToPos);
-            
             atten = GetDistanceAttenuation(lightToPos, _AdditionalLightAttenuations[lightIdx]);
             lightColor = _AdditionalLightColors[lightIdx].rgb;
         }
 
-        // Apply Diffuse Wrap
+        // Diffuse Wrap (확산광이 반대편까지 부드럽게 감싸는 효과)
         float rawNdotL = dot(normalWS, lightDir);
         float NdotL = saturate((rawNdotL + diffuseWrap) / (1.0 + diffuseWrap));
 
-        if (_LightingModel == 0) // Half Lambert
+        if (_LightingModel == 0) // Half Lambert (카툰/회화적 연출)
         {
             float halfLambert = rawNdotL * (1.0 - diffuseWrap) + diffuseWrap;
             totalDiffuse += albedo * halfLambert * lightColor * atten;
         }
-        else // Disney BRDF
+        else // Disney BRDF (물리 기반 셰이딩)
         {
             float roughness = 1.0 - smoothness;
             roughness = max(roughness * roughness, 0.001);
@@ -211,13 +296,12 @@ void CSMain (uint3 id : SV_DispatchThreadID)
             float NdotH = saturate(dot(normalWS, halfDir));
             float LdotH = saturate(dot(lightDir, halfDir));
             
-            // Diffuse (Disney)
+            // Disney Diffuse & Subsurface Diffuse (모델 내 근사)
             float FD90 = 0.5 + 2.0 * smoothness * LdotH * LdotH;
             float lightScatter = 1.0 + (FD90 - 1.0) * Local_SchlickFresnel(NdotL);
             float viewScatter = 1.0 + (FD90 - 1.0) * Local_SchlickFresnel(NdotV);
             float baseDiffuse = lightScatter * viewScatter;
 
-            // Subsurface Diffuse
             float FSS90 = LdotH * LdotH * smoothness;
             float FSS = (1.0 + (FSS90 - 1.0) * Local_SchlickFresnel(NdotL)) * 
                         (1.0 + (FSS90 - 1.0) * Local_SchlickFresnel(NdotV));
@@ -227,7 +311,7 @@ void CSMain (uint3 id : SV_DispatchThreadID)
             float3 diffuseTerm = albedo * finalDiffuseFactor * NdotL * lightColor * atten;
             totalDiffuse += diffuseTerm * (1.0 - metallic);
             
-            // Specular
+            // Specular (GTR2/GGX 기반)
             float D = Local_GTR2(NdotH, alpha);
             float3 F0 = lerp(0.08 * specularStrength * float3(1,1,1), albedo, metallic);
             float FH = Local_SchlickFresnel(LdotH);
@@ -238,22 +322,58 @@ void CSMain (uint3 id : SV_DispatchThreadID)
             totalSpecular += max(0, specTerm) * lightColor * NdotL * PI * atten;
         }
 
-        // 4. SSS
+        // 4. 투과형 하부표면 산란 (Translucency SSS)
         if (_EnableSSS > 0.5)
         {
             float frontDepth = _LNSurface_Front_Depth[id.xy].r;
             float backDepth = _LNSurface_Back_Depth[id.xy].r;
             float thickness = max(0, backDepth - frontDepth) * _SSS_ThicknessScale;
             
+            // 라이트가 뒤에서 비칠 때의 산란 강도 계산
             float backLightFactor = saturate((-rawNdotL + 0.2) * 2.0); 
             float sssIntensity = _SSS_Intensity * (1.0 + backLightFactor);
             totalSSS += exp(-thickness * sssIntensity) * albedo.rgb * lightColor * backLightFactor * atten;
         }
     }
 
-    // Ambient (SH) - Calculated once
+    // 주변광 (Ambient / SH) 계산
     float3 ambientColor = SampleSH(normalWS) * albedo * (1.0 - metallic);
 
-    // Final Output
+    // --- 화면 공간 반사 (SSR) 연산 ---
+    float3 reflectionColor = 0;
+    if (_EnableSSR > 0.5 && smoothness > 0.01)
+    {
+        // 뷰 공간 데이터를 사용한 반사 벡터 계산
+        float3 viewNormal = mul((float3x3)_WorldToCameraMatrix, normalWS);
+        float3 viewPosVS = mul(_WorldToCameraMatrix, float4(worldPos, 1.0)).xyz;
+        float3 reflectDirVS = reflect(normalize(viewPosVS), viewNormal);
+        
+        float2 hitUV;
+        bool hitBack;
+        // 레이마칭을 통해 화면 내 충돌 지점 탐색
+        if (Raymarch(viewPosVS, reflectDirVS, hitUV, hitBack))
+        {
+            float hitMask = _LNSurface_Mask[uint2(hitUV * _ScreenParams)].r;
+            // 앞면 마스크가 있거나, 뒷면 충돌이 확실한 경우 반사 컬러 채택
+            if (hitMask > 0.1 || hitBack) 
+            {
+                if (hitBack) // 가려진 뒷면 컬러 샘플링 (고급 기능)
+                    reflectionColor = _LNSurface_Back_Color.SampleLevel(painter_linear_clamp_sampler, hitUV, 0).rgb;
+                else // 일반 배경 씬 컬러 샘플링
+                    reflectionColor = _SceneColor.SampleLevel(painter_linear_clamp_sampler, hitUV, 0).rgb;
+                
+                // 화면 가장자리 페이드 아웃 처리
+                float2 edge = smoothstep(0, 0.1, hitUV) * smoothstep(1, 0.9, hitUV);
+                reflectionColor *= edge.x * edge.y;
+            }
+        }
+    }
+    
+    // 프레넬 법칙에 따른 환경광 및 반사광 합성
+    float3 specColor = lerp(float3(0.04, 0.04, 0.04), albedo.rgb, metallic);
+    float3 F = specColor + (1.0 - specColor) * Local_SchlickFresnel(max(dot(normalWS, viewDir), 0.0));
+    ambientColor += reflectionColor * F;
+
+    // 최종 픽셀 컬러 출력 (확산광 + 주변광/반사광 + 스펙큘러 + SSS)
     _Result[id.xy] = float4(totalDiffuse + ambientColor + totalSpecular + totalSSS, 1.0);
 }

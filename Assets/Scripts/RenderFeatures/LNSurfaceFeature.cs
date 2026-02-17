@@ -21,6 +21,13 @@ public class LNSurfaceFeature : ScriptableRendererFeature
         public bool enableSSS = true; 
         [Range(0f, 10f)] public float intensity = 1.0f;
         [Range(0f, 100f)] public float thicknessScale = 10.0f;
+
+        [Header("Screen Space Reflections")]
+        public bool enableSSR = true;
+        [Range(8, 128)] public int ssrMaxSteps = 64;
+        [Range(0.01f, 1.0f)] public float ssrStepSize = 0.1f;
+        [Range(0.01f, 1.0f)] public float ssrThickness = 0.1f;
+
         public RenderPassEvent renderPassEvent = RenderPassEvent.AfterRenderingTransparents;
     }
 
@@ -78,6 +85,7 @@ public class LNSurfaceFeature : ScriptableRendererFeature
             internal TextureHandle frontNormal; 
             internal TextureHandle frontDepth;
             internal TextureHandle backDepth;
+            internal TextureHandle backColor;
             internal TextureHandle sceneColor; 
             internal TextureHandle mask; 
             internal TextureHandle extra; // GBuffer4: Metallic, SpecularStrength, Packed(Subsurface, Anisotropic)
@@ -89,6 +97,12 @@ public class LNSurfaceFeature : ScriptableRendererFeature
             internal float enableSSS; 
             internal int lightingModel; // 0: HalfLambert, 1: DisneyBRDF
             internal Vector2 screenParams;
+
+            // SSR Params
+            internal float enableSSR;
+            internal int ssrMaxSteps;
+            internal float ssrStepSize;
+            internal float ssrThickness;
             // Light Data
             internal Vector4 mainLightDirection;  
             internal Vector4 mainLightColor;
@@ -98,6 +112,8 @@ public class LNSurfaceFeature : ScriptableRendererFeature
             internal Vector4[] additionalLightAttenuations;
 
             internal Matrix4x4 cameraToWorldMatrix;
+            internal Matrix4x4 worldToCameraMatrix;
+            internal Matrix4x4 projectionMatrix;
             internal Matrix4x4 inverseProjectionMatrix;
             
             // Ambient SH
@@ -169,8 +185,16 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                     RenderingUtils.ReAllocateHandleIfNeeded(ref _resultHandle, resultDesc, name: "_LNSurface_LightingResult");
 
                     passData.cameraToWorldMatrix = cameraData.camera.cameraToWorldMatrix;
+                    passData.worldToCameraMatrix = cameraData.camera.worldToCameraMatrix;
+                    passData.projectionMatrix = cameraData.camera.projectionMatrix;
                     passData.inverseProjectionMatrix = Matrix4x4.Inverse(cameraData.camera.projectionMatrix);
                     passData.screenParams = new Vector4(resultDesc.width, resultDesc.height, 1.0f / resultDesc.width, 1.0f / resultDesc.height);
+
+                    // SSR Params
+                    passData.enableSSR = _settings.enableSSR ? 1.0f : 0.0f;
+                    passData.ssrMaxSteps = _settings.ssrMaxSteps;
+                    passData.ssrStepSize = _settings.ssrStepSize;
+                    passData.ssrThickness = _settings.ssrThickness;
 
                     // Main Light
                     Vector4 mainLightDir = new Vector4(0, 1, 0, 0);
@@ -215,7 +239,8 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                     passData.frontColor = frontColor;
                     passData.frontNormal = frontNormal; 
                     passData.frontDepth = frontDepth;
-                    passData.backDepth = backDepth; // Bind BackDepth
+                    passData.backDepth = backDepth; 
+                    passData.backColor = backColor;
                     passData.mask = mask;
                     passData.extra = frontExtra;
                     passData.extra2 = frontExtra2;
@@ -245,7 +270,8 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                     builder.UseTexture(passData.frontColor);
                     builder.UseTexture(passData.frontNormal); 
                     builder.UseTexture(passData.frontDepth);
-                    builder.UseTexture(passData.backDepth); // Use BackDepth
+                    builder.UseTexture(passData.backDepth); 
+                    builder.UseTexture(passData.backColor);
                     builder.UseTexture(passData.mask);
                     builder.UseTexture(passData.extra);
                     builder.UseTexture(passData.extra2);
@@ -257,7 +283,8 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Front_Color", data.frontColor);
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Front_Normal", data.frontNormal); 
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Front_Depth", data.frontDepth);
-                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Back_Depth", data.backDepth); // Set BackDepth
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Back_Depth", data.backDepth); 
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Back_Color", data.backColor);
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Mask", data.mask);
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Front_Extra", data.extra);
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Front_Extra2", data.extra2);
@@ -289,9 +316,17 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                         context.cmd.SetComputeVectorParam(data.compute, "unity_SHBb", data.shBb[0]);
                         context.cmd.SetComputeVectorParam(data.compute, "unity_SHC", data.shC[0]);
                         
-                        // Matrix params (Unused in shader currently but kept for safety/future)
+                        // Matrix params
                         context.cmd.SetComputeMatrixParam(data.compute, "_CameraToWorldMatrix", data.cameraToWorldMatrix);
+                        context.cmd.SetComputeMatrixParam(data.compute, "_WorldToCameraMatrix", data.worldToCameraMatrix);
+                        context.cmd.SetComputeMatrixParam(data.compute, "_ProjectionMatrix", data.projectionMatrix);
                         context.cmd.SetComputeMatrixParam(data.compute, "_InverseProjectionMatrix", data.inverseProjectionMatrix);
+
+                        // SSR Params
+                        context.cmd.SetComputeFloatParam(data.compute, "_EnableSSR", data.enableSSR);
+                        context.cmd.SetComputeIntParam(data.compute, "_SSR_MaxSteps", data.ssrMaxSteps);
+                        context.cmd.SetComputeFloatParam(data.compute, "_SSR_StepSize", data.ssrStepSize);
+                        context.cmd.SetComputeFloatParam(data.compute, "_SSR_Thickness", data.ssrThickness);
 
                         int groupsX = Mathf.CeilToInt(data.screenParams.x / 8.0f);
                         int groupsY = Mathf.CeilToInt(data.screenParams.y / 8.0f);

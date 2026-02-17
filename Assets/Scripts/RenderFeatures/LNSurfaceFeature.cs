@@ -15,9 +15,20 @@ public class LNSurfaceFeature : ScriptableRendererFeature
             DisneyBRDF
         }
 
+        public enum ResolutionScale
+        {
+            Full = 1,
+            Half = 2,
+            Quarter = 4
+        }
+
         public LayerMask layerMask = -1;
         public ComputeShader lightingComputeShader; // Disney BRDF Lighting
         public LightingModel lightingModel = LightingModel.DisneyBRDF; // Selection
+        
+        [Header("Optimization")]
+        public ResolutionScale resolutionScale = ResolutionScale.Half;
+
         public bool enableSSS = true; 
         [Range(0f, 10f)] public float intensity = 1.0f;
         [Range(0f, 100f)] public float thicknessScale = 10.0f;
@@ -33,6 +44,12 @@ public class LNSurfaceFeature : ScriptableRendererFeature
         [Range(0.01f, 5.0f)] public float ssaoRadius = 0.5f;
         [Range(0f, 10f)] public float ssaoIntensity = 1.0f;
         [Range(4, 32)] public int ssaoSampleCount = 16;
+
+        [Header("Global Illumination")]
+        public bool enableSSGI = true;
+        [Range(0f, 5f)] public float ssgiIntensity = 1.0f;
+        [Range(1, 16)] public int ssgiSampleCount = 4;
+        [Range(0.1f, 2.0f)] public float ssgiRayStepSize = 0.5f;
 
         public RenderPassEvent renderPassEvent = RenderPassEvent.AfterRenderingTransparents;
     }
@@ -100,6 +117,7 @@ public class LNSurfaceFeature : ScriptableRendererFeature
             internal TextureHandle sceneColor; 
             internal TextureHandle ssaoTexture; // SSAO Blurred Result
             internal TextureHandle ssrTexture; // SSR Blurred Result
+            internal TextureHandle ssgiTexture; // SSGI Blurred Result
             internal TextureHandle result; // Input/Output
             
             internal float intensity;
@@ -119,6 +137,13 @@ public class LNSurfaceFeature : ScriptableRendererFeature
             internal float ssaoRadius;
             internal float ssaoIntensity;
             internal int ssaoSampleCount;
+
+            // SSGI Params
+            internal float enableSSGI;
+            internal float ssgiIntensity;
+            internal int ssgiSampleCount;
+            internal float ssgiRayStepSize;
+
             // Light Data
             internal Vector4 mainLightDirection;  
             internal Vector4 mainLightColor;
@@ -153,8 +178,14 @@ public class LNSurfaceFeature : ScriptableRendererFeature
             desc.depthBufferBits = 0; 
             desc.enableRandomWrite = false;
 
+            // Scaled Resolution Descriptor for Optimization
+            int scale = (int)_settings.resolutionScale;
+            var scaledDesc = desc;
+            scaledDesc.width = Mathf.Max(1, desc.width / scale);
+            scaledDesc.height = Mathf.Max(1, desc.height / scale);
+
             // 1. Create Textures
-            // Front Pass Textures
+            // Front Pass Textures (Full Res)
             TextureHandle frontColor = UniversalRenderer.CreateRenderGraphTexture(renderGraph, desc, "LNSurface_Front_Color", false);
             
             var packedDesc = desc;
@@ -165,23 +196,27 @@ public class LNSurfaceFeature : ScriptableRendererFeature
             extraDesc.graphicsFormat = UnityEngine.Experimental.Rendering.GraphicsFormat.R8G8B8A8_UNorm;
             TextureHandle frontExtra = UniversalRenderer.CreateRenderGraphTexture(renderGraph, extraDesc, "LNSurface_Front_Extra", false);
 
-            // Back Pass Textures
+            // Back Pass Textures (Full Res)
             TextureHandle backColor = UniversalRenderer.CreateRenderGraphTexture(renderGraph, desc, "LNSurface_Back_Color", false);
             TextureHandle backPacked = UniversalRenderer.CreateRenderGraphTexture(renderGraph, packedDesc, "LNSurface_Back_Packed", false);
 
-            // SSAO Textures (R8 for performance)
-            var aoDesc = desc;
+            // SSAO Textures (Scaled Res, R8)
+            var aoDesc = scaledDesc;
             aoDesc.graphicsFormat = UnityEngine.Experimental.Rendering.GraphicsFormat.R8_UNorm;
             aoDesc.enableRandomWrite = true;
             TextureHandle aoRaw = UniversalRenderer.CreateRenderGraphTexture(renderGraph, aoDesc, "LNSurface_AO_Raw", false);
             TextureHandle aoBlurred = UniversalRenderer.CreateRenderGraphTexture(renderGraph, aoDesc, "LNSurface_AO_Blurred", false);
 
-            // SSR Textures (B10G11R11_UFloatPack32 for HDR color)
-            var ssrDesc = desc;
+            // SSR Textures (Scaled Res, HDR)
+            var ssrDesc = scaledDesc;
             ssrDesc.graphicsFormat = UnityEngine.Experimental.Rendering.GraphicsFormat.B10G11R11_UFloatPack32;
             ssrDesc.enableRandomWrite = true;
             TextureHandle ssrRaw = UniversalRenderer.CreateRenderGraphTexture(renderGraph, ssrDesc, "LNSurface_SSR_Raw", false);
             TextureHandle ssrBlurred = UniversalRenderer.CreateRenderGraphTexture(renderGraph, ssrDesc, "LNSurface_SSR_Blurred", false);
+
+            // SSGI Textures (Scaled Res, HDR)
+            TextureHandle ssgiRaw = UniversalRenderer.CreateRenderGraphTexture(renderGraph, ssrDesc, "LNSurface_SSGI_Raw", false);
+            TextureHandle ssgiBlurred = UniversalRenderer.CreateRenderGraphTexture(renderGraph, ssrDesc, "LNSurface_SSGI_Blurred", false);
 
             // 2. Front Pass
             RenderGBufferFront(renderGraph, frameData, "Front", "LNSurface_Front", frontColor, frontPacked, frontExtra);
@@ -213,7 +248,8 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                     passData.cameraToWorldMatrix = cameraData.camera.cameraToWorldMatrix;
                     passData.worldToCameraMatrix = cameraData.camera.worldToCameraMatrix;
                     passData.projectionMatrix = GL.GetGPUProjectionMatrix(cameraData.camera.projectionMatrix, false);
-                    passData.screenParams = new Vector4(desc.width, desc.height, 1.0f / desc.width, 1.0f / desc.height);
+                    // Use Scaled Res Params
+                    passData.screenParams = new Vector4(scaledDesc.width, scaledDesc.height, 1.0f / scaledDesc.width, 1.0f / scaledDesc.height);
                     passData.enableSSAO = _settings.enableSSAO ? 1.0f : 0.0f;
                     passData.ssaoRadius = _settings.ssaoRadius;
                     passData.ssaoIntensity = _settings.ssaoIntensity;
@@ -255,7 +291,8 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                     builder.UseTexture(passData.frontExtra);
                     builder.UseTexture(passData.result, AccessFlags.Write);
                     
-                    passData.screenParams = new Vector4(desc.width, desc.height, 1.0f / desc.width, 1.0f / desc.height);
+                    // Use Scaled Res Params
+                    passData.screenParams = new Vector4(scaledDesc.width, scaledDesc.height, 1.0f / scaledDesc.width, 1.0f / scaledDesc.height);
                     passData.ssaoRadius = _settings.ssaoRadius; // For variable radius
 
                     builder.SetRenderFunc((ComputePassData data, ComputeGraphContext context) =>
@@ -295,7 +332,8 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                     builder.UseTexture(passData.frontExtra);
                     builder.UseTexture(passData.result, AccessFlags.Write);
 
-                    passData.screenParams = new Vector4(desc.width, desc.height, 1.0f / desc.width, 1.0f / desc.height);
+                    // Use Scaled Res Params
+                    passData.screenParams = new Vector4(scaledDesc.width, scaledDesc.height, 1.0f / scaledDesc.width, 1.0f / scaledDesc.height);
                     passData.ssrMaxSteps = _settings.ssrMaxSteps;
                     passData.ssrStepSize = _settings.ssrStepSize;
                     passData.ssrThickness = _settings.ssrThickness;
@@ -344,7 +382,8 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                     builder.UseTexture(passData.ssrTexture);
                     builder.UseTexture(passData.result, AccessFlags.Write);
 
-                    passData.screenParams = new Vector4(desc.width, desc.height, 1.0f / desc.width, 1.0f / desc.height);
+                    // Use Scaled Res Params
+                    passData.screenParams = new Vector4(scaledDesc.width, scaledDesc.height, 1.0f / scaledDesc.width, 1.0f / scaledDesc.height);
 
                     builder.SetRenderFunc((ComputePassData data, ComputeGraphContext context) =>
                     {
@@ -352,6 +391,91 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Front_Extra", data.frontExtra);
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_SSR_Raw", data.ssrTexture);
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_Result_SSR", data.result);
+                        context.cmd.SetComputeVectorParam(data.compute, "_ScreenParams", data.screenParams);
+
+                        int gx = Mathf.CeilToInt(data.screenParams.x / 8.0f);
+                        int gy = Mathf.CeilToInt(data.screenParams.y / 8.0f);
+                        context.cmd.DispatchCompute(data.compute, data.kernel, gx, gy, 1);
+                    });
+                }
+            }
+
+            // 7.5 SSGI Calculation Pass
+            if (_settings.enableSSGI && _settings.lightingComputeShader != null)
+            {
+                using (var builder = renderGraph.AddComputePass<ComputePassData>("LNSurface SSGI Pass", out var passData))
+                {
+                    passData.compute = _settings.lightingComputeShader;
+                    passData.kernel = _settings.lightingComputeShader.FindKernel("CS_SSGI");
+
+                    passData.frontColor = frontColor; 
+                    passData.frontPacked = frontPacked;
+                    passData.frontExtra = frontExtra; // Mask
+                    passData.backPacked = backPacked; // Needed for Raymarch
+                    passData.sceneColor = resourceData.activeColorTexture;
+                    passData.result = ssgiRaw;
+
+                    builder.UseTexture(passData.frontColor); 
+                    builder.UseTexture(passData.frontPacked);
+                    builder.UseTexture(passData.frontExtra);
+                    builder.UseTexture(passData.backPacked);
+                    builder.UseTexture(passData.sceneColor);
+                    builder.UseTexture(passData.result, AccessFlags.Write);
+
+                    // Use Scaled Res Params
+                    passData.screenParams = new Vector4(scaledDesc.width, scaledDesc.height, 1.0f / scaledDesc.width, 1.0f / scaledDesc.height);
+                    passData.ssgiSampleCount = _settings.ssgiSampleCount;
+                    passData.ssgiRayStepSize = _settings.ssgiRayStepSize;
+                    passData.worldToCameraMatrix = cameraData.GetViewMatrix();
+                    passData.cameraToWorldMatrix = cameraData.GetViewMatrix().inverse;
+                    passData.projectionMatrix = cameraData.GetProjectionMatrix();
+                    passData.inverseProjectionMatrix = cameraData.GetProjectionMatrix().inverse;
+
+                    builder.SetRenderFunc((ComputePassData data, ComputeGraphContext context) =>
+                    {
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Front_Color", data.frontColor); 
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Front_Packed", data.frontPacked);
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Front_Extra", data.frontExtra);
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Back_Packed", data.backPacked); 
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_SceneColor", data.sceneColor);
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_Result_SSGI", data.result);
+
+                        context.cmd.SetComputeVectorParam(data.compute, "_ScreenParams", data.screenParams);
+                        context.cmd.SetComputeIntParam(data.compute, "_SSGI_SampleCount", data.ssgiSampleCount);
+                        context.cmd.SetComputeFloatParam(data.compute, "_SSGI_RayStepSize", data.ssgiRayStepSize);
+                        context.cmd.SetComputeMatrixParam(data.compute, "_WorldToCameraMatrix", data.worldToCameraMatrix);
+                        context.cmd.SetComputeMatrixParam(data.compute, "_CameraToWorldMatrix", data.cameraToWorldMatrix);
+                        context.cmd.SetComputeMatrixParam(data.compute, "_ProjectionMatrix", data.projectionMatrix);
+                        context.cmd.SetComputeMatrixParam(data.compute, "_InverseProjectionMatrix", data.inverseProjectionMatrix);
+
+                        int gx = Mathf.CeilToInt(data.screenParams.x / 8.0f);
+                        int gy = Mathf.CeilToInt(data.screenParams.y / 8.0f);
+                        context.cmd.DispatchCompute(data.compute, data.kernel, gx, gy, 1);
+                    });
+                }
+
+                // 7.6 SSGI Blur Pass
+                using (var builder = renderGraph.AddComputePass<ComputePassData>("LNSurface SSGI Blur Pass", out var passData))
+                {
+                    passData.compute = _settings.lightingComputeShader;
+                    passData.kernel = _settings.lightingComputeShader.FindKernel("CS_SSGI_Blur");
+
+                    passData.frontPacked = frontPacked; // Depth
+                    passData.ssgiTexture = ssgiRaw; // Source SSGI
+                    passData.result = ssgiBlurred; // Final SSGI
+
+                    builder.UseTexture(passData.frontPacked);
+                    builder.UseTexture(passData.ssgiTexture);
+                    builder.UseTexture(passData.result, AccessFlags.Write);
+
+                    // Use Scaled Res Params
+                    passData.screenParams = new Vector4(scaledDesc.width, scaledDesc.height, 1.0f / scaledDesc.width, 1.0f / scaledDesc.height);
+
+                    builder.SetRenderFunc((ComputePassData data, ComputeGraphContext context) =>
+                    {
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Front_Packed", data.frontPacked);
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_SSGI_Raw", data.ssgiTexture);
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_Result_SSGI", data.result);
                         context.cmd.SetComputeVectorParam(data.compute, "_ScreenParams", data.screenParams);
 
                         int gx = Mathf.CeilToInt(data.screenParams.x / 8.0f);
@@ -411,8 +535,22 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                     {
                         passData.ssrTexture = ssrBlurred;
                     }
+
+                    // SSGI Texture Binding Logic
+                    if (_settings.enableSSGI)
+                    {
+                        passData.ssgiTexture = ssgiBlurred;
+                    }
+                    else
+                    {
+                        // Bind dummy texture to prevent "Property not set" error
+                        passData.ssgiTexture = frontColor; // Any valid texture
+                    }
+
                     passData.enableSSR = _settings.enableSSR ? 1.0f : 0.0f;
                     passData.enableSSAO = _settings.enableSSAO ? 1.0f : 0.0f;
+                    passData.enableSSGI = _settings.enableSSGI ? 1.0f : 0.0f;
+                    passData.ssgiIntensity = _settings.ssgiIntensity;
 
                     // Additional Lights
                     passData.additionalLightPositions = new Vector4[16];
@@ -488,6 +626,9 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                     {
                         builder.UseTexture(passData.ssrTexture);
                     }
+                    // Always use SSGI texture (real or dummy) to prevent binding error
+                    builder.UseTexture(passData.ssgiTexture);
+                    
                     builder.UseTexture(passData.result, AccessFlags.Write);
 
                     builder.SetRenderFunc((ComputePassData data, ComputeGraphContext context) =>
@@ -539,8 +680,12 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                         context.cmd.SetComputeFloatParam(data.compute, "_EnableSSAO", data.enableSSAO);
                         context.cmd.SetComputeFloatParam(data.compute, "_SSAO_Intensity", data.ssaoIntensity);
                         context.cmd.SetComputeIntParam(data.compute, "_SSAO_SampleCount", data.ssaoSampleCount);
+
+                        // SSGI Params
+                        context.cmd.SetComputeFloatParam(data.compute, "_EnableSSGI", data.enableSSGI);
+                        context.cmd.SetComputeFloatParam(data.compute, "_SSGI_Intensity", data.ssgiIntensity);
                         
-                        // Bind SSAO & SSR Textures
+                        // Bind SSAO & SSR & SSGI Textures
                         if (data.enableSSAO > 0.5f)
                         {
                             context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_AO_Blurred", data.ssaoTexture);
@@ -550,6 +695,9 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                         {
                             context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_SSR_Blurred", data.ssrTexture);
                         }
+
+                        // Always bind SSGI texture (real or dummy)
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_SSGI_Blurred", data.ssgiTexture);
 
                         int groupsX = Mathf.CeilToInt(data.screenParams.x / 8.0f);
                         int groupsY = Mathf.CeilToInt(data.screenParams.y / 8.0f);

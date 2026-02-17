@@ -98,6 +98,14 @@ MonoBehaviour:
     enableSSS: 1
     intensity: 1
     thicknessScale: 10
+    enableSSR: 1
+    ssrMaxSteps: 64
+    ssrStepSize: 0.1
+    ssrThickness: 0.1
+    enableSSAO: 1
+    ssaoRadius: 0.5
+    ssaoIntensity: 0.2
+    ssaoSampleCount: 16
     renderPassEvent: 500
 --- !u!114 &8311532915064548623
 MonoBehaviour:

@@ -67,58 +67,82 @@ Shader "Custom/LNSurfaceGBuffer"
             return output;
         }
 
-        struct FragmentOutput
+        // Octahedron Normal Encoding
+        float2 OctWrap(float2 v)
         {
-            float4 GBuffer0 : SV_Target0; // Color
-            float4 GBuffer1 : SV_Target1; // Normal
-            float4 GBuffer2 : SV_Target2; // Depth
-            float4 GBuffer3 : SV_Target3; // Mask
-            float4 GBuffer4 : SV_Target4; // Extra Data (Metallic, SpecularStrength, Packed(Subsurface, Anisotropic))
-            float4 GBuffer5 : SV_Target5; // Extra Data 2 (Smoothness, Shadow, DiffuseWrap, Unused)
+            return (1.0 - abs(v.yx)) * (v.xy >= 0.0 ? 1.0 : -1.0);
+        }
+
+        float2 EncodeNormal(float3 n)
+        {
+            n /= (abs(n.x) + abs(n.y) + abs(n.z));
+            n.xy = n.z >= 0.0 ? n.xy : OctWrap(n.xy);
+            return n.xy * 0.5 + 0.5;
+        }
+
+        // --- Front Pass Output Structure ---
+        struct FragmentOutputFront
+        {
+            float4 GBuffer0 : SV_Target0; // Color (RGB)
+            float4 GBuffer1 : SV_Target1; // Packed: Normal(RG) + Depth(B)
+            float4 GBuffer2 : SV_Target2; // Packed Extra Data
         };
 
-        FragmentOutput frag(Varyings input)
+        FragmentOutputFront frag_front(Varyings input)
         {
-            FragmentOutput output;
+            FragmentOutputFront output;
             float4 color = SAMPLE_TEXTURE2D(_BaseMap, sampler_BaseMap, input.uv) * _BaseColor;
             
-            // Shadow Calculation
-            float4 shadowCoord = TransformWorldToShadowCoord(input.positionWS.xyz);
-            Light mainLight = GetMainLight(shadowCoord);
-            float shadow = mainLight.shadowAttenuation;
-
-            // GBuffer0: Albedo (RGB), Unused (A) -> Set to 1.0
+            // GBuffer0: Albedo (RGB)
             output.GBuffer0 = float4(color.rgb, 1.0); 
 
-            // GBuffer1: Normal (RGB), Unused (A) -> Set to 1.0
-            output.GBuffer1 = float4(normalize(input.normalWS) * 0.5 + 0.5, 1.0);
+            // GBuffer1: Packed Normal (RG) + Linear Depth (B)
+            float3 normalWS = normalize(input.normalWS);
+            float2 encodedNormal = EncodeNormal(normalWS);
             
-            // View-space Z를 사용한 Linear Eye Depth
             float3 positionVS = TransformWorldToView(input.positionWS.xyz);
             float linearDepth = -positionVS.z;
-            output.GBuffer2 = float4(linearDepth.xxx, 1.0);
             
-            // GBuffer3: LNSurface Mask (R), Fresnel Strength (G), Fresnel Power (B), Unused (A)
-            output.GBuffer3 = float4(_SSSMask, _FresnelStrength / 5.0, _FresnelPower / 10.0, 1.0);
-
-            // GBuffer4 Packing
-            // R: Metallic
-            // G: Specular Strength
-            // B: Packed (Subsurface 4bit + Anisotropic 4bit)
-            // A: Unused -> 1.0
+            output.GBuffer1 = float4(encodedNormal, linearDepth, 1.0);
             
-            float specularStrength = max(max(_SpecularColor.r, _SpecularColor.g), _SpecularColor.b);
+            // GBuffer2: Packed Extra Data
+            // R: Mask
+            // G: Metallic
+            // B: Smoothness
+            // A: Packed (Subsurface 4bit + Anisotropic 4bit)
             
-            // Pack Subsurface (0..1) and Anisotropic (0..1) into 8 bits (0..255)
-            // Subsurface: High 4 bits, Anisotropic: Low 4 bits
             float packedSubsurface = floor(_Subsurface * 15.0 + 0.5); 
             float packedAnisotropic = floor(_Anisotropic * 15.0 + 0.5);
-            float packedB = (packedSubsurface * 16.0 + packedAnisotropic) / 255.0;
+            float packedA = (packedSubsurface * 16.0 + packedAnisotropic) / 255.0;
 
-            output.GBuffer4 = float4(_Metallic, specularStrength, packedB, 1.0);
+            output.GBuffer2 = float4(_SSSMask, _Metallic, _Smoothness, packedA);
+
+            return output;
+        }
+
+        // --- Back Pass Output Structure ---
+        struct FragmentOutputBack
+        {
+            float4 GBuffer0 : SV_Target0; // Color (RGB)
+            float4 GBuffer1 : SV_Target1; // Packed: Normal(RG) + Depth(B)
+        };
+
+        FragmentOutputBack frag_back(Varyings input)
+        {
+            FragmentOutputBack output;
+            float4 color = SAMPLE_TEXTURE2D(_BaseMap, sampler_BaseMap, input.uv) * _BaseColor;
             
-            // GBuffer5: Smoothness (R), Shadow (G), DiffuseWrap (B), Unused (A)
-            output.GBuffer5 = float4(_Smoothness, shadow, _DiffuseWrap, 1.0);
+            // GBuffer0: Albedo (RGB)
+            output.GBuffer0 = float4(color.rgb, 1.0); 
+
+            // GBuffer1: Packed Normal (RG) + Linear Depth (B)
+            float3 normalWS = normalize(input.normalWS);
+            float2 encodedNormal = EncodeNormal(normalWS);
+            
+            float3 positionVS = TransformWorldToView(input.positionWS.xyz);
+            float linearDepth = -positionVS.z;
+            
+            output.GBuffer1 = float4(encodedNormal, linearDepth, 1.0);
 
             return output;
         }
@@ -218,7 +242,7 @@ Shader "Custom/LNSurfaceGBuffer"
 
             HLSLPROGRAM
             #pragma vertex vert
-            #pragma fragment frag
+            #pragma fragment frag_front
             
             // Shadow keywords needed for GetMainLight()
             #pragma multi_compile _ _MAIN_LIGHT_SHADOWS _MAIN_LIGHT_SHADOWS_CASCADE _MAIN_LIGHT_SHADOWS_SCREEN
@@ -237,7 +261,7 @@ Shader "Custom/LNSurfaceGBuffer"
 
             HLSLPROGRAM
             #pragma vertex vert
-            #pragma fragment frag
+            #pragma fragment frag_back
             ENDHLSL
         }
     }

@@ -13,7 +13,8 @@ RWTexture2D<float> _Result_AO; // SSAO 용
 // --- 입력 텍스처 (GBuffer 자료형) ---
 Texture2D<float4> _LNSurface_Front_Color;  // RGB: 알베도(Albedo), A: 미사용
 Texture2D<float4> _LNSurface_Front_Packed; // RG: Oct-Encoded Normal, B: Linear Depth, A: 미사용
-Texture2D<float4> _LNSurface_Front_Extra;  // R: Mask, G: Metallic, B: Smoothness, A: Packed(SSS/Aniso)
+Texture2D<float4> _LNSurface_Front_Extra;  // R: Mask, G: Metallic, B: Smoothness, A: Unused
+Texture2D<float4> _LNSurface_Front_Extra2; // R: Shadow, G: Packed(Sub/Aniso), B: Packed(Int/Thick), A: Unused
 
 Texture2D<float4> _LNSurface_Back_Color;   // RGB: 뒷면 컬러
 Texture2D<float4> _LNSurface_Back_Packed;  // RG: Oct-Encoded Normal, B: Linear Depth, A: 미사용
@@ -43,8 +44,8 @@ float4 _AdditionalLightColors[16];
 float4 _AdditionalLightAttenuations[16]; // x: 거리 감쇠 역제곱, y: 미사용
 
 // 하부표면 산란(SSS) 설정
-float _SSS_Intensity;     // SSS 강도
-float _SSS_ThicknessScale; // 두께 계수
+// float _SSS_Intensity;     // Removed (Per-Material)
+// float _SSS_ThicknessScale; // Removed (Per-Material)
 float _EnableSSS;          // SSS 활성화 여부
 
 // 구면 조화 함수(SH) - Ambient Light 연산용
@@ -630,6 +631,7 @@ void CSMain (uint3 id : SV_DispatchThreadID)
     // 1. GBuffer 데이터 읽기 및 압축 해제
     float4 gbufferPacked = _LNSurface_Front_Packed[id.xy];
     float4 gbufferExtra = _LNSurface_Front_Extra[id.xy];
+    float4 gbufferExtra2 = _LNSurface_Front_Extra2[id.xy];
     
     // 마스크 체크 (렌더링 대상이 아닌 배경 처리)
     float mask = gbufferExtra.r;
@@ -645,14 +647,21 @@ void CSMain (uint3 id : SV_DispatchThreadID)
     float metallic = gbufferExtra.g;
     float smoothness = gbufferExtra.b;
     
-    // Extra A 채널의 패킹 데이터 해제 (Subsurface 4bit + Anisotropic 4bit)
-    float packedA = gbufferExtra.a * 255.0;
-    float subsurface = floor(packedA / 16.0) / 15.0;
-    float anisotropic = (packedA - floor(packedA / 16.0) * 16.0) / 15.0;
+    // Extra2에서 데이터 읽기
+    float shadow = gbufferExtra2.r;
     
-    // Specular Strength, Shadow, DiffuseWrap 등은 현재 Extra 텍스처에서 제거됨 (필요 시 복구 또는 상수 처리)
+    // G채널 언패킹 (Subsurface, Anisotropic)
+    float packedG = gbufferExtra2.g * 255.0;
+    float subsurface = floor(packedG / 16.0) / 15.0;
+    float anisotropic = (packedG - floor(packedG / 16.0) * 16.0) / 15.0;
+    
+    // B채널 언패킹 (SSS Intensity, SSS Thickness)
+    float packedB = gbufferExtra2.b * 255.0;
+    float sssIntensity = floor(packedB / 16.0) / 15.0 * 10.0; // 0~10 범위로 복원
+    float sssThickness = (packedB - floor(packedB / 16.0) * 16.0) / 15.0 * 100.0; // 0~100 범위로 복원
+    
+    // Specular Strength, DiffuseWrap 등은 현재 Extra 텍스처에서 제거됨 (필요 시 복구 또는 상수 처리)
     float specularStrength = 1.0; // Default
-    float shadow = 1.0; // Default (ShadowMap에서 가져와야 함)
     float diffuseWrap = 0.25; // Default
     
     // Normal 복원
@@ -755,12 +764,14 @@ void CSMain (uint3 id : SV_DispatchThreadID)
                 backDepth = 10000.0; // 무한대 두께로 취급
             }
             
-            float thickness = max(0, backDepth - frontDepth) * _SSS_ThicknessScale;
+            float thickness = max(0, backDepth - frontDepth) * sssThickness;
             
             // 라이트가 뒤에서 비칠 때의 산란 강도 계산
             float backLightFactor = saturate((-rawNdotL + 0.2) * 2.0); 
-            float sssIntensity = _SSS_Intensity * (1.0 + backLightFactor);
-            totalSSS += exp(-thickness * sssIntensity) * albedo.rgb * lightColor * backLightFactor * atten;
+            
+            // SSS Intensity를 밝기 Multiplier로 사용
+            float attenuation = exp(-thickness);
+            totalSSS += attenuation * albedo.rgb * lightColor * backLightFactor * atten * sssIntensity;
         }
     }
 

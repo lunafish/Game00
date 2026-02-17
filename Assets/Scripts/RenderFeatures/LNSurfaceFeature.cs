@@ -30,8 +30,7 @@ public class LNSurfaceFeature : ScriptableRendererFeature
         public ResolutionScale resolutionScale = ResolutionScale.Half;
 
         public bool enableSSS = true; 
-        [Range(0f, 10f)] public float intensity = 1.0f;
-        [Range(0f, 100f)] public float thicknessScale = 10.0f;
+        // intensity and thicknessScale removed (controlled by material)
 
         [Header("Screen Space Reflections")]
         public bool enableSSR = true;
@@ -109,7 +108,8 @@ public class LNSurfaceFeature : ScriptableRendererFeature
             // Textures
             internal TextureHandle frontColor;
             internal TextureHandle frontPacked; // Normal(RG) + Depth(B)
-            internal TextureHandle frontExtra; // Mask(R), Metallic(G), Smoothness(B), Packed(A)
+            internal TextureHandle frontExtra; // Mask(R), Metallic(G), Smoothness(B)
+            internal TextureHandle frontExtra2; // Shadow(R), Packed(G), Packed(B)
             
             internal TextureHandle backColor;
             internal TextureHandle backPacked; // Normal(RG) + Depth(B)
@@ -195,6 +195,7 @@ public class LNSurfaceFeature : ScriptableRendererFeature
             var extraDesc = desc;
             extraDesc.graphicsFormat = UnityEngine.Experimental.Rendering.GraphicsFormat.R8G8B8A8_UNorm;
             TextureHandle frontExtra = UniversalRenderer.CreateRenderGraphTexture(renderGraph, extraDesc, "LNSurface_Front_Extra", false);
+            TextureHandle frontExtra2 = UniversalRenderer.CreateRenderGraphTexture(renderGraph, extraDesc, "LNSurface_Front_Extra2", false);
 
             // Back Pass Textures (Full Res)
             TextureHandle backColor = UniversalRenderer.CreateRenderGraphTexture(renderGraph, desc, "LNSurface_Back_Color", false);
@@ -219,10 +220,10 @@ public class LNSurfaceFeature : ScriptableRendererFeature
             TextureHandle ssgiBlurred = UniversalRenderer.CreateRenderGraphTexture(renderGraph, ssrDesc, "LNSurface_SSGI_Blurred", false);
 
             // 2. Front Pass
-            RenderGBufferFront(renderGraph, frameData, "Front", "LNSurface_Front", frontColor, frontPacked, frontExtra);
+            RenderGBufferFront(renderGraph, frameData, "Front", "LNSurface_Front", frontColor, frontPacked, frontExtra, frontExtra2);
 
-            // 3. Back Pass (Only if SSS is enabled)
-            if (_settings.enableSSS)
+            // 3. Back Pass (Only if SSS OR SSR is enabled)
+            if (_settings.enableSSS || _settings.enableSSR)
             {
                 RenderGBufferBack(renderGraph, frameData, "Back", "LNSurface_Back", backColor, backPacked);
             }
@@ -573,8 +574,8 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                         addCount++;
                     }
                     passData.additionalLightCount = addCount;
-                    passData.intensity = _settings.intensity;
-                    passData.thicknessScale = _settings.thicknessScale;
+                    // passData.intensity = _settings.intensity; // Removed
+                    // passData.thicknessScale = _settings.thicknessScale; // Removed
                     passData.enableSSS = _settings.enableSSS ? 1.0f : 0.0f; 
                     passData.lightingModel = (int)_settings.lightingModel;
 
@@ -590,6 +591,7 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                     passData.backColor = backColor;
                     passData.sceneColor = resourceData.activeColorTexture; 
                     passData.frontExtra = frontExtra;
+                    passData.frontExtra2 = frontExtra2; // Added
                     
                     passData.result = renderGraph.ImportTexture(_resultHandle);
                     lightingResult = passData.result;
@@ -617,6 +619,7 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                     builder.UseTexture(passData.backPacked); 
                     builder.UseTexture(passData.backColor);
                     builder.UseTexture(passData.frontExtra);
+                    builder.UseTexture(passData.frontExtra2); // Added
                     builder.UseTexture(passData.sceneColor); 
                     if (_settings.enableSSAO)
                     {
@@ -638,6 +641,7 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Back_Packed", data.backPacked); 
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Back_Color", data.backColor);
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Front_Extra", data.frontExtra);
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Front_Extra2", data.frontExtra2); // Added
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_SceneColor", data.sceneColor); 
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_Result", data.result);
 
@@ -652,8 +656,8 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                         context.cmd.SetComputeVectorArrayParam(data.compute, "_AdditionalLightAttenuations", data.additionalLightAttenuations);
                         
                         // SSS Params
-                        context.cmd.SetComputeFloatParam(data.compute, "_SSS_Intensity", data.intensity);
-                        context.cmd.SetComputeFloatParam(data.compute, "_SSS_ThicknessScale", data.thicknessScale);
+                        // context.cmd.SetComputeFloatParam(data.compute, "_SSS_Intensity", data.intensity); // Removed
+                        // context.cmd.SetComputeFloatParam(data.compute, "_SSS_ThicknessScale", data.thicknessScale); // Removed
                         context.cmd.SetComputeFloatParam(data.compute, "_EnableSSS", data.enableSSS);
                         context.cmd.SetComputeIntParam(data.compute, "_LightingModel", data.lightingModel);
                         
@@ -713,7 +717,7 @@ public class LNSurfaceFeature : ScriptableRendererFeature
             renderGraph.AddBlitPass(blitParams, "LNSurface Final Blit");
         }
 
-        private void RenderGBufferFront(RenderGraph renderGraph, ContextContainer frameData, string name, string lightMode, TextureHandle color, TextureHandle packed, TextureHandle extra)
+        private void RenderGBufferFront(RenderGraph renderGraph, ContextContainer frameData, string name, string lightMode, TextureHandle color, TextureHandle packed, TextureHandle extra, TextureHandle extra2)
         {
             UniversalResourceData resourceData = frameData.Get<UniversalResourceData>();
             UniversalRenderingData renderingData = frameData.Get<UniversalRenderingData>();
@@ -724,6 +728,7 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                 builder.SetRenderAttachment(color, 0);
                 builder.SetRenderAttachment(packed, 1);
                 builder.SetRenderAttachment(extra, 2);
+                builder.SetRenderAttachment(extra2, 3);
                 builder.SetRenderAttachmentDepth(resourceData.activeDepthTexture, AccessFlags.Write);
 
                 DrawingSettings drawSettings = new DrawingSettings(new ShaderTagId(lightMode), new SortingSettings(cameraData.camera) { criteria = SortingCriteria.CommonOpaque });

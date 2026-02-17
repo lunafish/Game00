@@ -10,6 +10,8 @@ Shader "Custom/LNSurfaceGBuffer"
         _Metallic("Metallic", Range(0.0, 1.0)) = 0.0
         _Subsurface("Subsurface", Range(0.0, 1.0)) = 0.0
         _Anisotropic("Anisotropic", Range(0.0, 1.0)) = 0.0
+        _SSSIntensity("SSS Intensity", Range(0, 10)) = 1.0
+        _SSSThickness("SSS Thickness", Range(0, 100)) = 10.0
         _SpecularColor("Specular Color", Color) = (1, 1, 1, 1)
         _FresnelPower("Fresnel Power", Range(0.1, 10.0)) = 5.0
         _FresnelStrength("Fresnel Strength", Range(0, 5)) = 0.5
@@ -51,6 +53,8 @@ Shader "Custom/LNSurfaceGBuffer"
             float _Metallic;
             float _Subsurface;
             float _Anisotropic;
+            float _SSSIntensity;
+            float _SSSThickness;
             float4 _SpecularColor;
             float _FresnelPower;
             float _FresnelStrength;
@@ -85,7 +89,8 @@ Shader "Custom/LNSurfaceGBuffer"
         {
             float4 GBuffer0 : SV_Target0; // Color (RGB)
             float4 GBuffer1 : SV_Target1; // Packed: Normal(RG) + Depth(B)
-            float4 GBuffer2 : SV_Target2; // Packed Extra Data
+            float4 GBuffer2 : SV_Target2; // Extra1: Mask, Metallic, Smoothness
+            float4 GBuffer3 : SV_Target3; // Extra2: Shadow, Packed(Sub/Aniso), Packed(Int/Thick)
         };
 
         FragmentOutputFront frag_front(Varyings input)
@@ -93,6 +98,11 @@ Shader "Custom/LNSurfaceGBuffer"
             FragmentOutputFront output;
             float4 color = SAMPLE_TEXTURE2D(_BaseMap, sampler_BaseMap, input.uv) * _BaseColor;
             
+            // Shadow Calculation
+            float4 shadowCoord = TransformWorldToShadowCoord(input.positionWS.xyz);
+            Light mainLight = GetMainLight(shadowCoord);
+            float shadow = mainLight.shadowAttenuation;
+
             // GBuffer0: Albedo (RGB)
             output.GBuffer0 = float4(color.rgb, 1.0); 
 
@@ -105,17 +115,34 @@ Shader "Custom/LNSurfaceGBuffer"
             
             output.GBuffer1 = float4(encodedNormal, linearDepth, 1.0);
             
-            // GBuffer2: Packed Extra Data
+            // GBuffer2: Extra Data 1
             // R: Mask
             // G: Metallic
             // B: Smoothness
-            // A: Packed (Subsurface 4bit + Anisotropic 4bit)
-            
-            float packedSubsurface = floor(_Subsurface * 15.0 + 0.5); 
-            float packedAnisotropic = floor(_Anisotropic * 15.0 + 0.5);
-            float packedA = (packedSubsurface * 16.0 + packedAnisotropic) / 255.0;
+            // A: Unused
+            output.GBuffer2 = float4(_SSSMask, _Metallic, _Smoothness, 1.0);
 
-            output.GBuffer2 = float4(_SSSMask, _Metallic, _Smoothness, packedA);
+            // GBuffer3: Extra Data 2
+            // R: Shadow Attenuation
+            // G: Packed (Subsurface 4bit + Anisotropic 4bit)
+            // B: Packed (SSS Intensity 4bit + SSS Thickness 4bit)
+            // A: Unused
+            
+            // Pack G: Subsurface & Anisotropic
+            float packedSub = floor(_Subsurface * 15.0 + 0.5); 
+            float packedAniso = floor(_Anisotropic * 15.0 + 0.5);
+            float packedG = (packedSub * 16.0 + packedAniso) / 255.0;
+            
+            // Pack B: SSS Intensity & Thickness
+            // Normalize ranges: Intensity (0-10), Thickness (0-100)
+            float normIntensity = saturate(_SSSIntensity / 10.0);
+            float normThickness = saturate(_SSSThickness / 100.0);
+            
+            float packedInt = floor(normIntensity * 15.0 + 0.5);
+            float packedThick = floor(normThickness * 15.0 + 0.5);
+            float packedB = (packedInt * 16.0 + packedThick) / 255.0;
+
+            output.GBuffer3 = float4(shadow, packedG, packedB, 1.0);
 
             return output;
         }

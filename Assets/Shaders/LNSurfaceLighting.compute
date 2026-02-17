@@ -44,8 +44,8 @@ float4 _AdditionalLightColors[16];
 float4 _AdditionalLightAttenuations[16]; // x: 거리 감쇠 역제곱, y: 미사용
 
 // 하부표면 산란(SSS) 설정
-// float _SSS_Intensity;     // Removed (Per-Material)
-// float _SSS_ThicknessScale; // Removed (Per-Material)
+float _SSS_Intensity;     // SSS 강도
+float _SSS_ThicknessScale; // 두께 계수
 float _EnableSSS;          // SSS 활성화 여부
 
 // 구면 조화 함수(SH) - Ambient Light 연산용
@@ -310,8 +310,16 @@ bool Raymarch(float3 startPosVS, float3 rayDirVS, float stepSize, out float2 hit
         
         float currentDepth = -currentPosVS.z;
         
+        // Back Depth 유효성 체크 (1000.0은 Clear Value)
+        bool hasBackFace = (backDepth < 900.0);
+
+        // 유효한 뒷면이 있으면 볼륨 판정, 없으면 단순 두께 판정
+        float thicknessThreshold = hasBackFace ? (backDepth - frontDepth) : _SSR_Thickness;
+        // 뒷면이 앞면보다 앞에 있는 경우(오류) 보정
+        thicknessThreshold = max(thicknessThreshold, _SSR_Thickness); 
+        
         // 레이가 물체의 두께(앞면과 뒷면 사이 볼륨) 안에 진입했는지 확인
-        if (currentDepth >= frontDepth && currentDepth <= backDepth + _SSR_Thickness)
+        if (currentDepth >= frontDepth && currentDepth <= frontDepth + thicknessThreshold)
         {
             // 교점 정밀화를 위한 이진 탐색 (Binary Search Refinement)
             float3 prevPosVS = currentPosVS - rayDirVS * stepSize;
@@ -321,10 +329,10 @@ bool Raymarch(float3 startPosVS, float3 rayDirVS, float stepSize, out float2 hit
                 float3 midScreenPos = ProjectViewPos(midPosVS);
                 
                 float midFront = _LNSurface_Front_Packed.SampleLevel(painter_linear_clamp_sampler, midScreenPos.xy, 0).b;
-                float midBack = _LNSurface_Back_Packed.SampleLevel(painter_linear_clamp_sampler, midScreenPos.xy, 0).b;
                 float midDepth = -midPosVS.z;
                 
-                if (midDepth >= midFront && midDepth <= midBack + _SSR_Thickness)
+                // 이진 탐색 중에는 단순 두께 판정 사용 (성능 고려)
+                if (midDepth >= midFront && midDepth <= midFront + _SSR_Thickness)
                     currentPosVS = midPosVS;
                 else
                     prevPosVS = midPosVS;
@@ -549,9 +557,12 @@ void CS_SSR (uint3 id : SV_DispatchThreadID)
             reflectDirVS = normalize(reflectDirVS + jitter * roughness * 0.1);
         }
         
+        // Bias 추가: Self-Intersection 방지
+        float3 startPos = vPos + reflectDirVS * 0.05;
+
         float2 hitUV;
         bool hitBack;
-        if (Raymarch(vPos, reflectDirVS, _SSR_StepSize, hitUV, hitBack))
+        if (Raymarch(startPos, reflectDirVS, _SSR_StepSize, hitUV, hitBack))
         {
             float hitMask = _LNSurface_Front_Extra.SampleLevel(painter_linear_clamp_sampler, hitUV, 0).r;
             if (hitMask > 0.1 || hitBack) 
@@ -563,7 +574,10 @@ void CS_SSR (uint3 id : SV_DispatchThreadID)
                     reflectionColor = _SceneColor.SampleLevel(painter_linear_clamp_sampler, hitUV, 0).rgb;
                 }
                 
-                float2 edge = smoothstep(0, 0.1, hitUV) * smoothstep(1, 0.9, hitUV);
+                // Firefly Reduction (Clamp)
+                reflectionColor = min(reflectionColor, 10.0);
+
+                float2 edge = smoothstep(0, 0.2, hitUV) * smoothstep(1, 0.8, hitUV); // Edge Fade 강화
                 reflectionColor *= edge.x * edge.y;
             }
         }
@@ -810,9 +824,15 @@ void CSMain (uint3 id : SV_DispatchThreadID)
     
     // Roughness에 따른 반사광 블렌딩 (거칠수록 반사광이 약해짐)
     float roughness = saturate(1.0 - smoothness);
-    float reflectionStrength = 1.0 - roughness * 0.5; // 거칠수록 반사 강도 감소 (최대 50%까지)
     
-    ambientColor += reflectionColor * F * reflectionStrength;
+    // SSR Fade: Smoothness가 낮을수록(거칠수록) 반사를 부드럽게 끔
+    float ssrFade = smoothstep(0.05, 0.2, smoothness);
+    
+    // Reflection Strength: 거칠수록 반사 강도 감소 (제곱 감쇠)
+    float reflectionStrength = (1.0 - roughness);
+    reflectionStrength *= reflectionStrength; 
+    
+    ambientColor += reflectionColor * F * reflectionStrength * ssrFade;
 
     // 최종 픽셀 컬러 출력 (확산광 + 주변광/반사광 + 스펙큘러 + SSS)
     _Result[id.xy] = float4(totalDiffuse + ambientColor + totalSpecular + totalSSS, 1.0);

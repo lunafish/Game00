@@ -97,6 +97,7 @@ public class LNSurfaceFeature : ScriptableRendererFeature
             internal TextureHandle extra; // GBuffer4: Metallic, SpecularStrength, Packed(Subsurface, Anisotropic)
             internal TextureHandle extra2; // GBuffer5: Smoothness
             internal TextureHandle ssaoTexture; // SSAO Blurred Result
+            internal TextureHandle ssrTexture; // SSR Blurred Result
             internal TextureHandle result; // Input/Output
             
             internal float intensity;
@@ -173,6 +174,15 @@ public class LNSurfaceFeature : ScriptableRendererFeature
             aoDesc.enableRandomWrite = true;
             TextureHandle aoRaw = UniversalRenderer.CreateRenderGraphTexture(renderGraph, aoDesc, "LNSurface_AO_Raw", false);
             TextureHandle aoBlurred = UniversalRenderer.CreateRenderGraphTexture(renderGraph, aoDesc, "LNSurface_AO_Blurred", false);
+
+            // SSR Textures (B10G11R11_UFloatPack32 for HDR color)
+            var ssrDesc = desc;
+            ssrDesc.graphicsFormat = UnityEngine.Experimental.Rendering.GraphicsFormat.B10G11R11_UFloatPack32;
+            ssrDesc.enableRandomWrite = true;
+            TextureHandle ssrRaw = UniversalRenderer.CreateRenderGraphTexture(renderGraph, ssrDesc, "LNSurface_SSR_Raw", false);
+            TextureHandle ssrBlurred = UniversalRenderer.CreateRenderGraphTexture(renderGraph, ssrDesc, "LNSurface_SSR_Blurred", false);
+
+            TextureHandle sceneColor = resourceData.activeColorTexture;
 
             // 2. Front Pass
             RenderGBuffer(renderGraph, frameData, "Front", "LNSurface_Front", frontColor, frontNormal, frontDepth, mask, frontExtra, frontExtra2, true);
@@ -265,7 +275,98 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                 }
             }
 
-            // 4. Lighting Pass (Disney BRDF)
+            // 6. SSR Calculation Pass
+            if (_settings.enableSSR && _settings.lightingComputeShader != null)
+            {
+                using (var builder = renderGraph.AddComputePass<ComputePassData>("LNSurface SSR Pass", out var passData))
+                {
+                    passData.compute = _settings.lightingComputeShader;
+                    passData.kernel = _settings.lightingComputeShader.FindKernel("CS_SSR");
+
+                    passData.frontNormal = frontNormal;
+                    passData.frontDepth = frontDepth;
+                    passData.backDepth = backDepth;
+                    passData.backColor = backColor;
+                    passData.sceneColor = sceneColor;
+                    passData.mask = mask;
+                    passData.extra2 = frontExtra2; // Smoothness
+                    passData.result = ssrRaw;
+
+                    builder.UseTexture(passData.frontNormal);
+                    builder.UseTexture(passData.frontDepth);
+                    builder.UseTexture(passData.backDepth);
+                    builder.UseTexture(passData.backColor);
+                    builder.UseTexture(passData.sceneColor);
+                    builder.UseTexture(passData.mask);
+                    builder.UseTexture(passData.extra2);
+                    builder.UseTexture(passData.result, AccessFlags.Write);
+
+                    passData.screenParams = new Vector4(desc.width, desc.height, 1.0f / desc.width, 1.0f / desc.height);
+                    passData.ssrMaxSteps = _settings.ssrMaxSteps;
+                    passData.ssrStepSize = _settings.ssrStepSize;
+                    passData.ssrThickness = _settings.ssrThickness;
+                    passData.worldToCameraMatrix = cameraData.GetViewMatrix();
+                    passData.cameraToWorldMatrix = cameraData.GetViewMatrix().inverse;
+                    passData.projectionMatrix = cameraData.GetProjectionMatrix();
+                    passData.inverseProjectionMatrix = cameraData.GetProjectionMatrix().inverse;
+
+                    builder.SetRenderFunc((ComputePassData data, ComputeGraphContext context) =>
+                    {
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Front_Normal", data.frontNormal);
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Front_Depth", data.frontDepth);
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Back_Depth", data.backDepth);
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Back_Color", data.backColor);
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_SceneColor", data.sceneColor);
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Mask", data.mask);
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Front_Extra2", data.extra2);
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_Result_SSR", data.result);
+
+                        context.cmd.SetComputeVectorParam(data.compute, "_ScreenParams", data.screenParams);
+                        context.cmd.SetComputeIntParam(data.compute, "_SSR_MaxSteps", data.ssrMaxSteps);
+                        context.cmd.SetComputeFloatParam(data.compute, "_SSR_StepSize", data.ssrStepSize);
+                        context.cmd.SetComputeFloatParam(data.compute, "_SSR_Thickness", data.ssrThickness);
+                        context.cmd.SetComputeMatrixParam(data.compute, "_WorldToCameraMatrix", data.worldToCameraMatrix);
+                        context.cmd.SetComputeMatrixParam(data.compute, "_CameraToWorldMatrix", data.cameraToWorldMatrix);
+                        context.cmd.SetComputeMatrixParam(data.compute, "_ProjectionMatrix", data.projectionMatrix);
+                        context.cmd.SetComputeMatrixParam(data.compute, "_InverseProjectionMatrix", data.inverseProjectionMatrix);
+
+                        int gx = Mathf.CeilToInt(data.screenParams.x / 8.0f);
+                        int gy = Mathf.CeilToInt(data.screenParams.y / 8.0f);
+                        context.cmd.DispatchCompute(data.compute, data.kernel, gx, gy, 1);
+                    });
+                }
+
+                // 7. SSR Bilateral Blur Pass
+                using (var builder = renderGraph.AddComputePass<ComputePassData>("LNSurface SSR Blur Pass", out var passData))
+                {
+                    passData.compute = _settings.lightingComputeShader;
+                    passData.kernel = _settings.lightingComputeShader.FindKernel("CS_SSR_Blur");
+
+                    passData.frontDepth = frontDepth;
+                    passData.extra = ssrRaw; // Use extra for RAW SSR
+                    passData.result = ssrBlurred;
+
+                    builder.UseTexture(passData.frontDepth);
+                    builder.UseTexture(passData.extra);
+                    builder.UseTexture(passData.result, AccessFlags.Write);
+
+                    passData.screenParams = new Vector4(desc.width, desc.height, 1.0f / desc.width, 1.0f / desc.height);
+
+                    builder.SetRenderFunc((ComputePassData data, ComputeGraphContext context) =>
+                    {
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Front_Depth", data.frontDepth);
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_SSR_Raw", data.extra);
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_Result_SSR", data.result);
+                        context.cmd.SetComputeVectorParam(data.compute, "_ScreenParams", data.screenParams);
+
+                        int gx = Mathf.CeilToInt(data.screenParams.x / 8.0f);
+                        int gy = Mathf.CeilToInt(data.screenParams.y / 8.0f);
+                        context.cmd.DispatchCompute(data.compute, data.kernel, gx, gy, 1);
+                    });
+                }
+            }
+
+            // 8. Lighting Pass (Disney BRDF)
             TextureHandle lightingResult = resourceData.activeColorTexture; // Fallback
             if (_settings.lightingComputeShader != null)
             {
@@ -307,11 +408,17 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                     passData.mainLightDirection = mainLightDir;
                     passData.mainLightColor = mainLightCol;
                     
-                    // Bind SSAO Blurred Texture if enabled
                     if (_settings.enableSSAO)
                     {
                         passData.ssaoTexture = aoBlurred; // Use dedicated field for Blurred AO
                     }
+
+                    // Bind SSR Blurred Texture if enabled
+                    if (_settings.enableSSR)
+                    {
+                        passData.ssrTexture = ssrBlurred;
+                    }
+                    passData.enableSSR = _settings.enableSSR ? 1.0f : 0.0f;
                     passData.enableSSAO = _settings.enableSSAO ? 1.0f : 0.0f;
 
                     // Additional Lights
@@ -390,6 +497,10 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                     {
                         builder.UseTexture(passData.ssaoTexture);
                     }
+                    if (_settings.enableSSR)
+                    {
+                        builder.UseTexture(passData.ssrTexture);
+                    }
                     builder.UseTexture(passData.result, AccessFlags.Write);
 
                     builder.SetRenderFunc((ComputePassData data, ComputeGraphContext context) =>
@@ -445,9 +556,15 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                         context.cmd.SetComputeFloatParam(data.compute, "_SSAO_Intensity", data.ssaoIntensity);
                         context.cmd.SetComputeIntParam(data.compute, "_SSAO_SampleCount", data.ssaoSampleCount);
                         
+                        // Bind SSAO & SSR Textures
                         if (data.enableSSAO > 0.5f)
                         {
                             context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_AO_Blurred", data.ssaoTexture);
+                        }
+
+                        if (data.enableSSR > 0.5f)
+                        {
+                            context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_SSR_Blurred", data.ssrTexture);
                         }
 
                         int groupsX = Mathf.CeilToInt(data.screenParams.x / 8.0f);

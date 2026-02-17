@@ -182,7 +182,10 @@ public class LNSurfaceFeature : ScriptableRendererFeature
             TextureHandle ssrRaw = UniversalRenderer.CreateRenderGraphTexture(renderGraph, ssrDesc, "LNSurface_SSR_Raw", false);
             TextureHandle ssrBlurred = UniversalRenderer.CreateRenderGraphTexture(renderGraph, ssrDesc, "LNSurface_SSR_Blurred", false);
 
-            TextureHandle sceneColor = resourceData.activeColorTexture;
+            var sceneDesc = desc;
+            sceneDesc.useMipMap = true;
+            sceneDesc.autoGenerateMips = true;
+            TextureHandle sceneColorWithMips = UniversalRenderer.CreateRenderGraphTexture(renderGraph, sceneDesc, "LNSurface_SceneColor_Mips", false);
 
             // 2. Front Pass
             RenderGBuffer(renderGraph, frameData, "Front", "LNSurface_Front", frontColor, frontNormal, frontDepth, mask, frontExtra, frontExtra2, true);
@@ -275,6 +278,14 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                 }
             }
 
+            // 5.5 Prepare Scene Color with Mips for SSR
+            if (_settings.enableSSR)
+            {
+                RenderGraphUtils.BlitMaterialParameters mipBlitParams = new(resourceData.activeColorTexture, sceneColorWithMips, 
+                    Blitter.GetBlitMaterial(TextureDimension.Tex2D), 0);
+                renderGraph.AddBlitPass(mipBlitParams, "LNSurface Prepare Mipmaps");
+            }
+
             // 6. SSR Calculation Pass
             if (_settings.enableSSR && _settings.lightingComputeShader != null)
             {
@@ -287,7 +298,7 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                     passData.frontDepth = frontDepth;
                     passData.backDepth = backDepth;
                     passData.backColor = backColor;
-                    passData.sceneColor = sceneColor;
+                    passData.sceneColor = sceneColorWithMips; // Use Mipmapped Texture
                     passData.mask = mask;
                     passData.extra2 = frontExtra2; // Smoothness
                     passData.result = ssrRaw;
@@ -343,11 +354,13 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                     passData.kernel = _settings.lightingComputeShader.FindKernel("CS_SSR_Blur");
 
                     passData.frontDepth = frontDepth;
-                    passData.extra = ssrRaw; // Use extra for RAW SSR
-                    passData.result = ssrBlurred;
+                    passData.extra2 = frontExtra2; // Smoothness for variable radius
+                    passData.ssrTexture = ssrRaw; // Source SSR
+                    passData.result = ssrBlurred; // Final SSR
 
                     builder.UseTexture(passData.frontDepth);
-                    builder.UseTexture(passData.extra);
+                    builder.UseTexture(passData.extra2);
+                    builder.UseTexture(passData.ssrTexture);
                     builder.UseTexture(passData.result, AccessFlags.Write);
 
                     passData.screenParams = new Vector4(desc.width, desc.height, 1.0f / desc.width, 1.0f / desc.height);
@@ -355,7 +368,8 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                     builder.SetRenderFunc((ComputePassData data, ComputeGraphContext context) =>
                     {
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Front_Depth", data.frontDepth);
-                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_SSR_Raw", data.extra);
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Front_Extra2", data.extra2);
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_SSR_Raw", data.ssrTexture);
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_Result_SSR", data.result);
                         context.cmd.SetComputeVectorParam(data.compute, "_ScreenParams", data.screenParams);
 
@@ -458,10 +472,10 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                     passData.frontDepth = frontDepth;
                     passData.backDepth = backDepth; 
                     passData.backColor = backColor;
+                    passData.sceneColor = sceneColorWithMips; // Use Mipmapped Texture
                     passData.mask = mask;
                     passData.extra = frontExtra;
                     passData.extra2 = frontExtra2;
-                    passData.sceneColor = resourceData.activeColorTexture; // Bind Scene Color
                     
                     passData.result = renderGraph.ImportTexture(_resultHandle);
                     lightingResult = passData.result;

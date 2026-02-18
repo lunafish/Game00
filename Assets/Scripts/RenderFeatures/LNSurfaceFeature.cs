@@ -22,6 +22,12 @@ public class LNSurfaceFeature : ScriptableRendererFeature
             Quarter = 4
         }
 
+        public enum ShadowTintMode
+        {
+            Custom,
+            Complementary
+        }
+
         public LayerMask layerMask = -1;
         public ComputeShader lightingComputeShader; // Disney BRDF Lighting
         public LightingModel lightingModel = LightingModel.DisneyBRDF; // Selection
@@ -35,6 +41,12 @@ public class LNSurfaceFeature : ScriptableRendererFeature
         [Header("Material Global Settings")]
         [Range(0.0f, 2.0f)] public float specularStrength = 1.0f;
         [Range(0.0f, 1.0f)] public float diffuseWrap = 0.25f;
+
+        [Header("Stylized Shadow Tint")]
+        public ShadowTintMode shadowTintMode = ShadowTintMode.Complementary;
+        public Color shadowTintColor = new Color(0.0f, 0.0f, 0.2f, 1.0f); // Default Dark Blue
+        [Range(0.0f, 1.0f)] public float shadowTintIntensity = 0.5f;
+        [Range(0.0f, 1.0f)] public float shadowThreshold = 0.5f; // 0.5 Default
 
         [Header("Screen Space Reflections")]
         public bool enableSSR = true;
@@ -141,6 +153,12 @@ public class LNSurfaceFeature : ScriptableRendererFeature
             // Material Global Settings
             internal float specularStrength;
             internal float diffuseWrap;
+
+            // Shadow Tint Settings
+            internal int shadowTintMode;
+            internal Vector4 shadowTintColor;
+            internal float shadowTintIntensity;
+            internal float shadowThreshold;
 
             // SSR Params
             internal float enableSSR;
@@ -672,6 +690,12 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                     passData.specularStrength = _settings.specularStrength;
                     passData.diffuseWrap = _settings.diffuseWrap;
 
+                    // Shadow Tint Settings
+                    passData.shadowTintMode = (int)_settings.shadowTintMode;
+                    passData.shadowTintColor = _settings.shadowTintColor;
+                    passData.shadowTintIntensity = _settings.shadowTintIntensity;
+                    passData.shadowThreshold = _settings.shadowThreshold;
+
                     // Additional Lights
                     passData.additionalLightPositions = new Vector4[16];
                     passData.additionalLightColors = new Vector4[16];
@@ -793,6 +817,12 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                         // Material Global Settings
                         context.cmd.SetComputeFloatParam(data.compute, "_SpecularStrength", data.specularStrength);
                         context.cmd.SetComputeFloatParam(data.compute, "_DiffuseWrap", data.diffuseWrap);
+
+                        // Shadow Tint Settings
+                        context.cmd.SetComputeIntParam(data.compute, "_ShadowTintMode", data.shadowTintMode);
+                        context.cmd.SetComputeVectorParam(data.compute, "_ShadowTintColor", data.shadowTintColor);
+                        context.cmd.SetComputeFloatParam(data.compute, "_ShadowTintIntensity", data.shadowTintIntensity);
+                        context.cmd.SetComputeFloatParam(data.compute, "_ShadowThreshold", data.shadowThreshold);
                         
                         // SH
                         context.cmd.SetComputeVectorArrayParam(data.compute, "_SHAr", data.shAr);

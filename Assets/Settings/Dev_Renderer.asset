@@ -94,16 +94,22 @@ MonoBehaviour:
       serializedVersion: 2
       m_Bits: 4294967295
     lightingComputeShader: {fileID: 7200000, guid: 882c8abbaf1e64165a0ab4587a14e525, type: 3}
-    lightingModel: 0
-    resolutionScale: 2
-    enableSSS: 1
+    lightingModel: 1
+    resolutionScale: 4
+    enableSSS: 0
+    specularStrength: 0.5
+    diffuseWrap: 0.5
+    shadowTintMode: 1
+    shadowTintColor: {r: 0.1176471, g: 0.5647059, b: 1, a: 1}
+    shadowTintIntensity: 0.75
+    shadowThreshold: 0.785
     enableSSR: 1
     ssrMaxSteps: 64
     ssrStepSize: 0.1
     ssrThickness: 0.1
     enableSSAO: 1
     ssaoRadius: 0.5
-    ssaoIntensity: 0.25
+    ssaoIntensity: 1
     ssaoSampleCount: 16
     enableSSGI: 1
     ssgiIntensity: 0.25

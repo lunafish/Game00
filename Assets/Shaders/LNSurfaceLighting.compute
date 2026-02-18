@@ -68,6 +68,12 @@ int _LightingModel; // 조명 모델 선택 (0: HalfLambert, 1: DisneyBRDF)
 float _SpecularStrength;
 float _DiffuseWrap;
 
+// Shadow Tint Settings
+int _ShadowTintMode; // 0: Custom, 1: Complementary
+float4 _ShadowTintColor;
+float _ShadowTintIntensity;
+float _ShadowThreshold; // 0.0 ~ 1.0
+
 // 화면 공간 반사(SSR) 설정
 float _EnableSSR;      // SSR 활성화 여부
 int _SSR_MaxSteps;     // 최대 레이마칭 단계
@@ -111,6 +117,47 @@ float3 DecodeNormal(float2 f)
     float t = saturate(-n.z);
     n.xy += n.xy >= 0.0 ? -t : t;
     return normalize(n);
+}
+
+// --- Color Utility Functions (HSV) ---
+float3 RGBtoHSV(float3 c)
+{
+    float4 K = float4(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);
+    float4 p = lerp(float4(c.bg, K.wz), float4(c.gb, K.xy), step(c.b, c.g));
+    float4 q = lerp(float4(p.xyw, c.r), float4(c.r, p.yzx), step(p.x, c.r));
+
+    float d = q.x - min(q.w, q.y);
+    float e = 1.0e-10;
+    return float3(abs(q.z + (q.w - q.y) / (6.0 * d + e)), d / (q.x + e), q.x);
+}
+
+float3 HSVtoRGB(float3 c)
+{
+    float4 K = float4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+    float3 p = abs(frac(c.xxx + K.xyz) * 6.0 - K.www);
+    return c.z * lerp(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
+}
+
+float3 GetShadowColor(float3 lightColor)
+{
+    if (_ShadowTintMode == 0) // Custom
+    {
+        return _ShadowTintColor.rgb;
+    }
+    else // Complementary (HSV Hue Shift)
+    {
+        float3 hsv = RGBtoHSV(lightColor);
+        hsv.x = frac(hsv.x + 0.5); // 180도 회전
+        
+        float saturationFactor = 0.7;
+        // 보색의 채도를 주광원 채도의 70%로 낮춤 (최소값 0.1 보장)
+        hsv.y = max(hsv.y * saturationFactor, 0.1); 
+        
+        // 명도(Value)도 채도가 빠지는 만큼 어둡게 (70% 수준)
+        hsv.z *= saturationFactor;
+        
+        return HSVtoRGB(hsv);
+    }
 }
 
 // --- Disney BRDF 유틸리티 함수 ---
@@ -829,11 +876,36 @@ void CSMain (uint3 id : SV_DispatchThreadID)
         // Diffuse Wrap (확산광이 반대편까지 부드럽게 감싸는 효과)
         float rawNdotL = dot(normalWS, lightDir);
         float NdotL = saturate((rawNdotL + diffuseWrap) / (1.0 + diffuseWrap));
+        
+        // --- Stylized Shadow Tint 적용 ---
+        float3 shadowTintCol = GetShadowColor(lightColor);
+        
+        // 그림자 강도 (NdotL과 Attenuation을 모두 고려)
+        // NdotL이 낮거나(어두운 면) Atten이 낮으면(그림자) 0에 가까워짐
+        // diffuseWrap을 고려하여 마스크 생성
+        float shadowMask = (rawNdotL + diffuseWrap) / (1.0 + diffuseWrap);
+        shadowMask *= atten; // 그림자(Atten)가 있는 곳도 어둡게 처리
+        
+        // 0~1 범위로 부드럽게 매핑 (ShadowThreshold 적용)
+        // _ShadowThreshold가 0.5일 때 기본 범위 (0.0 ~ 0.5)
+        // _ShadowThreshold가 1.0일 때 주광 최대 범위 (-0.5 ~ 0.0)
+        // _ShadowThreshold가 0.0일 때 그림자 최대 범위 (0.5 ~ 1.0)
+        float minThreshold = 0.5 - _ShadowThreshold;
+        float maxThreshold = 1.0 - _ShadowThreshold;
+        float tintFactor = smoothstep(minThreshold, maxThreshold, shadowMask);
+        
+        // 밝은 부분은 원래 빛 색상, 어두운 부분은 틴트 색상으로 보간
+        float3 litColor = lightColor * atten;
+        float3 shadowColor = shadowTintCol * _ShadowTintIntensity;
+        
+        // 단순 RGB Lerp로 복구
+        float3 mixedLightColor = lerp(shadowColor, litColor, tintFactor);
 
         if (_LightingModel == 0) // Half Lambert (카툰/회화적 연출)
         {
-            float halfLambert = rawNdotL * (1.0 - diffuseWrap) + diffuseWrap;
-            totalDiffuse += albedo * halfLambert * lightColor * atten;
+            // Half Lambert는 이미 NdotL을 변형하므로, 여기서는 Tint된 LightColor를 사용
+            float halfLambert = rawNdotL * 0.5 + 0.5;
+            totalDiffuse += albedo * halfLambert * mixedLightColor;
         }
         else // Disney BRDF (물리 기반 셰이딩)
         {
@@ -858,10 +930,15 @@ void CSMain (uint3 id : SV_DispatchThreadID)
             float ssDiffuse = 1.25 * (FSS * (1.0 / (NdotL + NdotV + 0.0001) - 0.5) + 0.5);
 
             float finalDiffuseFactor = lerp(baseDiffuse, ssDiffuse, subsurface);
-            float3 diffuseTerm = albedo * finalDiffuseFactor * NdotL * lightColor * atten;
+            
+            // Diffuse Term에 mixedLightColor 적용 (NdotL은 mixedLightColor의 그라데이션에 이미 반영됨)
+            // 하지만 물리 기반 느낌을 살리기 위해 NdotL을 한번 더 곱해주는 것이 자연스러울 수 있음
+            // 여기서는 Stylized 느낌을 위해 NdotL을 직접 곱하지 않고 mixedLightColor에 의존
+            float3 diffuseTerm = albedo * finalDiffuseFactor * mixedLightColor; 
+            
             totalDiffuse += diffuseTerm * (1.0 - metallic);
             
-            // Specular (GTR2/GGX 기반)
+            // Specular (GTR2/GGX 기반) - 스펙큘러는 광원 색상을 그대로 따라야 함 (Tint 제외)
             float D = Local_GTR2(NdotH, alpha);
             float3 F0 = lerp(0.08 * specularStrength * float3(1,1,1), albedo, metallic);
             float FH = Local_SchlickFresnel(LdotH);
@@ -898,6 +975,14 @@ void CSMain (uint3 id : SV_DispatchThreadID)
     // 주변광 (Ambient / SH) 계산
     float3 ambientColor = SampleSH(normalWS) * albedo * (1.0 - metallic);
 
+    // --- SSGI 적용 (간접광) ---
+    if (_EnableSSGI > 0.5)
+    {
+        // Half-Res SSGI 텍스처를 Full-Res UV로 샘플링 (Linear Interpolation)
+        float3 ssgi = _LNSurface_SSGI_Blurred.SampleLevel(painter_linear_clamp_sampler, uv, 0).rgb;
+        ambientColor += ssgi * albedo * _SSGI_Intensity * (1.0 - metallic);
+    }
+
     // --- SSAO 적용 (볼륨 차폐광) ---
     float ao = 1.0;
     if (_EnableSSAO > 0.5)
@@ -907,14 +992,6 @@ void CSMain (uint3 id : SV_DispatchThreadID)
         ao = saturate(1.0 - rawAO * _SSAO_Intensity);
     }
     ambientColor *= ao;
-    
-    // --- SSGI 적용 (간접광) ---
-    if (_EnableSSGI > 0.5)
-    {
-        // Half-Res SSGI 텍스처를 Full-Res UV로 샘플링 (Linear Interpolation)
-        float3 ssgi = _LNSurface_SSGI_Blurred.SampleLevel(painter_linear_clamp_sampler, uv, 0).rgb;
-        ambientColor += ssgi * albedo * _SSGI_Intensity * (1.0 - metallic);
-    }
 
     // --- 화면 공간 반사 (SSR) 적용 ---
     float3 reflectionColor = 0;

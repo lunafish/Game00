@@ -5,6 +5,7 @@
 #pragma kernel CS_SSR_Blur
 #pragma kernel CS_SSGI
 #pragma kernel CS_SSGI_Blur
+#pragma kernel CS_SSCS
 
 // 최종 결과를 저장할 렌더 타겟
 RWTexture2D<float4> _Result;
@@ -32,10 +33,13 @@ RWTexture2D<float4> _Result_SSGI; // SSGI 용 (HDR)
 Texture2D<float4> _SSGI_Raw;               // 블러 전 SSGI 소스
 Texture2D<float4> _LNSurface_SSGI_Blurred; // 블러 후 최종 SSGI
 
+RWTexture2D<float> _Result_SSCS; // SSCS 용 (R8) - 쓰기 전용
+Texture2D<float> _SSCS_Texture;  // SSCS 용 (R8) - 읽기 전용
+
 SamplerState painter_linear_clamp_sampler;
 
 // --- 전역 파라미터 ---
-float2 _ScreenParams;     // 화면 해상도 (각 커널에 맞는 해상도가 들어옴: CSMain은 Full, 나머지는 Half)
+float2 _LNSurface_ScreenParams;     // 화면 해상도 (이름 변경)
 float4 _MainLightDirection; // 메인 라이트 방향
 float4 _MainLightColor;     // 메인 라이트 색상 및 강도
 int _AdditionalLightCount;  // 추가 라이트 개수 (최대 16)
@@ -60,6 +64,10 @@ float4x4 _WorldToCameraMatrix;      // 월드 -> 뷰 변환
 float4x4 _ProjectionMatrix;         // 월드 -> 클립 변환
 int _LightingModel; // 조명 모델 선택 (0: HalfLambert, 1: DisneyBRDF)
 
+// Material Global Settings
+float _SpecularStrength;
+float _DiffuseWrap;
+
 // 화면 공간 반사(SSR) 설정
 float _EnableSSR;      // SSR 활성화 여부
 int _SSR_MaxSteps;     // 최대 레이마칭 단계
@@ -77,6 +85,13 @@ float _EnableSSGI;
 float _SSGI_Intensity;
 int _SSGI_SampleCount;
 float _SSGI_RayStepSize;
+
+// --- SSCS (Screen Space Cast Shadow) 설정 ---
+float _EnableSSCS;
+float _SSCS_Distance;
+int _SSCS_MaxSteps;
+float _SSCS_Thickness;
+float _SSCS_Intensity; // SSCS 강도 추가
 
 #ifndef PI
 #define PI 3.14159265359f
@@ -238,7 +253,7 @@ float CalculateSSAO(float3 posWS, float3 normalWS, uint2 pixId)
     for (int i = 0; i < samples; i++)
     {
         // 픽셀 좌표와 인덱스를 조합한 시드 생성
-        uint seedInput = pixId.y * uint(_ScreenParams.x) + pixId.x + uint(i);
+        uint seedInput = pixId.y * uint(_LNSurface_ScreenParams.x) + pixId.x + uint(i);
         float3 randVec = float3(
             Local_Hash(seedInput),
             Local_Hash(seedInput + 100),
@@ -353,17 +368,61 @@ bool Raymarch(float3 startPosVS, float3 rayDirVS, float stepSize, out float2 hit
     return false;
 }
 
+// --- SSCS Raymarching ---
+float RaymarchShadow(float3 startPosVS, float3 lightDirVS, float maxDist, uint2 pixId)
+{
+    float3 currentPosVS = startPosVS;
+    float stepSize = maxDist / (float)_SSCS_MaxSteps;
+    float shadow = 1.0;
+    
+    // Jittering: 픽셀마다 시작 위치를 랜덤하게 이동하여 Banding 완화
+    float dither = Local_Hash(pixId.y * uint(_LNSurface_ScreenParams.x) + pixId.x);
+    currentPosVS += lightDirVS * stepSize * dither;
+    
+    // Bias: Self-Shadowing 방지용 Depth Bias (0.02 -> 0.005로 감소)
+    float bias = 0.005; 
+
+    for (int i = 0; i < _SSCS_MaxSteps; i++)
+    {
+        currentPosVS += lightDirVS * stepSize;
+        
+        float3 screenPos = ProjectViewPos(currentPosVS);
+        if (screenPos.x < 0 || screenPos.x > 1 || screenPos.y < 0 || screenPos.y > 1)
+            break; // 화면 밖으로 나가면 그림자 없음 (빛)
+            
+        float frontDepth = _LNSurface_Front_Packed.SampleLevel(painter_linear_clamp_sampler, screenPos.xy, 0).b;
+        float backDepth = _LNSurface_Back_Packed.SampleLevel(painter_linear_clamp_sampler, screenPos.xy, 0).b;
+        float currentDepth = -currentPosVS.z;
+        
+        // Back Depth 유효성 체크
+        bool hasBackFace = (backDepth < 900.0);
+        float thickness = hasBackFace ? (backDepth - frontDepth) : _SSCS_Thickness;
+        thickness = max(thickness, _SSCS_Thickness);
+
+        // 레이가 물체 뒤로 들어갔는지 확인 (Occlusion)
+        // Bias를 적용하여 자기 자신의 표면 바로 뒤는 무시
+        if (currentDepth > frontDepth + bias && currentDepth < frontDepth + thickness)
+        {
+            shadow = 0.0; // 가려짐
+            break;
+        }
+    }
+    
+    // 강도 적용 (0: 완전 그림자, 1: 그림자 없음) -> lerp(1, shadow, intensity)
+    return lerp(1.0, shadow, _SSCS_Intensity);
+}
+
 // ------------------------------------------------
 // SSAO 전용 계산 커널 (Half-Res)
 // ------------------------------------------------
 [numthreads(8, 8, 1)]
 void CS_SSAO (uint3 id : SV_DispatchThreadID)
 {
-    if (id.x >= (uint)_ScreenParams.x || id.y >= (uint)_ScreenParams.y)
+    if (id.x >= (uint)_LNSurface_ScreenParams.x || id.y >= (uint)_LNSurface_ScreenParams.y)
         return;
 
     // Half-Res UV 계산
-    float2 uv = (float2(id.xy) + 0.5) / _ScreenParams;
+    float2 uv = (float2(id.xy) + 0.5) / _LNSurface_ScreenParams;
 
     // Full-Res GBuffer 샘플링
     float mask = _LNSurface_Front_Extra.SampleLevel(painter_linear_clamp_sampler, uv, 0).r;
@@ -388,10 +447,10 @@ void CS_SSAO (uint3 id : SV_DispatchThreadID)
 [numthreads(8, 8, 1)]
 void CS_SSAO_Blur (uint3 id : SV_DispatchThreadID)
 {
-    if (id.x >= (uint)_ScreenParams.x || id.y >= (uint)_ScreenParams.y)
+    if (id.x >= (uint)_LNSurface_ScreenParams.x || id.y >= (uint)_LNSurface_ScreenParams.y)
         return;
 
-    float2 uv = (float2(id.xy) + 0.5) / _ScreenParams;
+    float2 uv = (float2(id.xy) + 0.5) / _LNSurface_ScreenParams;
     float centerDepth = _LNSurface_Front_Packed.SampleLevel(painter_linear_clamp_sampler, uv, 0).b;
     float totalAO = 0;
     float totalWeight = 0;
@@ -405,11 +464,11 @@ void CS_SSAO_Blur (uint3 id : SV_DispatchThreadID)
         for (int y = -radius; y <= radius; y++)
         {
             uint2 sampleId = uint2(
-                clamp(id.x + x, 0, (uint)_ScreenParams.x - 1),
-                clamp(id.y + y, 0, (uint)_ScreenParams.y - 1)
+                clamp(id.x + x, 0, (uint)_LNSurface_ScreenParams.x - 1),
+                clamp(id.y + y, 0, (uint)_LNSurface_ScreenParams.y - 1)
             );
             
-            float2 sampleUV = (float2(sampleId) + 0.5) / _ScreenParams;
+            float2 sampleUV = (float2(sampleId) + 0.5) / _LNSurface_ScreenParams;
 
             float sampleAO = _AO_Raw[sampleId].r;
             float sampleDepth = _LNSurface_Front_Packed.SampleLevel(painter_linear_clamp_sampler, sampleUV, 0).b;
@@ -436,10 +495,10 @@ void CS_SSAO_Blur (uint3 id : SV_DispatchThreadID)
 [numthreads(8, 8, 1)]
 void CS_SSGI (uint3 id : SV_DispatchThreadID)
 {
-    if (id.x >= (uint)_ScreenParams.x || id.y >= (uint)_ScreenParams.y)
+    if (id.x >= (uint)_LNSurface_ScreenParams.x || id.y >= (uint)_LNSurface_ScreenParams.y)
         return;
 
-    float2 uv = (float2(id.xy) + 0.5) / _ScreenParams;
+    float2 uv = (float2(id.xy) + 0.5) / _LNSurface_ScreenParams;
 
     float mask = _LNSurface_Front_Extra.SampleLevel(painter_linear_clamp_sampler, uv, 0).r;
     if (mask <= 0.001)
@@ -459,7 +518,7 @@ void CS_SSGI (uint3 id : SV_DispatchThreadID)
     
     for(int i=0; i<samples; i++)
     {
-        uint seed = id.y * uint(_ScreenParams.x) + id.x + uint(i * 152);
+        uint seed = id.y * uint(_LNSurface_ScreenParams.x) + id.x + uint(i * 152);
         float3 rayDirVS = GetCosineHemisphereDir(normalVS, seed);
         
         float2 hitUV;
@@ -481,10 +540,10 @@ void CS_SSGI (uint3 id : SV_DispatchThreadID)
 [numthreads(8, 8, 1)]
 void CS_SSGI_Blur (uint3 id : SV_DispatchThreadID)
 {
-    if (id.x >= (uint)_ScreenParams.x || id.y >= (uint)_ScreenParams.y)
+    if (id.x >= (uint)_LNSurface_ScreenParams.x || id.y >= (uint)_LNSurface_ScreenParams.y)
         return;
 
-    float2 uv = (float2(id.xy) + 0.5) / _ScreenParams;
+    float2 uv = (float2(id.xy) + 0.5) / _LNSurface_ScreenParams;
     float centerDepth = _LNSurface_Front_Packed.SampleLevel(painter_linear_clamp_sampler, uv, 0).b;
     float3 totalColor = 0;
     float totalWeight = 0;
@@ -497,11 +556,11 @@ void CS_SSGI_Blur (uint3 id : SV_DispatchThreadID)
         for (int y = -radius; y <= radius; y++)
         {
             uint2 sampleId = uint2(
-                clamp(id.x + x, 0, (uint)_ScreenParams.x - 1),
-                clamp(id.y + y, 0, (uint)_ScreenParams.y - 1)
+                clamp(id.x + x, 0, (uint)_LNSurface_ScreenParams.x - 1),
+                clamp(id.y + y, 0, (uint)_LNSurface_ScreenParams.y - 1)
             );
             
-            float2 sampleUV = (float2(sampleId) + 0.5) / _ScreenParams;
+            float2 sampleUV = (float2(sampleId) + 0.5) / _LNSurface_ScreenParams;
 
             float3 sampleColor = _SSGI_Raw[sampleId].rgb;
             float sampleDepth = _LNSurface_Front_Packed.SampleLevel(painter_linear_clamp_sampler, sampleUV, 0).b;
@@ -520,15 +579,44 @@ void CS_SSGI_Blur (uint3 id : SV_DispatchThreadID)
 }
 
 // ------------------------------------------------
+// SSCS 전용 계산 커널 (Full-Res 권장, 여기선 Half-Res로 구현)
+// ------------------------------------------------
+[numthreads(8, 8, 1)]
+void CS_SSCS (uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_LNSurface_ScreenParams.x || id.y >= (uint)_LNSurface_ScreenParams.y)
+        return;
+
+    float2 uv = (float2(id.xy) + 0.5) / _LNSurface_ScreenParams;
+    float mask = _LNSurface_Front_Extra.SampleLevel(painter_linear_clamp_sampler, uv, 0).r;
+    
+    if (mask <= 0.001)
+    {
+        _Result_SSCS[id.xy] = 1.0; // No shadow
+        return;
+    }
+
+    float fDepth = _LNSurface_Front_Packed.SampleLevel(painter_linear_clamp_sampler, uv, 0).b;
+    float3 viewPos = GetViewSpacePos(uv, fDepth);
+    
+    // Light Direction in View Space
+    float3 lightDirVS = mul((float3x3)_WorldToCameraMatrix, normalize(_MainLightDirection.xyz));
+    
+    float shadow = RaymarchShadow(viewPos, lightDirVS, _SSCS_Distance, id.xy);
+    
+    _Result_SSCS[id.xy] = shadow;
+}
+
+// ------------------------------------------------
 // SSR 전용 연산 커널 (Half-Res)
 // ------------------------------------------------
 [numthreads(8, 8, 1)]
 void CS_SSR (uint3 id : SV_DispatchThreadID)
 {
-    if (id.x >= (uint)_ScreenParams.x || id.y >= (uint)_ScreenParams.y)
+    if (id.x >= (uint)_LNSurface_ScreenParams.x || id.y >= (uint)_LNSurface_ScreenParams.y)
         return;
 
-    float2 uv = (float2(id.xy) + 0.5) / _ScreenParams;
+    float2 uv = (float2(id.xy) + 0.5) / _LNSurface_ScreenParams;
 
     float smoothness = _LNSurface_Front_Extra.SampleLevel(painter_linear_clamp_sampler, uv, 0).b;
     float3 normalWS = DecodeNormal(_LNSurface_Front_Packed.SampleLevel(painter_linear_clamp_sampler, uv, 0).rg);
@@ -547,7 +635,7 @@ void CS_SSR (uint3 id : SV_DispatchThreadID)
         float roughness = saturate(1.0 - smoothness);
         if (roughness > 0.01)
         {
-            uint seed = id.y * uint(_ScreenParams.x) + id.x;
+            uint seed = id.y * uint(_LNSurface_ScreenParams.x) + id.x;
             float3 jitter = float3(
                 Local_Hash(seed) * 2.0 - 1.0,
                 Local_Hash(seed + 100) * 2.0 - 1.0,
@@ -591,10 +679,10 @@ void CS_SSR (uint3 id : SV_DispatchThreadID)
 [numthreads(8, 8, 1)]
 void CS_SSR_Blur (uint3 id : SV_DispatchThreadID)
 {
-    if (id.x >= (uint)_ScreenParams.x || id.y >= (uint)_ScreenParams.y)
+    if (id.x >= (uint)_LNSurface_ScreenParams.x || id.y >= (uint)_LNSurface_ScreenParams.y)
         return;
 
-    float2 uv = (float2(id.xy) + 0.5) / _ScreenParams;
+    float2 uv = (float2(id.xy) + 0.5) / _LNSurface_ScreenParams;
     float centerDepth = _LNSurface_Front_Packed.SampleLevel(painter_linear_clamp_sampler, uv, 0).b;
     float3 centerCol = _SSR_Raw[id.xy].rgb;
     float smoothness = _LNSurface_Front_Extra.SampleLevel(painter_linear_clamp_sampler, uv, 0).b;
@@ -613,8 +701,8 @@ void CS_SSR_Blur (uint3 id : SV_DispatchThreadID)
     {
         for (int y = -radius; y <= radius; y++)
         {
-            uint2 sampleId = uint2(clamp(id.x + x, 0, _ScreenParams.x - 1), clamp(id.y + y, 0, _ScreenParams.y - 1));
-            float2 sampleUV = (float2(sampleId) + 0.5) / _ScreenParams;
+            uint2 sampleId = uint2(clamp(id.x + x, 0, _LNSurface_ScreenParams.x - 1), clamp(id.y + y, 0, _LNSurface_ScreenParams.y - 1));
+            float2 sampleUV = (float2(sampleId) + 0.5) / _LNSurface_ScreenParams;
 
             float3 sampleCol = _SSR_Raw[sampleId].rgb;
             float sampleDepth = _LNSurface_Front_Packed.SampleLevel(painter_linear_clamp_sampler, sampleUV, 0).b;
@@ -639,7 +727,7 @@ void CS_SSR_Blur (uint3 id : SV_DispatchThreadID)
 void CSMain (uint3 id : SV_DispatchThreadID)
 {
     // 화면 범위를 벗어나는 스레드 제외
-    if (id.x >= (uint)_ScreenParams.x || id.y >= (uint)_ScreenParams.y)
+    if (id.x >= (uint)_LNSurface_ScreenParams.x || id.y >= (uint)_LNSurface_ScreenParams.y)
         return;
 
     // 1. GBuffer 데이터 읽기 및 압축 해제
@@ -675,14 +763,14 @@ void CSMain (uint3 id : SV_DispatchThreadID)
     float sssThickness = (packedB - floor(packedB / 16.0) * 16.0) / 15.0 * 100.0; // 0~100 범위로 복원
     
     // Specular Strength, DiffuseWrap 등은 현재 Extra 텍스처에서 제거됨 (필요 시 복구 또는 상수 처리)
-    float specularStrength = 1.0; // Default
-    float diffuseWrap = 0.25; // Default
+    float specularStrength = _SpecularStrength; // Global Setting
+    float diffuseWrap = _DiffuseWrap; // Global Setting
     
     // Normal 복원
     float3 normalWS = DecodeNormal(gbufferPacked.rg);
     
     // 2. 월드 공간 좌표 재구성
-    float2 uv = (float2(id.xy) + 0.5) / _ScreenParams;
+    float2 uv = (float2(id.xy) + 0.5) / _LNSurface_ScreenParams;
     float linearDepth = gbufferPacked.b;
     
     float3 viewPos = GetViewSpacePos(uv, linearDepth);
@@ -695,6 +783,13 @@ void CSMain (uint3 id : SV_DispatchThreadID)
     float3 totalDiffuse = 0;
     float3 totalSpecular = 0;
     float3 totalSSS = 0;
+    
+    // SSCS 적용 (Contact Shadow)
+    if (_EnableSSCS > 0.5)
+    {
+        float sscs = _SSCS_Texture.SampleLevel(painter_linear_clamp_sampler, uv, 0).r;
+        shadow = min(shadow, sscs);
+    }
 
     // 3. 조명 루프 (메인 라이트 + 추가 라이트)
     uint lightLoopCount = (uint)(_AdditionalLightCount + 1);
@@ -715,9 +810,20 @@ void CSMain (uint3 id : SV_DispatchThreadID)
             uint lightIdx = i - 1;
             float3 lightPos = _AdditionalLightPositions[lightIdx].xyz;
             float3 lightToPos = lightPos - worldPos;
+            float distToLight = length(lightToPos); // 거리 계산
             lightDir = normalize(lightToPos);
             atten = GetDistanceAttenuation(lightToPos, _AdditionalLightAttenuations[lightIdx]);
             lightColor = _AdditionalLightColors[lightIdx].rgb;
+            
+            // SSCS 적용 (추가 라이트)
+            if (_EnableSSCS > 0.5)
+            {
+                float3 lightDirVS = mul((float3x3)_WorldToCameraMatrix, lightDir);
+                // 광원까지의 거리와 설정된 최대 거리 중 작은 값을 사용
+                float rayDist = min(_SSCS_Distance, distToLight);
+                float sscs = RaymarchShadow(viewPos, lightDirVS, rayDist, id.xy);
+                atten *= sscs;
+            }
         }
 
         // Diffuse Wrap (확산광이 반대편까지 부드럽게 감싸는 효과)

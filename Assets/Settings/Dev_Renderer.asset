@@ -94,8 +94,8 @@ MonoBehaviour:
       serializedVersion: 2
       m_Bits: 4294967295
     lightingComputeShader: {fileID: 7200000, guid: 882c8abbaf1e64165a0ab4587a14e525, type: 3}
-    lightingModel: 1
-    resolutionScale: 4
+    lightingModel: 0
+    resolutionScale: 2
     enableSSS: 1
     enableSSR: 1
     ssrMaxSteps: 64
@@ -109,6 +109,11 @@ MonoBehaviour:
     ssgiIntensity: 0.25
     ssgiSampleCount: 4
     ssgiRayStepSize: 0.1
+    enableSSCS: 1
+    sscsDistance: 1
+    sscsMaxSteps: 16
+    sscsThickness: 0.1
+    sscsIntensity: 0.1
     renderPassEvent: 500
 --- !u!114 &8311532915064548623
 MonoBehaviour:

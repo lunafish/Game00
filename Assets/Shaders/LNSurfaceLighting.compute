@@ -573,7 +573,15 @@ void CS_SSGI (uint3 id : SV_DispatchThreadID)
         
         if(Raymarch(viewPos, rayDirVS, _SSGI_RayStepSize, hitUV, hitBack))
         {
-            float3 hitColor = _SceneColor.SampleLevel(painter_linear_clamp_sampler, hitUV, 0).rgb;
+            float3 hitColor;
+            if (hitBack)
+            {
+                hitColor = _LNSurface_Back_Color.SampleLevel(painter_linear_clamp_sampler, hitUV, 0).rgb;
+            }
+            else
+            {
+                hitColor = _SceneColor.SampleLevel(painter_linear_clamp_sampler, hitUV, 0).rgb;
+            }
             indirectLight += hitColor;
         }
     }

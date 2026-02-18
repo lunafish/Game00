@@ -239,7 +239,8 @@ public class LNSurfaceFeature : ScriptableRendererFeature
             TextureHandle frontExtra2 = UniversalRenderer.CreateRenderGraphTexture(renderGraph, extraDesc, "LNSurface_Front_Extra2", false);
 
             // Back Pass Textures (Full Res)
-            TextureHandle backColor = UniversalRenderer.CreateRenderGraphTexture(renderGraph, desc, "LNSurface_Back_Color", false);
+            // [Optimization] Enable auto-clear (clear: true) to remove explicit clear pass
+            TextureHandle backColor = UniversalRenderer.CreateRenderGraphTexture(renderGraph, desc, "LNSurface_Back_Color", true);
             TextureHandle backPacked = UniversalRenderer.CreateRenderGraphTexture(renderGraph, packedDesc, "LNSurface_Back_Packed", false);
 
             // SSAO Textures (Scaled Res, R8)
@@ -270,7 +271,7 @@ public class LNSurfaceFeature : ScriptableRendererFeature
             RenderGBufferFront(renderGraph, frameData, "Front", "LNSurface_Front", frontColor, frontPacked, frontExtra, frontExtra2);
 
             // 3. Back Pass (Only if SSS is enabled)
-            if (_settings.enableSSS || _settings.enableSSR || _settings.enableSSCS)
+            if (_settings.enableSSS || _settings.enableSSR || _settings.enableSSCS || _settings.enableSSGI)
             {
                 RenderGBufferBack(renderGraph, frameData, "Back", "LNSurface_Back", backColor, backPacked);
             }
@@ -460,6 +461,7 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                     passData.frontPacked = frontPacked;
                     passData.frontExtra = frontExtra; // Mask
                     passData.backPacked = backPacked; // Needed for Raymarch
+                    passData.backColor = backColor; // Added
                     passData.sceneColor = resourceData.activeColorTexture;
                     passData.result = ssgiRaw;
 
@@ -467,6 +469,7 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                     builder.UseTexture(passData.frontPacked);
                     builder.UseTexture(passData.frontExtra);
                     builder.UseTexture(passData.backPacked);
+                    builder.UseTexture(passData.backColor); // Added
                     builder.UseTexture(passData.sceneColor);
                     builder.UseTexture(passData.result, AccessFlags.Write);
 
@@ -485,6 +488,7 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Front_Packed", data.frontPacked);
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Front_Extra", data.frontExtra);
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Back_Packed", data.backPacked); 
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Back_Color", data.backColor); // Added
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_SceneColor", data.sceneColor);
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_Result_SSGI", data.result);
 
@@ -882,11 +886,24 @@ public class LNSurfaceFeature : ScriptableRendererFeature
             UniversalRenderingData renderingData = frameData.Get<UniversalRenderingData>();
             UniversalCameraData cameraData = frameData.Get<UniversalCameraData>();
             
+            // [Removed] 1. Clear Back Color (Black) - Handled by CreateRenderGraphTexture(clear: true)
+
+            // [Kept] 2. Clear Back Packed (Depth=1000)
+            using (var builder = renderGraph.AddRasterRenderPass<GBufferPassData>($"Clear {name} Packed", out var passData))
+            {
+                builder.SetRenderAttachment(packed, 0, AccessFlags.Write);
+                builder.SetRenderFunc((GBufferPassData data, RasterGraphContext context) =>
+                {
+                    context.cmd.ClearRenderTarget(false, true, new Color(0, 0, 1000.0f, 0));
+                });
+            }
+
+            // [Kept] 3. Render Pass (No Clear)
             using (var builder = renderGraph.AddRasterRenderPass<GBufferPassData>($"LNSurface GBuffer {name} Pass", out var passData))
             {
                 builder.SetRenderAttachment(color, 0);
                 builder.SetRenderAttachment(packed, 1);
-                builder.SetRenderAttachmentDepth(resourceData.activeDepthTexture, AccessFlags.Write);
+                builder.SetRenderAttachmentDepth(resourceData.activeDepthTexture, AccessFlags.Read); // Read Only
                 
                 passData.packedTexture = packed;
 
@@ -896,14 +913,10 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                 passData.rendererList = renderGraph.CreateRendererList(rendererListParams);
                 
                 builder.UseRendererList(passData.rendererList);
-                // builder.UseTexture(passData.packedTexture, AccessFlags.Write); // Removed to fix ArgumentException
 
                 builder.SetRenderFunc((GBufferPassData data, RasterGraphContext context) =>
                 {
-                    // Clear Back Packed Texture with High Depth Value (e.g., 1000 in Blue channel)
-                    // R: Normal X, G: Normal Y, B: Depth, A: Unused
-                    context.cmd.ClearRenderTarget(false, true, new Color(0, 0, 1000.0f, 0)); 
-
+                    // No Clear Here
                     context.cmd.DrawRendererList(data.rendererList);
                 });
             }

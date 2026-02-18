@@ -100,9 +100,9 @@ MonoBehaviour:
     specularStrength: 0.5
     diffuseWrap: 0.5
     shadowTintMode: 1
-    shadowTintColor: {r: 0.1176471, g: 0.5647059, b: 1, a: 1}
-    shadowTintIntensity: 0.75
-    shadowThreshold: 0.785
+    shadowTintColor: {r: 0.3921569, g: 0.5843138, b: 0.9294118, a: 1}
+    shadowTintIntensity: 0.5
+    shadowThreshold: 0.75
     enableSSR: 1
     ssrMaxSteps: 64
     ssrStepSize: 0.1

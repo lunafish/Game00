@@ -96,12 +96,12 @@ MonoBehaviour:
     lightingComputeShader: {fileID: 7200000, guid: 882c8abbaf1e64165a0ab4587a14e525, type: 3}
     lightingModel: 1
     resolutionScale: 4
-    enableSSS: 0
+    enableSSS: 1
     specularStrength: 0.5
     diffuseWrap: 0.5
     shadowTintMode: 1
     shadowTintColor: {r: 0.3921569, g: 0.5843138, b: 0.9294118, a: 1}
-    shadowTintIntensity: 0.5
+    shadowTintIntensity: 0.25
     shadowThreshold: 0.75
     enableSSR: 1
     ssrMaxSteps: 64
@@ -113,13 +113,13 @@ MonoBehaviour:
     ssaoSampleCount: 16
     enableSSGI: 1
     ssgiIntensity: 0.25
-    ssgiSampleCount: 4
+    ssgiSampleCount: 8
     ssgiRayStepSize: 0.1
     enableSSCS: 1
     sscsDistance: 1
     sscsMaxSteps: 16
     sscsThickness: 0.1
-    sscsIntensity: 0.1
+    sscsIntensity: 0.125
     renderPassEvent: 500
 --- !u!114 &8311532915064548623
 MonoBehaviour:

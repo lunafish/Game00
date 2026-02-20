@@ -907,7 +907,7 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                 
                 passData.packedTexture = packed;
 
-                DrawingSettings drawSettings = new DrawingSettings(new ShaderTagId(lightMode), new SortingSettings(cameraData.camera) { criteria = SortingCriteria.CommonOpaque });
+                DrawingSettings drawSettings = new DrawingSettings(new ShaderTagId(lightMode), new SortingSettings(cameraData.camera) { criteria = SortingCriteria.BackToFront });
                 
                 var rendererListParams = new RendererListParams(renderingData.cullResults, drawSettings, _filteringSettings);
                 passData.rendererList = renderGraph.CreateRendererList(rendererListParams);

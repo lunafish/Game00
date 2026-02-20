@@ -109,11 +109,11 @@ Material:
     - _Parallax: 0.005
     - _QueueOffset: 0
     - _ReceiveShadows: 1
-    - _SSSIntensity: 1
+    - _SSSIntensity: 2
     - _SSSMask: 1
     - _SSSThickness: 10
     - _ShadowStrength: 0.5
-    - _Smoothness: 0.5
+    - _Smoothness: 0.777
     - _SmoothnessTextureChannel: 0
     - _SpecularHighlights: 1
     - _SrcBlend: 1

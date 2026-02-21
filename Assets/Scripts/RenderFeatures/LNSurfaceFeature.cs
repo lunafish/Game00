@@ -928,7 +928,7 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                     }
                     else
                     {
-                        passDataLighting.ssrTexture = frontColor; // Dummy
+                        passDataLighting.ssrTexture = ssrBlurred; // Dummy with UAV support
                     }
 
                     // SSGI Texture Binding Logic
@@ -1038,7 +1038,7 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                     builder.UseTexture(passDataLighting.ssaoTexture);
                     builder.UseTexture(passDataLighting.ssrTexture);
                     builder.UseTexture(passDataLighting.ssgiTexture);
-                    if (passData.hizPyramid.IsValid()) builder.UseTexture(passData.hizPyramid); // Added
+                    if (passDataLighting.hizPyramid.IsValid()) builder.UseTexture(passDataLighting.hizPyramid); // Added
 
                     builder.SetRenderFunc((ComputePassData data, ComputeGraphContext context) =>
                     {

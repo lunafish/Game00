@@ -376,73 +376,104 @@ bool Raymarch(float3 startPosVS, float3 rayDirVS, float stepSize, out float2 hit
 {
     float3 rayPosVS = startPosVS;
     hitBack = false;
-    hitUV = float3(0, 0, 0).xy; // explicit float2 init to be safe
+    hitUV = float3(0, 0, 0).xy; 
 
     float currentMip = 0.0;
     float maxDistance = 200.0; 
     float traveled = 0.0;
 
-    // View-space ray setup
     float3 rayDir = normalize(rayDirVS);
     
-    // Bias to prevent self-intersection
+    // Bias: 시작 위치를 표면에서 살짝 띄움
     rayPosVS += rayDir * 0.05;
+
+    // 이전 스텝 위치 저장용 (Binary Search를 위해)
+    float3 prevRayPosVS = rayPosVS;
 
     [loop]
     for (int i = 0; i < _SSR_MaxSteps; i++)
     {
+        // prevRayPosVS = rayPosVS; // <-- 여기가 아니라 이동 직전에 저장해야 함
+
         float3 screenPos = ProjectViewPos(rayPosVS);
         
-        // Out of screen bounds check
         if (screenPos.x < 0.0 || screenPos.x > 1.0 || screenPos.y < 0.0 || screenPos.y > 1.0)
             return false;
 
-        // Sample Hierarchical Z-Buffer (Min Linear Depth)
         float frontDepth = _HiZ_Pyramid.SampleLevel(painter_point_clamp_sampler, screenPos.xy, currentMip).r;
         float rayDepth = -rayPosVS.z;
 
+        // Hi-Z Traversal
         if (rayDepth < frontDepth - 0.01) 
         {
-            // Ray is in front of the surface (Empty Space)
-            // Increase mip level and jump
+            // 빈 공간: 밉맵 레벨을 높여서 크게 점프
             float jumpMultiplier = pow(2.0, floor(currentMip));
             float jump = stepSize * jumpMultiplier;
             
+            prevRayPosVS = rayPosVS; // <-- 이동 직전 위치 저장!
             rayPosVS += rayDir * jump;
             traveled += jump;
             currentMip = min((float)_HiZ_MaxMip, currentMip + 1.0);
         }
         else
         {
-            // Potential hit or occlusion
+            // 충돌 가능성 있음
             if (currentMip <= 0.5)
             {
-                // Mip 0: Detailed Volume Check
+                // Mip 0: 정밀 검사 (Binary Search 추가)
+                
+                // 1. Binary Search (Refinement)
+                // 레이가 표면을 뚫고 지나갔을 수 있으므로, 이전 위치와 현재 위치 사이를 이분 탐색
+                float3 start = prevRayPosVS;
+                float3 end = rayPosVS;
+                float3 mid = start;
+                
+                for(int j=0; j<4; j++) // 4번 정도 반복하면 충분히 정밀해짐
+                {
+                    mid = (start + end) * 0.5;
+                    float3 midScreenPos = ProjectViewPos(mid);
+                    float midDepth = _HiZ_Pyramid.SampleLevel(painter_point_clamp_sampler, midScreenPos.xy, 0).r;
+                    
+                    if (-mid.z > midDepth) // 여전히 표면 뒤에 있다면
+                        end = mid; // 범위를 앞쪽으로 좁힘
+                    else
+                        start = mid; // 표면 앞이라면 범위를 뒤쪽으로 좁힘
+                }
+                
+                rayPosVS = mid; // 보정된 위치 사용
+                screenPos = ProjectViewPos(rayPosVS);
+                frontDepth = _HiZ_Pyramid.SampleLevel(painter_point_clamp_sampler, screenPos.xy, 0).r;
+                rayDepth = -rayPosVS.z;
+
+                // 2. 최종 충돌 판정
                 float fDepth = frontDepth;
                 float bDepth = _LNSurface_Back_Packed.SampleLevel(painter_point_clamp_sampler, screenPos.xy, 0).b;
                 
                 bool hasBackFace = (bDepth > fDepth + 0.001) && (bDepth < 900.0);
                 float thickness = hasBackFace ? (bDepth - fDepth) : _SSR_Thickness;
                 
-                // Adaptive thickness to prevent skipping thin objects at distance
-                float adaptiveThickness = max(_SSR_Thickness, traveled * 0.01);
-                thickness = max(thickness, adaptiveThickness * 0.5);
+                float adaptiveThickness = max(_SSR_Thickness, traveled * 0.005); // 계수 감소 (0.01 -> 0.005)
+                thickness = max(thickness, adaptiveThickness);
 
-                if (rayDepth >= fDepth - 0.02 && rayDepth <= fDepth + thickness)
+                // 충돌 허용 오차 완화 (-0.02 -> -0.05)
+                if (rayDepth >= fDepth - 0.05 && rayDepth <= fDepth + thickness)
                 {
                     hitUV = screenPos.xy;
                     hitBack = hasBackFace && (abs(rayDepth - bDepth) < abs(rayDepth - fDepth));
                     return true;
                 }
                 
-                // Behind the volume
-                rayPosVS += rayDir * stepSize;
+                // 충돌이 아니라면 다시 전진 (Binary Search로 위치가 뒤로 갔을 수 있으므로 주의)
+                // 여기서 루프가 꼬이지 않도록 강제로 조금 전진시킴
+                prevRayPosVS = rayPosVS; // <-- 이동 직전 위치 저장!
+                rayPosVS += rayDir * stepSize; 
                 traveled += stepSize;
             }
             else
             {
-                // Refine by decreasing mip level
+                // 더 낮은 밉맵 레벨로 내려가서 다시 검사
                 currentMip = max(0.0, currentMip - 1.0);
+                // 위치는 되돌리지 않음 (Hi-Z 특성상 현재 셀 안에 표면이 있을 수 있음)
             }
         }
 

@@ -104,22 +104,24 @@ MonoBehaviour:
     shadowTintIntensity: 0.25
     shadowThreshold: 0.75
     enableSSR: 1
-    ssrMaxSteps: 64
-    ssrStepSize: 0.1
+    ssrMaxSteps: 8
+    ssrStepSize: 0.4
     ssrThickness: 0.1
     enableSSAO: 1
     ssaoRadius: 0.5
     ssaoIntensity: 1
     ssaoSampleCount: 16
     enableSSGI: 1
-    ssgiIntensity: 0.2
-    ssgiSampleCount: 8
-    ssgiRayStepSize: 0.1
+    ssgiIntensity: 0.34
+    ssgiSampleCount: 16
+    ssgiRayStepSize: 0.4
     enableSSCS: 1
     sscsDistance: 1
     sscsMaxSteps: 16
     sscsThickness: 0.1
-    sscsIntensity: 0.1
+    sscsIntensity: 0.34
+    enableCheckerboard: 1
+    debugMode: 0
     renderPassEvent: 500
 --- !u!114 &8311532915064548623
 MonoBehaviour:

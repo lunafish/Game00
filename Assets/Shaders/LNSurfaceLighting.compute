@@ -1,16 +1,15 @@
 #pragma kernel CSMain
-#pragma kernel CS_SSAO
-#pragma kernel CS_SSAO_Blur
+#pragma kernel CS_SSAO_SSCS
+#pragma kernel CS_SSAO_SSCS_Blur
 #pragma kernel CS_SSR
 #pragma kernel CS_SSR_Blur
 #pragma kernel CS_SSGI
 #pragma kernel CS_SSGI_Blur
-#pragma kernel CS_SSCS
 #pragma kernel CS_TemporalReprojection
 
 // 최종 결과를 저장할 렌더 타겟
 RWTexture2D<float4> _Result;
-RWTexture2D<float> _Result_AO; // SSAO 용
+RWTexture2D<float2> _Result_AO_SSCS; // SSAO(R) + SSCS(G) 통합 용
 
 // --- 입력 텍스처 (GBuffer 자료형) ---
 Texture2D<float4> _LNSurface_Front_Color;  // RGB: 알베도(Albedo), A: 미사용
@@ -23,8 +22,8 @@ Texture2D<float4> _LNSurface_Back_Packed;  // RG: Oct-Encoded Normal, B: Linear 
 
 Texture2D<float4> _SceneColor;             // 배경 씬 컬러 (SSR 반사 소스)
 
-Texture2D<float> _AO_Raw;                // 블러 전 SSAO 소스
-Texture2D<float> _LNSurface_AO_Blurred; // 블러 후 최종 SSAO
+Texture2D<float2> _AO_SSCS_Raw;                // 블러 전 SSAO+SSCS 소스
+Texture2D<float2> _LNSurface_AO_SSCS_Blurred; // 블러 후 최종 SSAO+SSCS
 
 RWTexture2D<float4> _Result_SSR; // SSR 용 (HDR)
 Texture2D<float4> _SSR_Raw;               // 블러 전 SSR 소스
@@ -33,9 +32,6 @@ Texture2D<float4> _LNSurface_SSR_Blurred; // 블러 후 최종 SSR
 RWTexture2D<float4> _Result_SSGI; // SSGI 용 (HDR)
 Texture2D<float4> _SSGI_Raw;               // 블러 전 SSGI 소스
 Texture2D<float4> _LNSurface_SSGI_Blurred; // 블러 후 최종 SSGI
-
-RWTexture2D<float> _Result_SSCS; // SSCS 용 (R8) - 쓰기 전용
-Texture2D<float> _SSCS_Texture;  // SSCS 용 (R8) - 읽기 전용
 
 // --- Temporal Reprojection Resources ---
 Texture2D<float4> _HistoryBuffer; // 이전 프레임 결과 (Read)
@@ -366,9 +362,14 @@ bool Raymarch(float3 startPosVS, float3 rayDirVS, float stepSize, out float2 hit
     float3 currentPosVS = startPosVS;
     hitBack = false;
     
+    // 깊이 버퍼 최적화: 레이 방향이 카메라(Z=0)를 향하는지 확인하여 스텝 크기 동적 조절
+    float zDir = sign(rayDirVS.z);
+    
     for (int i = 0; i < _SSR_MaxSteps; i++)
     {
-        currentPosVS += rayDirVS * stepSize;
+        // 최적화: 거리가 멀어질수록 보폭(stepSize)을 선형적으로 증가시켜 적은 루프 횟수로 더 멀리 도달 (단순 Hi-Z 근사)
+        float currentStepSize = stepSize * (1.0 + (float)i * 0.05);
+        currentPosVS += rayDirVS * currentStepSize;
         
         float3 screenPos = ProjectViewPos(currentPosVS);
         if (screenPos.x < 0 || screenPos.x > 1 || screenPos.y < 0 || screenPos.y > 1)
@@ -376,48 +377,50 @@ bool Raymarch(float3 startPosVS, float3 rayDirVS, float stepSize, out float2 hit
             
         // Half-Res 최적화: UV 샘플링 사용 (Full-Res GBuffer 읽기)
         float frontDepth = _LNSurface_Front_Packed.SampleLevel(painter_linear_clamp_sampler, screenPos.xy, 0).b;
-        float backDepth = _LNSurface_Back_Packed.SampleLevel(painter_linear_clamp_sampler, screenPos.xy, 0).b;
         
         float currentDepth = -currentPosVS.z;
         
-        // Back Depth 유효성 체크 (1000.0은 Clear Value)
-        bool hasBackFace = (backDepth < 900.0);
-
-        // 유효한 뒷면이 있으면 볼륨 판정, 없으면 단순 두께 판정
-        float thicknessThreshold = hasBackFace ? (backDepth - frontDepth) : _SSR_Thickness;
-        // 뒷면이 앞면보다 앞에 있는 경우(오류) 보정
-        thicknessThreshold = max(thicknessThreshold, _SSR_Thickness); 
-        
-        // 레이가 물체의 두께(앞면과 뒷면 사이 볼륨) 안에 진입했는지 확인
-        if (currentDepth >= frontDepth && currentDepth <= frontDepth + thicknessThreshold)
+        // 1차 체크: 앞면보다 레이가 뒤로 들어갔는지만 먼저 확인 (분기 최소화)
+        if (currentDepth >= frontDepth)
         {
-            // 교점 정밀화를 위한 이진 탐색 (Binary Search Refinement)
-            float3 prevPosVS = currentPosVS - rayDirVS * stepSize;
-            for (int j = 0; j < 4; j++)
-            {
-                float3 midPosVS = (prevPosVS + currentPosVS) * 0.5;
-                float3 midScreenPos = ProjectViewPos(midPosVS);
-                
-                float midFront = _LNSurface_Front_Packed.SampleLevel(painter_linear_clamp_sampler, midScreenPos.xy, 0).b;
-                float midDepth = -midPosVS.z;
-                
-                // 이진 탐색 중에는 단순 두께 판정 사용 (성능 고려)
-                if (midDepth >= midFront && midDepth <= midFront + _SSR_Thickness)
-                    currentPosVS = midPosVS;
-                else
-                    prevPosVS = midPosVS;
-            }
-            
-            float3 finalScreenPos = ProjectViewPos(currentPosVS);
-            
-            float fDepth = _LNSurface_Front_Packed.SampleLevel(painter_linear_clamp_sampler, finalScreenPos.xy, 0).b;
-            float bDepth = _LNSurface_Back_Packed.SampleLevel(painter_linear_clamp_sampler, finalScreenPos.xy, 0).b;
-            float cDepth = -currentPosVS.z;
+            float backDepth = _LNSurface_Back_Packed.SampleLevel(painter_linear_clamp_sampler, screenPos.xy, 0).b;
+            bool hasBackFace = (backDepth < 900.0);
 
-            hitUV = finalScreenPos.xy;
-            // 앞면 보다는 뒷면에 더 가까운지, 그리고 실제 뒷면 깊이 데이터가 유효한지 판단
-            hitBack = (abs(cDepth - bDepth) < abs(cDepth - fDepth)) && (bDepth > fDepth);
-            return true;
+            // 유효한 뒷면이 있으면 볼륨 판정, 없으면 단순 두께 판정
+            float thicknessThreshold = hasBackFace ? (backDepth - frontDepth) : _SSR_Thickness;
+            thicknessThreshold = max(thicknessThreshold, _SSR_Thickness); 
+            
+            // 2차 볼륨 체크
+            if (currentDepth <= frontDepth + thicknessThreshold)
+            {
+                // 교점 정밀화를 위한 이진 탐색 (Binary Search Refinement)
+                float3 prevPosVS = currentPosVS - rayDirVS * currentStepSize;
+                for (int j = 0; j < 4; j++)
+                {
+                    float3 midPosVS = (prevPosVS + currentPosVS) * 0.5;
+                    float3 midScreenPos = ProjectViewPos(midPosVS);
+                    
+                    float midFront = _LNSurface_Front_Packed.SampleLevel(painter_linear_clamp_sampler, midScreenPos.xy, 0).b;
+                    float midDepth = -midPosVS.z;
+                    
+                    // 이진 탐색 중에는 단순 두께 판정 사용 (성능 고려)
+                    if (midDepth >= midFront && midDepth <= midFront + _SSR_Thickness)
+                        currentPosVS = midPosVS;
+                    else
+                        prevPosVS = midPosVS;
+                }
+                
+                float3 finalScreenPos = ProjectViewPos(currentPosVS);
+                
+                float fDepth = _LNSurface_Front_Packed.SampleLevel(painter_linear_clamp_sampler, finalScreenPos.xy, 0).b;
+                float bDepth = _LNSurface_Back_Packed.SampleLevel(painter_linear_clamp_sampler, finalScreenPos.xy, 0).b;
+                float cDepth = -currentPosVS.z;
+
+                hitUV = finalScreenPos.xy;
+                // 앞면 보다는 뒷면에 더 가까운지, 그리고 실제 뒷면 깊이 데이터가 유효한지 판단
+                hitBack = (abs(cDepth - bDepth) < abs(cDepth - fDepth)) && (bDepth > fDepth);
+                return true;
+            }
         }
     }
     return false;
@@ -468,49 +471,57 @@ float RaymarchShadow(float3 startPosVS, float3 lightDirVS, float maxDist, uint2 
 }
 
 // ------------------------------------------------
-// SSAO 전용 계산 커널 (Half-Res)
+// SSAO + SSCS 통합 계산 커널 (Half-Res)
 // ------------------------------------------------
 [numthreads(8, 8, 1)]
-void CS_SSAO (uint3 id : SV_DispatchThreadID)
+void CS_SSAO_SSCS (uint3 id : SV_DispatchThreadID)
 {
     if (id.x >= (uint)_LNSurface_ScreenParams.x || id.y >= (uint)_LNSurface_ScreenParams.y)
         return;
 
-    // Half-Res UV 계산
     float2 uv = (float2(id.xy) + 0.5) / _LNSurface_ScreenParams;
-
-    // Full-Res GBuffer 샘플링
     float mask = _LNSurface_Front_Extra.SampleLevel(painter_linear_clamp_sampler, uv, 0).r;
-    if (mask <= 0.001)
+    
+    float ao = 0.0;
+    float sscs = 1.0;
+
+    if (mask > 0.001)
     {
-        _Result_AO[id.xy] = 0.0; // No occlusion
-        return;
+        float fDepth = _LNSurface_Front_Packed.SampleLevel(painter_linear_clamp_sampler, uv, 0).b;
+        float3 viewPos = GetViewSpacePos(uv, fDepth);
+        
+        if (_EnableSSAO > 0.5)
+        {
+            float3 worldPos = mul(_CameraToWorldMatrix, float4(viewPos, 1.0)).xyz;
+            float3 normalWS = DecodeNormal(_LNSurface_Front_Packed.SampleLevel(painter_linear_clamp_sampler, uv, 0).rg);
+            ao = CalculateSSAO(worldPos, normalWS, id.xy);
+        }
+        
+        if (_EnableSSCS > 0.5)
+        {
+            float3 lightDirVS = mul((float3x3)_WorldToCameraMatrix, normalize(_MainLightDirection.xyz));
+            sscs = RaymarchShadow(viewPos, lightDirVS, _SSCS_Distance, id.xy);
+        }
     }
 
-    // GBuffer에서 월드 공간 정보 복원
-    float fDepth = _LNSurface_Front_Packed.SampleLevel(painter_linear_clamp_sampler, uv, 0).b;
-    float3 viewPos = GetViewSpacePos(uv, fDepth);
-    float3 worldPos = mul(_CameraToWorldMatrix, float4(viewPos, 1.0)).xyz;
-    float3 normalWS = DecodeNormal(_LNSurface_Front_Packed.SampleLevel(painter_linear_clamp_sampler, uv, 0).rg);
-
-    _Result_AO[id.xy] = CalculateSSAO(worldPos, normalWS, id.xy);
+    _Result_AO_SSCS[id.xy] = float2(ao, sscs);
 }
 
 // ------------------------------------------------
-// SSAO Bilateral Blur 커널 (Half-Res)
+// SSAO + SSCS 통합 Bilateral Blur 커널 (Half-Res)
 // ------------------------------------------------
 [numthreads(8, 8, 1)]
-void CS_SSAO_Blur (uint3 id : SV_DispatchThreadID)
+void CS_SSAO_SSCS_Blur (uint3 id : SV_DispatchThreadID)
 {
     if (id.x >= (uint)_LNSurface_ScreenParams.x || id.y >= (uint)_LNSurface_ScreenParams.y)
         return;
 
     float2 uv = (float2(id.xy) + 0.5) / _LNSurface_ScreenParams;
     float centerDepth = _LNSurface_Front_Packed.SampleLevel(painter_linear_clamp_sampler, uv, 0).b;
-    float totalAO = 0;
+    float2 totalAO_SSCS = 0;
     float totalWeight = 0;
 
-    // SSAO는 고정 반경 (예: 2) 사용, Gaussian Weight 적용
+    // SSAO 반경을 기준으로 Blur (SSCS도 동일하게 공유)
     int radius = (int)lerp(1.0, 8.0, _SSAO_Radius);
     float sigma = max(0.1, radius / 2.0);
 
@@ -525,7 +536,7 @@ void CS_SSAO_Blur (uint3 id : SV_DispatchThreadID)
             
             float2 sampleUV = (float2(sampleId) + 0.5) / _LNSurface_ScreenParams;
 
-            float sampleAO = _AO_Raw[sampleId].r;
+            float2 sampleAO_SSCS = _AO_SSCS_Raw[sampleId].rg;
             float sampleDepth = _LNSurface_Front_Packed.SampleLevel(painter_linear_clamp_sampler, sampleUV, 0).b;
 
             // Gaussian Spatial Weight
@@ -536,12 +547,12 @@ void CS_SSAO_Blur (uint3 id : SV_DispatchThreadID)
             
             float weight = spatialWeight * depthWeight;
             
-            totalAO += sampleAO * weight;
+            totalAO_SSCS += sampleAO_SSCS * weight;
             totalWeight += weight;
         }
     }
 
-    _Result_AO[id.xy] = totalAO / max(0.0001, totalWeight);
+    _Result_AO_SSCS[id.xy] = totalAO_SSCS / max(0.0001, totalWeight);
 }
 
 // ------------------------------------------------
@@ -641,34 +652,6 @@ void CS_SSGI_Blur (uint3 id : SV_DispatchThreadID)
     _Result_SSGI[id.xy] = float4(totalColor / max(0.0001, totalWeight), 1.0);
 }
 
-// ------------------------------------------------
-// SSCS 전용 계산 커널 (Full-Res 권장, 여기선 Half-Res로 구현)
-// ------------------------------------------------
-[numthreads(8, 8, 1)]
-void CS_SSCS (uint3 id : SV_DispatchThreadID)
-{
-    if (id.x >= (uint)_LNSurface_ScreenParams.x || id.y >= (uint)_LNSurface_ScreenParams.y)
-        return;
-
-    float2 uv = (float2(id.xy) + 0.5) / _LNSurface_ScreenParams;
-    float mask = _LNSurface_Front_Extra.SampleLevel(painter_linear_clamp_sampler, uv, 0).r;
-    
-    if (mask <= 0.001)
-    {
-        _Result_SSCS[id.xy] = 1.0; // No shadow
-        return;
-    }
-
-    float fDepth = _LNSurface_Front_Packed.SampleLevel(painter_linear_clamp_sampler, uv, 0).b;
-    float3 viewPos = GetViewSpacePos(uv, fDepth);
-    
-    // Light Direction in View Space
-    float3 lightDirVS = mul((float3x3)_WorldToCameraMatrix, normalize(_MainLightDirection.xyz));
-    
-    float shadow = RaymarchShadow(viewPos, lightDirVS, _SSCS_Distance, id.xy);
-    
-    _Result_SSCS[id.xy] = shadow;
-}
 
 // ------------------------------------------------
 // SSR 전용 연산 커널 (Half-Res)
@@ -919,10 +902,10 @@ void CSMain (uint3 id : SV_DispatchThreadID)
     float3 totalSpecular = 0;
     float3 totalSSS = 0;
     
-    // SSCS 적용 (Contact Shadow)
+    // SSCS 적용 (Contact Shadow) - _LNSurface_AO_SSCS_Blurred 의 G 채널
     if (_EnableSSCS > 0.5)
     {
-        float sscs = _SSCS_Texture.SampleLevel(painter_linear_clamp_sampler, uv, 0).r;
+        float sscs = _LNSurface_AO_SSCS_Blurred.SampleLevel(painter_linear_clamp_sampler, uv, 0).g;
         shadow = min(shadow, sscs);
     }
 
@@ -1071,12 +1054,12 @@ void CSMain (uint3 id : SV_DispatchThreadID)
         ambientColor += ssgi * albedo * _SSGI_Intensity * (1.0 - metallic);
     }
 
-    // --- SSAO 적용 (볼륨 차폐광) ---
+    // --- SSAO 적용 (볼륨 차폐광) --- - _LNSurface_AO_SSCS_Blurred 의 R 채널
     float ao = 1.0;
     if (_EnableSSAO > 0.5)
     {
-        // Half-Res AO 텍스처를 Full-Res UV로 샘플링 (Linear Interpolation)
-        float rawAO = _LNSurface_AO_Blurred.SampleLevel(painter_linear_clamp_sampler, uv, 0).r;
+        // Half-Res AO+SSCS 텍스처를 Full-Res UV로 샘플링 (Linear Interpolation)
+        float rawAO = _LNSurface_AO_SSCS_Blurred.SampleLevel(painter_linear_clamp_sampler, uv, 0).r;
         ao = saturate(1.0 - rawAO * _SSAO_Intensity);
     }
     ambientColor *= ao;

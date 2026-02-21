@@ -192,6 +192,18 @@
       "enabled": true
     },
     {
+      "name": "screenshot-camera",
+      "enabled": true
+    },
+    {
+      "name": "screenshot-game-view",
+      "enabled": true
+    },
+    {
+      "name": "screenshot-scene-view",
+      "enabled": true
+    },
+    {
       "name": "script-delete",
       "enabled": true
     },

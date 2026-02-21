@@ -29,6 +29,14 @@ public class LNSurfaceFeature : ScriptableRendererFeature
             Complementary
         }
 
+        public enum DebugMode
+        {
+            None = 0,
+            HiZ = 1,
+            SSR_Raw = 2,
+            SSR_Blurred = 3
+        }
+
         public LayerMask layerMask = -1;
         public ComputeShader lightingComputeShader; // Disney BRDF Lighting
         public LightingModel lightingModel = LightingModel.DisneyBRDF; // Selection
@@ -76,6 +84,7 @@ public class LNSurfaceFeature : ScriptableRendererFeature
 
         [Header("Performance")]
         public bool enableCheckerboard = true;
+        public DebugMode debugMode = DebugMode.None;
 
         public RenderPassEvent renderPassEvent = RenderPassEvent.AfterRenderingTransparents;
     }
@@ -125,8 +134,11 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                 _kernelLighting = settings.lightingComputeShader.FindKernel("CSMain");
         }
 
+        private RTHandle m_HiZPyramidRT;
+
         public void Dispose()
         {
+            m_HiZPyramidRT?.Release();
             _resultHandle?.Release();
             foreach (var buffers in _ssrHistoryBuffers.Values)
             {
@@ -225,6 +237,7 @@ public class LNSurfaceFeature : ScriptableRendererFeature
             // Performance Params
             internal float enableCheckerboard;
             internal int frameCount;
+            internal int debugMode;
 
             // Light Data
             internal Vector4 mainLightDirection;  
@@ -250,6 +263,12 @@ public class LNSurfaceFeature : ScriptableRendererFeature
             internal Vector4[] shBg;
             internal Vector4[] shBb;
             internal Vector4[] shC;
+
+            // Hi-Z
+            internal TextureHandle hizSource;
+            internal TextureHandle hizPyramid;
+            internal int mipLevel;
+            internal int maxMipLevel;
         }
 
         public override void RecordRenderGraph(RenderGraph renderGraph, ContextContainer frameData)
@@ -322,38 +341,38 @@ public class LNSurfaceFeature : ScriptableRendererFeature
             // 4. SSAO + SSCS Calculation Pass
             if (_settings.enableSSAO || _settings.enableSSCS)
             {
-                using (var builder = renderGraph.AddComputePass<ComputePassData>("LNSurface SSAO_SSCS Pass", out var passData))
+                using (var builder = renderGraph.AddComputePass<ComputePassData>("LNSurface SSAO_SSCS Pass", out var passDataAO))
                 {
-                    passData.compute = _settings.lightingComputeShader;
-                    passData.kernel = _settings.lightingComputeShader.FindKernel("CS_SSAO_SSCS");
+                    passDataAO.compute = _settings.lightingComputeShader;
+                    passDataAO.kernel = _settings.lightingComputeShader.FindKernel("CS_SSAO_SSCS");
                     
-                    passData.frontPacked = frontPacked;
-                    passData.backPacked = backPacked;
-                    passData.frontExtra = frontExtra; // Mask
-                    passData.result = aoSscsRaw;
+                    passDataAO.frontPacked = frontPacked;
+                    passDataAO.backPacked = backPacked;
+                    passDataAO.frontExtra = frontExtra; // Mask
+                    passDataAO.result = aoSscsRaw;
                     
-                    builder.UseTexture(passData.frontPacked);
-                    builder.UseTexture(passData.backPacked);
-                    builder.UseTexture(passData.frontExtra); 
-                    builder.UseTexture(passData.result, AccessFlags.Write);
+                    builder.UseTexture(passDataAO.frontPacked);
+                    builder.UseTexture(passDataAO.backPacked);
+                    builder.UseTexture(passDataAO.frontExtra); 
+                    builder.UseTexture(passDataAO.result, AccessFlags.Write);
                     
-                    passData.cameraToWorldMatrix = cameraData.camera.cameraToWorldMatrix;
-                    passData.worldToCameraMatrix = cameraData.camera.worldToCameraMatrix;
-                    passData.projectionMatrix = GL.GetGPUProjectionMatrix(cameraData.camera.projectionMatrix, false);
-                    passData.inverseProjectionMatrix = passData.projectionMatrix.inverse;
+                    passDataAO.cameraToWorldMatrix = cameraData.camera.cameraToWorldMatrix;
+                    passDataAO.worldToCameraMatrix = cameraData.camera.worldToCameraMatrix;
+                    passDataAO.projectionMatrix = GL.GetGPUProjectionMatrix(cameraData.camera.projectionMatrix, false);
+                    passDataAO.inverseProjectionMatrix = passDataAO.projectionMatrix.inverse;
                     // Use Scaled Res Params
-                    passData.screenParams = new Vector4(scaledDesc.width, scaledDesc.height, 1.0f / scaledDesc.width, 1.0f / scaledDesc.height);
+                    passDataAO.screenParams = new Vector4(scaledDesc.width, scaledDesc.height, 1.0f / scaledDesc.width, 1.0f / scaledDesc.height);
                     
-                    passData.enableSSAO = _settings.enableSSAO ? 1.0f : 0.0f;
-                    passData.ssaoRadius = _settings.ssaoRadius;
-                    passData.ssaoIntensity = _settings.ssaoIntensity;
-                    passData.ssaoSampleCount = _settings.ssaoSampleCount;
+                    passDataAO.enableSSAO = _settings.enableSSAO ? 1.0f : 0.0f;
+                    passDataAO.ssaoRadius = _settings.ssaoRadius;
+                    passDataAO.ssaoIntensity = _settings.ssaoIntensity;
+                    passDataAO.ssaoSampleCount = _settings.ssaoSampleCount;
                     
-                    passData.enableSSCS = _settings.enableSSCS ? 1.0f : 0.0f;
-                    passData.sscsDistance = _settings.sscsDistance;
-                    passData.sscsMaxSteps = _settings.sscsMaxSteps;
-                    passData.sscsThickness = _settings.sscsThickness;
-                    passData.sscsIntensity = _settings.sscsIntensity;
+                    passDataAO.enableSSCS = _settings.enableSSCS ? 1.0f : 0.0f;
+                    passDataAO.sscsDistance = _settings.sscsDistance;
+                    passDataAO.sscsMaxSteps = _settings.sscsMaxSteps;
+                    passDataAO.sscsThickness = _settings.sscsThickness;
+                    passDataAO.sscsIntensity = _settings.sscsIntensity;
                     
                     // Main Light
                     Vector4 mainLightDir = new Vector4(0, 1, 0, 0);
@@ -362,7 +381,7 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                         var light = lightData.visibleLights[lightData.mainLightIndex];
                         mainLightDir = -light.localToWorldMatrix.GetColumn(2);
                     }
-                    passData.mainLightDirection = mainLightDir;
+                    passDataAO.mainLightDirection = mainLightDir;
 
                     builder.SetRenderFunc((ComputePassData data, ComputeGraphContext context) =>
                     {
@@ -394,23 +413,26 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                         context.cmd.DispatchCompute(data.compute, data.kernel, gx, gy, 1);
                     });
                 }
+            }
 
-                // 5. SSAO_SSCS Bilateral Blur Pass
-                using (var builder = renderGraph.AddComputePass<ComputePassData>("LNSurface SSAO_SSCS Blur Pass", out var passData))
+            // 5. SSAO_SSCS Bilateral Blur Pass
+            if (_settings.enableSSAO && _settings.lightingComputeShader != null)
+            {
+                using (var builder = renderGraph.AddComputePass<ComputePassData>("LNSurface SSAO_SSCS Blur Pass", out var passDataAOBlur))
                 {
-                    passData.compute = _settings.lightingComputeShader;
-                    passData.kernel = _settings.lightingComputeShader.FindKernel("CS_SSAO_SSCS_Blur");
+                    passDataAOBlur.compute = _settings.lightingComputeShader;
+                    passDataAOBlur.kernel = _settings.lightingComputeShader.FindKernel("CS_SSAO_SSCS_Blur");
                     
-                    passData.frontPacked = frontPacked; // Depth
-                    passData.frontExtra = aoSscsRaw; // RAW input
-                    passData.result = aoSscsBlurred;
+                    passDataAOBlur.frontPacked = frontPacked; // Depth
+                    passDataAOBlur.frontExtra = aoSscsRaw; // RAW input
+                    passDataAOBlur.result = aoSscsBlurred;
                     
-                    builder.UseTexture(passData.frontPacked);
-                    builder.UseTexture(passData.frontExtra);
-                    builder.UseTexture(passData.result, AccessFlags.Write);
+                    builder.UseTexture(passDataAOBlur.frontPacked);
+                    builder.UseTexture(passDataAOBlur.frontExtra);
+                    builder.UseTexture(passDataAOBlur.result, AccessFlags.Write);
                     
-                    passData.screenParams = new Vector4(scaledDesc.width, scaledDesc.height, 1.0f / scaledDesc.width, 1.0f / scaledDesc.height);
-                    passData.ssaoRadius = _settings.ssaoRadius;
+                    passDataAOBlur.screenParams = new Vector4(scaledDesc.width, scaledDesc.height, 1.0f / scaledDesc.width, 1.0f / scaledDesc.height);
+                    passDataAOBlur.ssaoRadius = _settings.ssaoRadius;
 
                     builder.SetRenderFunc((ComputePassData data, ComputeGraphContext context) =>
                     {
@@ -427,39 +449,119 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                 }
             }
 
+            // --- Hi-Z Pyramid Generation ---
+            TextureHandle hizPyramid = TextureHandle.nullHandle;
+            if ((_settings.enableSSR || _settings.enableSSGI) && _settings.lightingComputeShader != null)
+            {
+                int hizWidth = scaledDesc.width;
+                int hizHeight = scaledDesc.height;
+                int mips = Mathf.FloorToInt(Mathf.Log(Mathf.Max(hizWidth, hizHeight), 2)) + 1;
+                mips = Mathf.Min(mips, 10); // Limit levels for performance
+
+                // Persistent RTHandle allocation for Hi-Z Pyramid (RenderGraph transient mips work inconsistently)
+                if (m_HiZPyramidRT == null || m_HiZPyramidRT.rt.width != hizWidth || m_HiZPyramidRT.rt.height != hizHeight)
+                {
+                    m_HiZPyramidRT?.Release();
+                    RenderTextureDescriptor hizDesc = new RenderTextureDescriptor(hizWidth, hizHeight, UnityEngine.Experimental.Rendering.GraphicsFormat.R16_SFloat, 0);
+                    hizDesc.enableRandomWrite = true;
+                    hizDesc.useMipMap = true;
+                    hizDesc.autoGenerateMips = true;
+                    m_HiZPyramidRT = RTHandles.Alloc(hizDesc, name: "LNSurface HiZ Pyramid v9");
+                }
+                
+                hizPyramid = renderGraph.ImportTexture(m_HiZPyramidRT);
+
+                // Pass 1: Initialize Mip 0 from Front Depth
+                using (var builder = renderGraph.AddComputePass<ComputePassData>("LNSurface HiZ Initialize", out var passDataHiZ))
+                {
+                    passDataHiZ.compute = _settings.lightingComputeShader;
+                    passDataHiZ.kernel = _settings.lightingComputeShader.FindKernel("CS_HiZ_Initialize");
+                    passDataHiZ.frontPacked = frontPacked;
+                    passDataHiZ.result = hizPyramid;
+                    passDataHiZ.screenParams = new Vector4(hizWidth, hizHeight, 1.0f / hizWidth, 1.0f / hizHeight);
+
+                    builder.UseTexture(passDataHiZ.frontPacked);
+                    builder.UseTexture(passDataHiZ.result, AccessFlags.Write);
+
+                    builder.SetRenderFunc((ComputePassData data, ComputeGraphContext context) =>
+                    {
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Front_Packed", data.frontPacked);
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_HiZ_Destination", data.result, 0);
+                        context.cmd.SetComputeVectorParam(data.compute, "_LNSurface_ScreenParams", data.screenParams);
+                        
+                        int gx = Mathf.CeilToInt(data.screenParams.x / 8.0f);
+                        int gy = Mathf.CeilToInt(data.screenParams.y / 8.0f);
+                        context.cmd.DispatchCompute(data.compute, data.kernel, gx, gy, 1);
+                    });
+                }
+
+                // Subsequent Passes: Downsample to higher mips
+                for (int i = 1; i < mips; i++)
+                {
+                    int dw = Mathf.Max(1, hizWidth >> i);
+                    int dh = Mathf.Max(1, hizHeight >> i);
+
+                    using (var builder = renderGraph.AddComputePass<ComputePassData>($"LNSurface HiZ Downsample Mip {i}", out var passDataHiZDown))
+                    {
+                        passDataHiZDown.compute = _settings.lightingComputeShader;
+                        passDataHiZDown.kernel = _settings.lightingComputeShader.FindKernel("CS_HiZ_Downsample");
+                        passDataHiZDown.hizPyramid = hizPyramid;
+                        passDataHiZDown.mipLevel = i;
+                        passDataHiZDown.screenParams = new Vector4(dw, dh, 1.0f / dw, 1.0f / dh);
+
+                        // UseTexture for both read and write on different mips
+                        builder.UseTexture(passDataHiZDown.hizPyramid, AccessFlags.ReadWrite);
+
+                        builder.SetRenderFunc((ComputePassData data, ComputeGraphContext context) =>
+                        {
+                            context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_HiZ_Source", data.hizPyramid, data.mipLevel - 1);
+                            context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_HiZ_Destination", data.hizPyramid, data.mipLevel);
+                            
+                            int gx = Mathf.CeilToInt(data.screenParams.x / 8.0f);
+                            int gy = Mathf.CeilToInt(data.screenParams.y / 8.0f);
+                            context.cmd.DispatchCompute(data.compute, data.kernel, gx, gy, 1);
+                        });
+                    }
+                }
+            }
+
             // 6. SSR Calculation Pass
             if (_settings.enableSSR && _settings.lightingComputeShader != null)
             {
-                using (var builder = renderGraph.AddComputePass<ComputePassData>("LNSurface SSR Pass", out var passData))
+                using (var builder = renderGraph.AddComputePass<ComputePassData>("LNSurface SSR Pass", out var passDataSSR))
                 {
-                    passData.compute = _settings.lightingComputeShader;
-                    passData.kernel = _settings.lightingComputeShader.FindKernel("CS_SSR");
+                    passDataSSR.compute = _settings.lightingComputeShader;
+                    passDataSSR.kernel = _settings.lightingComputeShader.FindKernel("CS_SSR");
 
-                    passData.frontPacked = frontPacked;
-                    passData.backPacked = backPacked;
-                    passData.backColor = backColor;
-                    passData.sceneColor = resourceData.activeColorTexture; 
-                    passData.frontExtra = frontExtra; // Mask & Smoothness
-                    passData.result = ssrRaw;
+                    passDataSSR.frontPacked = frontPacked;
+                    passDataSSR.backPacked = backPacked;
+                    passDataSSR.backColor = backColor;
+                    passDataSSR.sceneColor = resourceData.activeColorTexture; 
+                    passDataSSR.frontExtra = frontExtra; // Mask & Smoothness
+                    passDataSSR.result = ssrRaw;
+                    passDataSSR.hizPyramid = hizPyramid;
 
-                    builder.UseTexture(passData.frontPacked);
-                    builder.UseTexture(passData.backPacked);
-                    builder.UseTexture(passData.backColor);
-                    builder.UseTexture(passData.sceneColor);
-                    builder.UseTexture(passData.frontExtra);
-                    builder.UseTexture(passData.result, AccessFlags.Write);
+                    builder.UseTexture(passDataSSR.frontPacked);
+                    builder.UseTexture(passDataSSR.backPacked);
+                    builder.UseTexture(passDataSSR.backColor);
+                    builder.UseTexture(passDataSSR.sceneColor);
+                    builder.UseTexture(passDataSSR.frontExtra);
+                    builder.UseTexture(passDataSSR.result, AccessFlags.Write);
+                    if (passDataSSR.hizPyramid.IsValid()) builder.UseTexture(passDataSSR.hizPyramid);
 
                     // Use Scaled Res Params
-                    passData.screenParams = new Vector4(scaledDesc.width, scaledDesc.height, 1.0f / scaledDesc.width, 1.0f / scaledDesc.height);
-                    passData.ssrMaxSteps = _settings.ssrMaxSteps;
-                    passData.ssrStepSize = _settings.ssrStepSize;
-                    passData.ssrThickness = _settings.ssrThickness;
-                    passData.worldToCameraMatrix = cameraData.GetViewMatrix();
-                    passData.cameraToWorldMatrix = cameraData.GetViewMatrix().inverse;
-                    passData.projectionMatrix = cameraData.GetProjectionMatrix();
-                    passData.inverseProjectionMatrix = cameraData.GetProjectionMatrix().inverse;
-                    passData.enableCheckerboard = _settings.enableCheckerboard ? 1.0f : 0.0f;
-                    passData.frameCount = _frameCount;
+                    passDataSSR.screenParams = new Vector4(scaledDesc.width, scaledDesc.height, 1.0f / scaledDesc.width, 1.0f / scaledDesc.height);
+                    passDataSSR.ssrMaxSteps = _settings.ssrMaxSteps;
+                    passDataSSR.ssrStepSize = _settings.ssrStepSize;
+                    passDataSSR.ssrThickness = _settings.ssrThickness;
+                    passDataSSR.worldToCameraMatrix = cameraData.GetViewMatrix();
+                    passDataSSR.cameraToWorldMatrix = cameraData.GetViewMatrix().inverse;
+                    passDataSSR.projectionMatrix = cameraData.GetProjectionMatrix();
+                    passDataSSR.inverseProjectionMatrix = cameraData.GetProjectionMatrix().inverse;
+                    passDataSSR.enableCheckerboard = _settings.enableCheckerboard ? 1.0f : 0.0f;
+                    passDataSSR.frameCount = _frameCount;
+                    passDataSSR.maxMipLevel = Mathf.Min(10, Mathf.FloorToInt(Mathf.Log(Mathf.Max(scaledDesc.width, scaledDesc.height), 2)));
+                    passDataSSR.debugMode = (int)_settings.debugMode;
 
                     builder.SetRenderFunc((ComputePassData data, ComputeGraphContext context) =>
                     {
@@ -469,6 +571,7 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_SceneColor", data.sceneColor);
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Front_Extra", data.frontExtra);
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_Result_SSR", data.result);
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_HiZ_Pyramid", data.hizPyramid.IsValid() ? data.hizPyramid : data.frontPacked); // Default to front depth if HiZ invalid
 
                         context.cmd.SetComputeVectorParam(data.compute, "_LNSurface_ScreenParams", data.screenParams); // Renamed
                         context.cmd.SetComputeIntParam(data.compute, "_SSR_MaxSteps", data.ssrMaxSteps);
@@ -480,31 +583,32 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                         context.cmd.SetComputeMatrixParam(data.compute, "_InverseProjectionMatrix", data.inverseProjectionMatrix);
                         context.cmd.SetComputeFloatParam(data.compute, "_EnableCheckerboard", data.enableCheckerboard);
                         context.cmd.SetComputeIntParam(data.compute, "_FrameCount", data.frameCount);
+                        context.cmd.SetComputeIntParam(data.compute, "_HiZ_MaxMip", data.maxMipLevel);
+                        context.cmd.SetComputeIntParam(data.compute, "_DebugMode", data.debugMode);
 
                         int gx = Mathf.CeilToInt(data.screenParams.x / 8.0f);
                         int gy = Mathf.CeilToInt(data.screenParams.y / 8.0f);
                         context.cmd.DispatchCompute(data.compute, data.kernel, gx, gy, 1);
                     });
                 }
-
-                // 7. SSR Bilateral Blur Pass
-                using (var builder = renderGraph.AddComputePass<ComputePassData>("LNSurface SSR Blur Pass", out var passData))
+     // 7. SSR Bilateral Blur Pass
+                using (var builder = renderGraph.AddComputePass<ComputePassData>("LNSurface SSR Blur Pass", out var passDataSSRBlur))
                 {
-                    passData.compute = _settings.lightingComputeShader;
-                    passData.kernel = _settings.lightingComputeShader.FindKernel("CS_SSR_Blur");
+                    passDataSSRBlur.compute = _settings.lightingComputeShader;
+                    passDataSSRBlur.kernel = _settings.lightingComputeShader.FindKernel("CS_SSR_Blur");
 
-                    passData.frontPacked = frontPacked; // Depth
-                    passData.frontExtra = frontExtra; // Smoothness
-                    passData.ssrTexture = ssrRaw; // Source SSR
-                    passData.result = ssrBlurred; // Final SSR
+                    passDataSSRBlur.frontPacked = frontPacked; // Depth
+                    passDataSSRBlur.frontExtra = frontExtra; // Smoothness
+                    passDataSSRBlur.ssrTexture = ssrRaw; // Source SSR
+                    passDataSSRBlur.result = ssrBlurred; // Final SSR
 
-                    builder.UseTexture(passData.frontPacked);
-                    builder.UseTexture(passData.frontExtra);
-                    builder.UseTexture(passData.ssrTexture);
-                    builder.UseTexture(passData.result, AccessFlags.Write);
+                    builder.UseTexture(passDataSSRBlur.frontPacked);
+                    builder.UseTexture(passDataSSRBlur.frontExtra);
+                    builder.UseTexture(passDataSSRBlur.ssrTexture);
+                    builder.UseTexture(passDataSSRBlur.result, AccessFlags.Write);
 
                     // Use Scaled Res Params
-                    passData.screenParams = new Vector4(scaledDesc.width, scaledDesc.height, 1.0f / scaledDesc.width, 1.0f / scaledDesc.height);
+                    passDataSSRBlur.screenParams = new Vector4(scaledDesc.width, scaledDesc.height, 1.0f / scaledDesc.width, 1.0f / scaledDesc.height);
 
                     builder.SetRenderFunc((ComputePassData data, ComputeGraphContext context) =>
                     {
@@ -543,30 +647,30 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                 TextureHandle historyReadHandle = renderGraph.ImportTexture(readHistory);
                 TextureHandle historyWriteHandle = renderGraph.ImportTexture(writeHistory);
 
-                using (var builder = renderGraph.AddComputePass<ComputePassData>("LNSurface SSR Temporal Pass", out var passData))
+                using (var builder = renderGraph.AddComputePass<ComputePassData>("LNSurface SSR Temporal Pass", out var passDataSSRTemporal))
                 {
-                    passData.compute = _settings.lightingComputeShader;
-                    passData.kernel = _settings.lightingComputeShader.FindKernel("CS_TemporalReprojection");
+                    passDataSSRTemporal.compute = _settings.lightingComputeShader;
+                    passDataSSRTemporal.kernel = _settings.lightingComputeShader.FindKernel("CS_TemporalReprojection");
 
-                    passData.frontPacked = frontPacked; // Depth for Velocity
-                    passData.currentFrameResult = ssrBlurred; // Input (Noisy)
-                    passData.historyBuffer = historyReadHandle; // Previous Frame
-                    passData.newHistoryBuffer = historyWriteHandle; // Output (Denoised)
+                    passDataSSRTemporal.frontPacked = frontPacked; // Depth for Velocity
+                    passDataSSRTemporal.currentFrameResult = ssrBlurred; // Input (Noisy)
+                    passDataSSRTemporal.historyBuffer = historyReadHandle; // Previous Frame
+                    passDataSSRTemporal.newHistoryBuffer = historyWriteHandle; // Output (Denoised)
                     
-                    builder.UseTexture(passData.frontPacked);
-                    builder.UseTexture(passData.currentFrameResult);
-                    builder.UseTexture(passData.historyBuffer);
-                    builder.UseTexture(passData.newHistoryBuffer, AccessFlags.Write);
+                    builder.UseTexture(passDataSSRTemporal.frontPacked);
+                    builder.UseTexture(passDataSSRTemporal.currentFrameResult);
+                    builder.UseTexture(passDataSSRTemporal.historyBuffer);
+                    builder.UseTexture(passDataSSRTemporal.newHistoryBuffer, AccessFlags.Write);
 
-                    passData.screenParams = new Vector4(scaledDesc.width, scaledDesc.height, 1.0f / scaledDesc.width, 1.0f / scaledDesc.height);
-                    passData.cameraToWorldMatrix = cameraData.camera.cameraToWorldMatrix;
+                    passDataSSRTemporal.screenParams = new Vector4(scaledDesc.width, scaledDesc.height, 1.0f / scaledDesc.width, 1.0f / scaledDesc.height);
+                    passDataSSRTemporal.cameraToWorldMatrix = cameraData.camera.cameraToWorldMatrix;
                     
                     Matrix4x4 currentViewProj = GL.GetGPUProjectionMatrix(cameraData.camera.projectionMatrix, false) * cameraData.camera.worldToCameraMatrix;
                     if (!_prevViewProjMatrices.TryGetValue(cameraData.camera, out Matrix4x4 prevViewProj))
                     {
                         prevViewProj = currentViewProj;
                     }
-                    passData.prevViewProjMatrix = prevViewProj;
+                    passDataSSRTemporal.prevViewProjMatrix = prevViewProj;
 
                     builder.SetRenderFunc((ComputePassData data, ComputeGraphContext context) =>
                     {
@@ -594,37 +698,40 @@ public class LNSurfaceFeature : ScriptableRendererFeature
             // 7.5 SSGI Calculation Pass
             if (_settings.enableSSGI && _settings.lightingComputeShader != null)
             {
-                using (var builder = renderGraph.AddComputePass<ComputePassData>("LNSurface SSGI Pass", out var passData))
+                using (var builder = renderGraph.AddComputePass<ComputePassData>("LNSurface SSGI Pass", out var passDataSSGI))
                 {
-                    passData.compute = _settings.lightingComputeShader;
-                    passData.kernel = _settings.lightingComputeShader.FindKernel("CS_SSGI");
+                    passDataSSGI.compute = _settings.lightingComputeShader;
+                    passDataSSGI.kernel = _settings.lightingComputeShader.FindKernel("CS_SSGI");
 
-                    passData.frontColor = frontColor; 
-                    passData.frontPacked = frontPacked;
-                    passData.frontExtra = frontExtra; // Mask
-                    passData.backPacked = backPacked; // Needed for Raymarch
-                    passData.backColor = backColor; // Added
-                    passData.sceneColor = resourceData.activeColorTexture;
-                    passData.result = ssgiRaw;
+                    passDataSSGI.frontColor = frontColor; 
+                    passDataSSGI.frontPacked = frontPacked;
+                    passDataSSGI.frontExtra = frontExtra; // Mask
+                    passDataSSGI.backPacked = backPacked; // Needed for Raymarch
+                    passDataSSGI.backColor = backColor; // Added
+                    passDataSSGI.sceneColor = resourceData.activeColorTexture;
+                    passDataSSGI.result = ssgiRaw;
+                    passDataSSGI.hizPyramid = hizPyramid;
 
-                    builder.UseTexture(passData.frontColor); 
-                    builder.UseTexture(passData.frontPacked);
-                    builder.UseTexture(passData.frontExtra);
-                    builder.UseTexture(passData.backPacked);
-                    builder.UseTexture(passData.backColor); // Added
-                    builder.UseTexture(passData.sceneColor);
-                    builder.UseTexture(passData.result, AccessFlags.Write);
+                    builder.UseTexture(passDataSSGI.frontColor); 
+                    builder.UseTexture(passDataSSGI.frontPacked);
+                    builder.UseTexture(passDataSSGI.frontExtra);
+                    builder.UseTexture(passDataSSGI.backPacked);
+                    builder.UseTexture(passDataSSGI.backColor); // Added
+                    builder.UseTexture(passDataSSGI.sceneColor);
+                    builder.UseTexture(passDataSSGI.result, AccessFlags.Write);
+                    if (passDataSSGI.hizPyramid.IsValid()) builder.UseTexture(passDataSSGI.hizPyramid);
 
                     // Use Scaled Res Params
-                    passData.screenParams = new Vector4(scaledDesc.width, scaledDesc.height, 1.0f / scaledDesc.width, 1.0f / scaledDesc.height);
-                    passData.ssgiSampleCount = _settings.ssgiSampleCount;
-                    passData.ssgiRayStepSize = _settings.ssgiRayStepSize;
-                    passData.worldToCameraMatrix = cameraData.GetViewMatrix();
-                    passData.cameraToWorldMatrix = cameraData.GetViewMatrix().inverse;
-                    passData.projectionMatrix = cameraData.GetProjectionMatrix();
-                    passData.inverseProjectionMatrix = cameraData.GetProjectionMatrix().inverse;
-                    passData.enableCheckerboard = _settings.enableCheckerboard ? 1.0f : 0.0f;
-                    passData.frameCount = _frameCount;
+                    passDataSSGI.screenParams = new Vector4(scaledDesc.width, scaledDesc.height, 1.0f / scaledDesc.width, 1.0f / scaledDesc.height);
+                    passDataSSGI.ssgiSampleCount = _settings.ssgiSampleCount;
+                    passDataSSGI.ssgiRayStepSize = _settings.ssgiRayStepSize;
+                    passDataSSGI.worldToCameraMatrix = cameraData.GetViewMatrix();
+                    passDataSSGI.cameraToWorldMatrix = cameraData.GetViewMatrix().inverse;
+                    passDataSSGI.projectionMatrix = cameraData.GetProjectionMatrix();
+                    passDataSSGI.inverseProjectionMatrix = cameraData.GetProjectionMatrix().inverse;
+                    passDataSSGI.enableCheckerboard = _settings.enableCheckerboard ? 1.0f : 0.0f;
+                    passDataSSGI.frameCount = _frameCount;
+                    passDataSSGI.maxMipLevel = Mathf.Min(10, Mathf.FloorToInt(Mathf.Log(Mathf.Max(scaledDesc.width, scaledDesc.height), 2)));
 
                     builder.SetRenderFunc((ComputePassData data, ComputeGraphContext context) =>
                     {
@@ -635,6 +742,7 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Back_Color", data.backColor); // Added
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_SceneColor", data.sceneColor);
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_Result_SSGI", data.result);
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_HiZ_Pyramid", data.hizPyramid.IsValid() ? data.hizPyramid : data.frontPacked); // Default to front depth if HiZ invalid
 
                         context.cmd.SetComputeVectorParam(data.compute, "_LNSurface_ScreenParams", data.screenParams); // Renamed
                         context.cmd.SetComputeIntParam(data.compute, "_SSGI_SampleCount", data.ssgiSampleCount);
@@ -645,6 +753,7 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                         context.cmd.SetComputeMatrixParam(data.compute, "_InverseProjectionMatrix", data.inverseProjectionMatrix);
                         context.cmd.SetComputeFloatParam(data.compute, "_EnableCheckerboard", data.enableCheckerboard);
                         context.cmd.SetComputeIntParam(data.compute, "_FrameCount", data.frameCount);
+                        context.cmd.SetComputeIntParam(data.compute, "_HiZ_MaxMip", data.maxMipLevel);
 
                         int gx = Mathf.CeilToInt(data.screenParams.x / 8.0f);
                         int gy = Mathf.CeilToInt(data.screenParams.y / 8.0f);
@@ -653,21 +762,21 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                 }
 
                 // 7.6 SSGI Blur Pass
-                using (var builder = renderGraph.AddComputePass<ComputePassData>("LNSurface SSGI Blur Pass", out var passData))
+                using (var builder = renderGraph.AddComputePass<ComputePassData>("LNSurface SSGI Blur Pass", out var passDataSSGIBlur))
                 {
-                    passData.compute = _settings.lightingComputeShader;
-                    passData.kernel = _settings.lightingComputeShader.FindKernel("CS_SSGI_Blur");
+                    passDataSSGIBlur.compute = _settings.lightingComputeShader;
+                    passDataSSGIBlur.kernel = _settings.lightingComputeShader.FindKernel("CS_SSGI_Blur");
 
-                    passData.frontPacked = frontPacked; // Depth
-                    passData.ssgiTexture = ssgiRaw; // Source SSGI
-                    passData.result = ssgiBlurred; // Final SSGI
+                    passDataSSGIBlur.frontPacked = frontPacked; // Depth
+                    passDataSSGIBlur.ssgiTexture = ssgiRaw; // Source SSGI
+                    passDataSSGIBlur.result = ssgiBlurred; // Final SSGI
 
-                    builder.UseTexture(passData.frontPacked);
-                    builder.UseTexture(passData.ssgiTexture);
-                    builder.UseTexture(passData.result, AccessFlags.Write);
+                    builder.UseTexture(passDataSSGIBlur.frontPacked);
+                    builder.UseTexture(passDataSSGIBlur.ssgiTexture);
+                    builder.UseTexture(passDataSSGIBlur.result, AccessFlags.Write);
 
                     // Use Scaled Res Params
-                    passData.screenParams = new Vector4(scaledDesc.width, scaledDesc.height, 1.0f / scaledDesc.width, 1.0f / scaledDesc.height);
+                    passDataSSGIBlur.screenParams = new Vector4(scaledDesc.width, scaledDesc.height, 1.0f / scaledDesc.width, 1.0f / scaledDesc.height);
 
                     builder.SetRenderFunc((ComputePassData data, ComputeGraphContext context) =>
                     {
@@ -705,30 +814,30 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                 TextureHandle historyReadHandle = renderGraph.ImportTexture(readHistory);
                 TextureHandle historyWriteHandle = renderGraph.ImportTexture(writeHistory);
 
-                using (var builder = renderGraph.AddComputePass<ComputePassData>("LNSurface SSGI Temporal Pass", out var passData))
+                using (var builder = renderGraph.AddComputePass<ComputePassData>("LNSurface SSGI Temporal Pass", out var passDataSSGITemporal))
                 {
-                    passData.compute = _settings.lightingComputeShader;
-                    passData.kernel = _settings.lightingComputeShader.FindKernel("CS_TemporalReprojection");
+                    passDataSSGITemporal.compute = _settings.lightingComputeShader;
+                    passDataSSGITemporal.kernel = _settings.lightingComputeShader.FindKernel("CS_TemporalReprojection");
 
-                    passData.frontPacked = frontPacked; // Depth for Velocity
-                    passData.currentFrameResult = ssgiBlurred; // Input (Noisy)
-                    passData.historyBuffer = historyReadHandle; // Previous Frame
-                    passData.newHistoryBuffer = historyWriteHandle; // Output (Denoised)
+                    passDataSSGITemporal.frontPacked = frontPacked; // Depth for Velocity
+                    passDataSSGITemporal.currentFrameResult = ssgiBlurred; // Input (Noisy)
+                    passDataSSGITemporal.historyBuffer = historyReadHandle; // Previous Frame
+                    passDataSSGITemporal.newHistoryBuffer = historyWriteHandle; // Output (Denoised)
                     
-                    builder.UseTexture(passData.frontPacked);
-                    builder.UseTexture(passData.currentFrameResult);
-                    builder.UseTexture(passData.historyBuffer);
-                    builder.UseTexture(passData.newHistoryBuffer, AccessFlags.Write);
+                    builder.UseTexture(passDataSSGITemporal.frontPacked);
+                    builder.UseTexture(passDataSSGITemporal.currentFrameResult);
+                    builder.UseTexture(passDataSSGITemporal.historyBuffer);
+                    builder.UseTexture(passDataSSGITemporal.newHistoryBuffer, AccessFlags.Write);
 
-                    passData.screenParams = new Vector4(scaledDesc.width, scaledDesc.height, 1.0f / scaledDesc.width, 1.0f / scaledDesc.height);
-                    passData.cameraToWorldMatrix = cameraData.camera.cameraToWorldMatrix;
+                    passDataSSGITemporal.screenParams = new Vector4(scaledDesc.width, scaledDesc.height, 1.0f / scaledDesc.width, 1.0f / scaledDesc.height);
+                    passDataSSGITemporal.cameraToWorldMatrix = cameraData.camera.cameraToWorldMatrix;
                     
                     Matrix4x4 currentViewProj = GL.GetGPUProjectionMatrix(cameraData.camera.projectionMatrix, false) * cameraData.camera.worldToCameraMatrix;
                     if (!_prevViewProjMatrices.TryGetValue(cameraData.camera, out Matrix4x4 prevViewProj))
                     {
                         prevViewProj = currentViewProj;
                     }
-                    passData.prevViewProjMatrix = prevViewProj;
+                    passDataSSGITemporal.prevViewProjMatrix = prevViewProj;
 
                     builder.SetRenderFunc((ComputePassData data, ComputeGraphContext context) =>
                     {
@@ -757,10 +866,10 @@ public class LNSurfaceFeature : ScriptableRendererFeature
             TextureHandle lightingResult = resourceData.activeColorTexture; // Fallback
             if (_settings.lightingComputeShader != null)
             {
-                using (var builder = renderGraph.AddComputePass<ComputePassData>("LNSurface Lighting Pass", out var passData))
+                using (var builder = renderGraph.AddComputePass<ComputePassData>("LNSurface Lighting Pass", out var passDataLighting))
                 {
-                    passData.compute = _settings.lightingComputeShader;
-                    passData.kernel = _settings.lightingComputeShader.FindKernel("CSMain");
+                    passDataLighting.compute = _settings.lightingComputeShader;
+                    passDataLighting.kernel = _settings.lightingComputeShader.FindKernel("CSMain");
 
                     var resultDesc = cameraData.cameraTargetDescriptor;
                     resultDesc.depthBufferBits = 0; 
@@ -768,26 +877,26 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                     resultDesc.graphicsFormat = UnityEngine.Experimental.Rendering.GraphicsFormat.R16G16B16A16_SFloat;
                     RenderingUtils.ReAllocateHandleIfNeeded(ref _resultHandle, resultDesc, name: "_LNSurface_LightingResult");
 
-                    passData.cameraToWorldMatrix = cameraData.camera.cameraToWorldMatrix;
-                    passData.worldToCameraMatrix = cameraData.camera.worldToCameraMatrix;
-                    passData.projectionMatrix = GL.GetGPUProjectionMatrix(cameraData.camera.projectionMatrix, false);
-                    passData.inverseProjectionMatrix = passData.projectionMatrix.inverse;
-                    passData.screenParams = new Vector4(resultDesc.width, resultDesc.height, 1.0f / resultDesc.width, 1.0f / resultDesc.height);
+                    passDataLighting.cameraToWorldMatrix = cameraData.camera.cameraToWorldMatrix;
+                    passDataLighting.worldToCameraMatrix = cameraData.camera.worldToCameraMatrix;
+                    passDataLighting.projectionMatrix = GL.GetGPUProjectionMatrix(cameraData.camera.projectionMatrix, false);
+                    passDataLighting.inverseProjectionMatrix = passDataLighting.projectionMatrix.inverse;
+                    passDataLighting.screenParams = new Vector4(resultDesc.width, resultDesc.height, 1.0f / resultDesc.width, 1.0f / resultDesc.height);
 
                     // Temporal Reprojection Matrix Update
-                    Matrix4x4 currentViewProj = passData.projectionMatrix * passData.worldToCameraMatrix;
+                    Matrix4x4 currentViewProj = passDataLighting.projectionMatrix * passDataLighting.worldToCameraMatrix;
                     if (!_prevViewProjMatrices.TryGetValue(cameraData.camera, out Matrix4x4 prevViewProj))
                     {
                         prevViewProj = currentViewProj; // First frame
                     }
-                    passData.prevViewProjMatrix = prevViewProj;
+                    passDataLighting.prevViewProjMatrix = prevViewProj;
                     _prevViewProjMatrices[cameraData.camera] = currentViewProj; // Update for next frame
 
                     // SSR Params
-                    passData.enableSSR = _settings.enableSSR ? 1.0f : 0.0f;
-                    passData.ssrMaxSteps = _settings.ssrMaxSteps;
-                    passData.ssrStepSize = _settings.ssrStepSize;
-                    passData.ssrThickness = _settings.ssrThickness;
+                    passDataLighting.enableSSR = _settings.enableSSR ? 1.0f : 0.0f;
+                    passDataLighting.ssrMaxSteps = _settings.ssrMaxSteps;
+                    passDataLighting.ssrStepSize = _settings.ssrStepSize;
+                    passDataLighting.ssrThickness = _settings.ssrThickness;
 
                     // Main Light
                     Vector4 mainLightDir = new Vector4(0, 1, 0, 0);
@@ -800,63 +909,64 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                         mainLightCol = light.finalColor;
                     }
 
-                    passData.mainLightDirection = mainLightDir;
-                    passData.mainLightColor = mainLightCol;
+                    passDataLighting.mainLightDirection = mainLightDir;
+                    passDataLighting.mainLightColor = mainLightCol;
                     
                     if (_settings.enableSSAO || _settings.enableSSCS)
                     {
-                        passData.ssaoTexture = aoSscsBlurred; 
+                        passDataLighting.ssaoTexture = aoSscsBlurred; 
                     }
                     else
                     {
-                        passData.ssaoTexture = frontColor; // Dummy
+                        passDataLighting.ssaoTexture = frontColor; // Dummy
                     }
 
                     if (_settings.enableSSR)
                     {
                         // Use Denoised SSR if available, otherwise Blurred
-                        passData.ssrTexture = ssrDenoised.IsValid() ? ssrDenoised : ssrBlurred;
+                        passDataLighting.ssrTexture = ssrDenoised.IsValid() ? ssrDenoised : ssrBlurred;
                     }
                     else
                     {
-                        passData.ssrTexture = frontColor; // Dummy
+                        passDataLighting.ssrTexture = frontColor; // Dummy
                     }
 
                     // SSGI Texture Binding Logic
                     if (_settings.enableSSGI)
                     {
                         // Use Denoised SSGI if available, otherwise Blurred
-                        passData.ssgiTexture = ssgiDenoised.IsValid() ? ssgiDenoised : ssgiBlurred;
+                        passDataLighting.ssgiTexture = ssgiDenoised.IsValid() ? ssgiDenoised : ssgiBlurred;
                     }
                     else
                     {
                         // Bind dummy texture to prevent "Property not set" error
-                        passData.ssgiTexture = frontColor; // Any valid texture
+                        passDataLighting.ssgiTexture = frontColor; // Any valid texture
                     }
 
 
 
-                    passData.enableSSR = _settings.enableSSR ? 1.0f : 0.0f;
-                    passData.enableSSAO = _settings.enableSSAO ? 1.0f : 0.0f;
-                    passData.enableSSGI = _settings.enableSSGI ? 1.0f : 0.0f;
-                    passData.enableSSCS = _settings.enableSSCS ? 1.0f : 0.0f;
-                    passData.ssgiIntensity = _settings.ssgiIntensity;
-                    passData.sscsIntensity = _settings.sscsIntensity; // Added
+                    passDataLighting.enableSSR = _settings.enableSSR ? 1.0f : 0.0f;
+                    passDataLighting.enableSSAO = _settings.enableSSAO ? 1.0f : 0.0f;
+                    passDataLighting.enableSSGI = _settings.enableSSGI ? 1.0f : 0.0f;
+                    passDataLighting.enableSSCS = _settings.enableSSCS ? 1.0f : 0.0f;
+                    passDataLighting.debugMode = (int)_settings.debugMode;
+                    passDataLighting.ssgiIntensity = _settings.ssgiIntensity;
+                    passDataLighting.sscsIntensity = _settings.sscsIntensity; // Added
 
                     // Material Global Settings
-                    passData.specularStrength = _settings.specularStrength;
-                    passData.diffuseWrap = _settings.diffuseWrap;
+                    passDataLighting.specularStrength = _settings.specularStrength;
+                    passDataLighting.diffuseWrap = _settings.diffuseWrap;
 
                     // Shadow Tint Settings
-                    passData.shadowTintMode = (int)_settings.shadowTintMode;
-                    passData.shadowTintColor = _settings.shadowTintColor;
-                    passData.shadowTintIntensity = _settings.shadowTintIntensity;
-                    passData.shadowThreshold = _settings.shadowThreshold;
+                    passDataLighting.shadowTintMode = (int)_settings.shadowTintMode;
+                    passDataLighting.shadowTintColor = _settings.shadowTintColor;
+                    passDataLighting.shadowTintIntensity = _settings.shadowTintIntensity;
+                    passDataLighting.shadowThreshold = _settings.shadowThreshold;
 
                     // Additional Lights
-                    passData.additionalLightPositions = new Vector4[16];
-                    passData.additionalLightColors = new Vector4[16];
-                    passData.additionalLightAttenuations = new Vector4[16];
+                    passDataLighting.additionalLightPositions = new Vector4[16];
+                    passDataLighting.additionalLightColors = new Vector4[16];
+                    passDataLighting.additionalLightAttenuations = new Vector4[16];
 
                     int addCount = 0;
                     for (int i = 0; i < lightData.visibleLights.Length && addCount < 16; i++)
@@ -865,68 +975,70 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                             continue;
 
                         var light = lightData.visibleLights[i];
-                        passData.additionalLightPositions[addCount] = light.localToWorldMatrix.GetColumn(3);
-                        passData.additionalLightColors[addCount] = light.finalColor;
+                        passDataLighting.additionalLightPositions[addCount] = light.localToWorldMatrix.GetColumn(3);
+                        passDataLighting.additionalLightColors[addCount] = light.finalColor;
                         
                         float rangeSq = light.range * light.range;
-                        passData.additionalLightAttenuations[addCount] = new Vector4(1.0f / Mathf.Max(rangeSq, 0.0001f), 1.0f, 0, 0);
+                        passDataLighting.additionalLightAttenuations[addCount] = new Vector4(1.0f / Mathf.Max(rangeSq, 0.0001f), 1.0f, 0, 0);
                         
                         addCount++;
                     }
-                    passData.additionalLightCount = addCount;
-                    // passData.intensity = _settings.intensity; // Removed
-                    // passData.thicknessScale = _settings.thicknessScale; // Removed
-                    passData.enableSSS = _settings.enableSSS ? 1.0f : 0.0f; 
-                    passData.lightingModel = (int)_settings.lightingModel;
+                    passDataLighting.additionalLightCount = addCount;
+                    // passDataLighting.intensity = _settings.intensity; // Removed
+                    // passDataLighting.thicknessScale = _settings.thicknessScale; // Removed
+                    passDataLighting.enableSSS = _settings.enableSSS ? 1.0f : 0.0f; 
+                    passDataLighting.lightingModel = (int)_settings.lightingModel;
 
                     // SSAO Init
-                    passData.enableSSAO = _settings.enableSSAO ? 1.0f : 0.0f;
-                    passData.ssaoRadius = _settings.ssaoRadius;
-                    passData.ssaoIntensity = _settings.ssaoIntensity;
-                    passData.ssaoSampleCount = _settings.ssaoSampleCount;
+                    passDataLighting.enableSSAO = _settings.enableSSAO ? 1.0f : 0.0f;
+                    passDataLighting.ssaoRadius = _settings.ssaoRadius;
+                    passDataLighting.ssaoIntensity = _settings.ssaoIntensity;
+                    passDataLighting.ssaoSampleCount = _settings.ssaoSampleCount;
 
-                    passData.frontColor = frontColor;
-                    passData.frontPacked = frontPacked; 
-                    passData.backPacked = backPacked; 
-                    passData.backColor = backColor;
-                    passData.sceneColor = resourceData.activeColorTexture; 
-                    passData.frontExtra = frontExtra;
-                    passData.frontExtra2 = frontExtra2; // Added
+                    passDataLighting.frontColor = frontColor;
+                    passDataLighting.frontPacked = frontPacked; 
+                    passDataLighting.backPacked = backPacked; 
+                    passDataLighting.backColor = backColor;
+                    passDataLighting.sceneColor = resourceData.activeColorTexture; 
+                    passDataLighting.frontExtra = frontExtra;
+                    passDataLighting.frontExtra2 = frontExtra2; // Added
                     
-                    passData.result = renderGraph.ImportTexture(_resultHandle);
-                    lightingResult = passData.result;
+                    passDataLighting.result = renderGraph.ImportTexture(_resultHandle);
+                    lightingResult = passDataLighting.result;
+                    passDataLighting.hizPyramid = hizPyramid; // Added
                     
                     // SH Data Extraction
                     SphericalHarmonicsL2 sh = RenderSettings.ambientProbe;
-                    passData.shAr = new Vector4[1]; passData.shAg = new Vector4[1]; passData.shAb = new Vector4[1];
-                    passData.shBr = new Vector4[1]; passData.shBg = new Vector4[1]; passData.shBb = new Vector4[1];
-                    passData.shC = new Vector4[1];
+                    passDataLighting.shAr = new Vector4[1]; passDataLighting.shAg = new Vector4[1]; passDataLighting.shAb = new Vector4[1];
+                    passDataLighting.shBr = new Vector4[1]; passDataLighting.shBg = new Vector4[1]; passDataLighting.shBb = new Vector4[1];
+                    passDataLighting.shC = new Vector4[1];
                     
                     // L0, L1
-                    passData.shAr[0] = new Vector4(sh[0, 3], sh[0, 1], sh[0, 2], sh[0, 0] - sh[0, 6]);
-                    passData.shAg[0] = new Vector4(sh[1, 3], sh[1, 1], sh[1, 2], sh[1, 0] - sh[1, 6]);
-                    passData.shAb[0] = new Vector4(sh[2, 3], sh[2, 1], sh[2, 2], sh[2, 0] - sh[2, 6]);
+                    passDataLighting.shAr[0] = new Vector4(sh[0, 3], sh[0, 1], sh[0, 2], sh[0, 0] - sh[0, 6]);
+                    passDataLighting.shAg[0] = new Vector4(sh[1, 3], sh[1, 1], sh[1, 2], sh[1, 0] - sh[1, 6]);
+                    passDataLighting.shAb[0] = new Vector4(sh[2, 3], sh[2, 1], sh[2, 2], sh[2, 0] - sh[2, 6]);
                     
                     // L2
-                    passData.shBr[0] = new Vector4(sh[0, 4], sh[0, 6], sh[0, 5] * 3.0f, sh[0, 7]);
-                    passData.shBg[0] = new Vector4(sh[1, 4], sh[1, 6], sh[1, 5] * 3.0f, sh[1, 7]);
-                    passData.shBb[0] = new Vector4(sh[2, 4], sh[2, 6], sh[2, 5] * 3.0f, sh[2, 7]);
+                    passDataLighting.shBr[0] = new Vector4(sh[0, 4], sh[0, 6], sh[0, 5] * 3.0f, sh[0, 7]);
+                    passDataLighting.shBg[0] = new Vector4(sh[1, 4], sh[1, 6], sh[1, 5] * 3.0f, sh[1, 7]);
+                    passDataLighting.shBb[0] = new Vector4(sh[2, 4], sh[2, 6], sh[2, 5] * 3.0f, sh[2, 7]);
                     
-                    passData.shC[0] = new Vector4(sh[0, 8], sh[2, 8], sh[1, 8], 1.0f);
+                    passDataLighting.shC[0] = new Vector4(sh[0, 8], sh[2, 8], sh[1, 8], 1.0f);
 
-                    builder.UseTexture(passData.frontColor);
-                    builder.UseTexture(passData.frontPacked); 
-                    builder.UseTexture(passData.backPacked); 
-                    builder.UseTexture(passData.backColor);
-                    builder.UseTexture(passData.frontExtra);
-                    builder.UseTexture(passData.frontExtra2); // Added
-                    builder.UseTexture(passData.sceneColor); 
-                    builder.UseTexture(passData.result, AccessFlags.Write); // Ensure result is writable
+                    builder.UseTexture(passDataLighting.frontColor);
+                    builder.UseTexture(passDataLighting.frontPacked); 
+                    builder.UseTexture(passDataLighting.backPacked); 
+                    builder.UseTexture(passDataLighting.backColor);
+                    builder.UseTexture(passDataLighting.frontExtra);
+                    builder.UseTexture(passDataLighting.frontExtra2); // Added
+                    builder.UseTexture(passDataLighting.sceneColor); 
+                    builder.UseTexture(passDataLighting.result, AccessFlags.Write); // Ensure result is writable
 
                     // Always use textures (real or dummy) to prevent binding error
-                    builder.UseTexture(passData.ssaoTexture);
-                    builder.UseTexture(passData.ssrTexture);
-                    builder.UseTexture(passData.ssgiTexture);
+                    builder.UseTexture(passDataLighting.ssaoTexture);
+                    builder.UseTexture(passDataLighting.ssrTexture);
+                    builder.UseTexture(passDataLighting.ssgiTexture);
+                    if (passData.hizPyramid.IsValid()) builder.UseTexture(passData.hizPyramid); // Added
 
                     builder.SetRenderFunc((ComputePassData data, ComputeGraphContext context) =>
                     {
@@ -942,6 +1054,8 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_AO_SSCS_Blurred", data.ssaoTexture);
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_SSR_Blurred", data.ssrTexture);
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_SSGI_Blurred", data.ssgiTexture);
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_Result_SSR", data.ssrTexture); // Fixed: Bind SSR result even if used only for debug visualization in CSMain
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_HiZ_Pyramid", data.hizPyramid.IsValid() ? data.hizPyramid : data.frontPacked); // Added
                         
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_Result", data.result);
 
@@ -968,6 +1082,7 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                         context.cmd.SetComputeFloatParam(data.compute, "_SSCS_Intensity", data.sscsIntensity); // Added
                         context.cmd.SetComputeFloatParam(data.compute, "_EnableSSS", data.enableSSS);
                         context.cmd.SetComputeIntParam(data.compute, "_LightingModel", data.lightingModel);
+                        context.cmd.SetComputeIntParam(data.compute, "_DebugMode", data.debugMode);
 
                         // Material Global Settings
                         context.cmd.SetComputeFloatParam(data.compute, "_SpecularStrength", data.specularStrength);
@@ -997,7 +1112,7 @@ public class LNSurfaceFeature : ScriptableRendererFeature
             
             // 6. Blit Final Result
             TextureHandle finalResult = lightingResult;
-            RenderGraphUtils.BlitMaterialParameters blitParams = new(finalResult, resourceData.activeColorTexture, 
+            var blitParams = new RenderGraphUtils.BlitMaterialParameters(finalResult, resourceData.activeColorTexture, 
                 Blitter.GetBlitMaterial(TextureDimension.Tex2D), 0);
             renderGraph.AddBlitPass(blitParams, "LNSurface Final Blit");
         } // End of RecordRenderGraph

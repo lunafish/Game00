@@ -6,6 +6,8 @@
 #pragma kernel CS_SSGI
 #pragma kernel CS_SSGI_Blur
 #pragma kernel CS_TemporalReprojection
+#pragma kernel CS_HiZ_Initialize
+#pragma kernel CS_HiZ_Downsample
 
 // 최종 결과를 저장할 렌더 타겟
 RWTexture2D<float4> _Result;
@@ -37,6 +39,11 @@ Texture2D<float4> _LNSurface_SSGI_Blurred; // 블러 후 최종 SSGI
 Texture2D<float4> _HistoryBuffer; // 이전 프레임 결과 (Read)
 RWTexture2D<float4> _NewHistoryBuffer; // 다음 프레임용 저장 (Write)
 Texture2D<float4> _CurrentFrameResult; // 현재 프레임 결과 (Noisy)
+
+// --- Hi-Z Resources ---
+RWTexture2D<float> _HiZ_Source;
+RWTexture2D<float> _HiZ_Destination;
+Texture2D<float> _HiZ_Pyramid; // SSR/SSGI에서 참조할 최종 피라미드 (밉맵)
 
 SamplerState painter_linear_clamp_sampler;
 SamplerState painter_point_clamp_sampler;
@@ -83,6 +90,7 @@ float _EnableSSR;      // SSR 활성화 여부
 int _SSR_MaxSteps;     // 최대 레이마칭 단계
 float _SSR_StepSize;    // 레이 전진 보폭
 float _SSR_Thickness;   // 충돌 판정 두께 임계값
+int _DebugMode;         // 디버그 시각화 모드
 
 // --- SSAO (Screen Space Ambient Occlusion) 설정 ---
 float _EnableSSAO;      // SSAO 활성화 여부
@@ -106,6 +114,9 @@ float _SSCS_Intensity; // SSCS 강도 추가
 // Checkerboard Rendering Settings
 float _EnableCheckerboard;
 int _FrameCount;
+
+// Hi-Z Settings
+int _HiZ_MaxMip;
 
 #ifndef PI
 #define PI 3.14159265359f
@@ -363,72 +374,84 @@ float CalculateSSAO(float3 posWS, float3 normalWS, uint2 pixId)
  */
 bool Raymarch(float3 startPosVS, float3 rayDirVS, float stepSize, out float2 hitUV, out bool hitBack)
 {
-    float3 currentPosVS = startPosVS;
+    float3 rayPosVS = startPosVS;
     hitBack = false;
+    hitUV = float3(0, 0, 0).xy; // explicit float2 init to be safe
+
+    float currentMip = 0.0;
+    float maxDistance = 200.0; 
+    float traveled = 0.0;
+
+    // View-space ray setup
+    float3 rayDir = normalize(rayDirVS);
     
-    // 깊이 버퍼 최적화: 레이 방향이 카메라(Z=0)를 향하는지 확인하여 스텝 크기 동적 조절
-    float zDir = sign(rayDirVS.z);
-    
+    // Bias to prevent self-intersection
+    rayPosVS += rayDir * 0.05;
+
+    [loop]
     for (int i = 0; i < _SSR_MaxSteps; i++)
     {
-        // 최적화: 거리가 멀어질수록 보폭(stepSize)을 선형적으로 증가시켜 적은 루프 횟수로 더 멀리 도달 (단순 Hi-Z 근사)
-        float currentStepSize = stepSize * (1.0 + (float)i * 0.05);
-        currentPosVS += rayDirVS * currentStepSize;
+        float3 screenPos = ProjectViewPos(rayPosVS);
         
-        float3 screenPos = ProjectViewPos(currentPosVS);
-        if (screenPos.x < 0 || screenPos.x > 1 || screenPos.y < 0 || screenPos.y > 1)
+        // Out of screen bounds check
+        if (screenPos.x < 0.0 || screenPos.x > 1.0 || screenPos.y < 0.0 || screenPos.y > 1.0)
             return false;
-            
-        // Half-Res 최적화: UV 샘플링 사용 (Full-Res GBuffer 읽기)
-        float frontDepth = _LNSurface_Front_Packed.SampleLevel(painter_linear_clamp_sampler, screenPos.xy, 0).b;
-        
-        float currentDepth = -currentPosVS.z;
-        
-        // 1차 체크: 앞면보다 레이가 뒤로 들어갔는지만 먼저 확인 (분기 최소화)
-        if (currentDepth >= frontDepth)
-        {
-            float backDepth = _LNSurface_Back_Packed.SampleLevel(painter_linear_clamp_sampler, screenPos.xy, 0).b;
-            bool hasBackFace = (backDepth < 900.0);
 
-            // 유효한 뒷면이 있으면 볼륨 판정, 없으면 단순 두께 판정
-            float thicknessThreshold = hasBackFace ? (backDepth - frontDepth) : _SSR_Thickness;
-            thicknessThreshold = max(thicknessThreshold, _SSR_Thickness); 
+        // Sample Hierarchical Z-Buffer (Min Linear Depth)
+        float frontDepth = _HiZ_Pyramid.SampleLevel(painter_point_clamp_sampler, screenPos.xy, currentMip).r;
+        float rayDepth = -rayPosVS.z;
+
+        if (rayDepth < frontDepth - 0.01) 
+        {
+            // Ray is in front of the surface (Empty Space)
+            // Increase mip level and jump
+            float jumpMultiplier = pow(2.0, floor(currentMip));
+            float jump = stepSize * jumpMultiplier;
             
-            // 2차 볼륨 체크
-            if (currentDepth <= frontDepth + thicknessThreshold)
+            rayPosVS += rayDir * jump;
+            traveled += jump;
+            currentMip = min((float)_HiZ_MaxMip, currentMip + 1.0);
+        }
+        else
+        {
+            // Potential hit or occlusion
+            if (currentMip <= 0.5)
             {
-                // 교점 정밀화를 위한 이진 탐색 (Binary Search Refinement)
-                float3 prevPosVS = currentPosVS - rayDirVS * currentStepSize;
-                for (int j = 0; j < 4; j++)
+                // Mip 0: Detailed Volume Check
+                float fDepth = frontDepth;
+                float bDepth = _LNSurface_Back_Packed.SampleLevel(painter_point_clamp_sampler, screenPos.xy, 0).b;
+                
+                bool hasBackFace = (bDepth > fDepth + 0.001) && (bDepth < 900.0);
+                float thickness = hasBackFace ? (bDepth - fDepth) : _SSR_Thickness;
+                
+                // Adaptive thickness to prevent skipping thin objects at distance
+                float adaptiveThickness = max(_SSR_Thickness, traveled * 0.01);
+                thickness = max(thickness, adaptiveThickness * 0.5);
+
+                if (rayDepth >= fDepth - 0.02 && rayDepth <= fDepth + thickness)
                 {
-                    float3 midPosVS = (prevPosVS + currentPosVS) * 0.5;
-                    float3 midScreenPos = ProjectViewPos(midPosVS);
-                    
-                    float midFront = _LNSurface_Front_Packed.SampleLevel(painter_linear_clamp_sampler, midScreenPos.xy, 0).b;
-                    float midDepth = -midPosVS.z;
-                    
-                    // 이진 탐색 중에는 단순 두께 판정 사용 (성능 고려)
-                    if (midDepth >= midFront && midDepth <= midFront + _SSR_Thickness)
-                        currentPosVS = midPosVS;
-                    else
-                        prevPosVS = midPosVS;
+                    hitUV = screenPos.xy;
+                    hitBack = hasBackFace && (abs(rayDepth - bDepth) < abs(rayDepth - fDepth));
+                    return true;
                 }
                 
-                float3 finalScreenPos = ProjectViewPos(currentPosVS);
-                
-                float fDepth = _LNSurface_Front_Packed.SampleLevel(painter_linear_clamp_sampler, finalScreenPos.xy, 0).b;
-                float bDepth = _LNSurface_Back_Packed.SampleLevel(painter_linear_clamp_sampler, finalScreenPos.xy, 0).b;
-                float cDepth = -currentPosVS.z;
-
-                hitUV = finalScreenPos.xy;
-                // 앞면 보다는 뒷면에 더 가까운지, 그리고 실제 뒷면 깊이 데이터가 유효한지 판단
-                hitBack = (abs(cDepth - bDepth) < abs(cDepth - fDepth)) && (bDepth > fDepth);
-                return true;
+                // Behind the volume
+                rayPosVS += rayDir * stepSize;
+                traveled += stepSize;
+            }
+            else
+            {
+                // Refine by decreasing mip level
+                currentMip = max(0.0, currentMip - 1.0);
             }
         }
+
+        if (traveled > maxDistance) return false;
     }
+
     return false;
 }
+
 
 // --- SSCS Raymarching ---
 float RaymarchShadow(float3 startPosVS, float3 lightDirVS, float maxDist, uint2 pixId)
@@ -890,14 +913,44 @@ void CS_TemporalReprojection (uint3 id : SV_DispatchThreadID)
     historyColor = clamp(historyColor, minColor, maxColor);
     
     // 7. Blending (90% History, 10% Current)
-    // 움직임이 빠를수록 History 비중을 줄이는 것이 좋음 (Velocity 크기 기반)
     float velocityMag = length(velocity * _LNSurface_ScreenParams);
     float blendFactor = lerp(0.9, 0.5, saturate(velocityMag / 10.0));
     
     float4 finalColor = lerp(currentColor, historyColor, blendFactor);
     
-    _NewHistoryBuffer[id.xy] = finalColor;
+    _NewHistoryBuffer[id.xy] = float4(finalColor.rgb, 1.0);
 }
+
+// ------------------------------------------------
+// Hi-Z Depth Pyramid Initialization
+// ------------------------------------------------
+[numthreads(8, 8, 1)]
+void CS_HiZ_Initialize(uint3 id : SV_DispatchThreadID)
+{
+    float2 uv = (float2(id.xy) + 0.5) / _LNSurface_ScreenParams;
+    float depth = _LNSurface_Front_Packed.SampleLevel(painter_point_clamp_sampler, uv, 0).b;
+    _HiZ_Destination[id.xy] = depth;
+}
+
+// ------------------------------------------------
+// Hi-Z Depth Pyramid Downsample Kernel
+// ------------------------------------------------
+[numthreads(8, 8, 1)]
+void CS_HiZ_Downsample(uint3 id : SV_DispatchThreadID)
+{
+    uint2 srcId = id.xy * 2;
+    
+    // 2x2 픽셀 중 최소 깊이(Min-Depth) 선택
+    float d0 = _HiZ_Source[srcId + uint2(0, 0)].r;
+    float d1 = _HiZ_Source[srcId + uint2(1, 0)].r;
+    float d2 = _HiZ_Source[srcId + uint2(0, 1)].r;
+    float d3 = _HiZ_Source[srcId + uint2(1, 1)].r;
+    
+    float minDepth = min(min(d0, d1), min(d2, d3));
+    
+    _HiZ_Destination[id.xy] = minDepth;
+}
+
 
 [numthreads(8, 8, 1)]
 void CSMain (uint3 id : SV_DispatchThreadID)
@@ -1147,5 +1200,22 @@ void CSMain (uint3 id : SV_DispatchThreadID)
     ambientColor += reflectionColor * F * reflectionStrength * ssrFade;
 
     // 최종 픽셀 컬러 출력 (확산광 + 주변광/반사광 + 스펙큘러 + SSS)
-    _Result[id.xy] = float4(totalDiffuse + ambientColor + totalSpecular + totalSSS, 1.0);
+    float3 finalResult = totalDiffuse + ambientColor + totalSpecular + totalSSS;
+
+    // --- Debug Visualization ---
+    if (_DebugMode == 1) // Hi-Z View
+    {
+        float hiz = _HiZ_Pyramid.SampleLevel(painter_point_clamp_sampler, uv, 0).r;
+        finalResult = float3(hiz * 0.01, hiz * 0.01, hiz * 0.01);
+    }
+    else if (_DebugMode == 2) // SSR Raw
+    {
+        finalResult = _Result_SSR[id.xy].rgb;
+    }
+    else if (_DebugMode == 3) // SSR Blurred
+    {
+        finalResult = reflectionColor;
+    }
+
+    _Result[id.xy] = float4(finalResult, 1.0);
 }

@@ -74,6 +74,9 @@ public class LNSurfaceFeature : ScriptableRendererFeature
         [Range(0.01f, 1.0f)] public float sscsThickness = 0.1f;
         [Range(0.0f, 2.0f)] public float sscsIntensity = 1.0f; // Added Intensity
 
+        [Header("Performance")]
+        public bool enableCheckerboard = true;
+
         public RenderPassEvent renderPassEvent = RenderPassEvent.AfterRenderingTransparents;
     }
 
@@ -101,6 +104,7 @@ public class LNSurfaceFeature : ScriptableRendererFeature
         private FilteringSettings _filteringSettings;
         private RTHandle _resultHandle;
         private int _kernelLighting;
+        private int _frameCount = 0;
         
         // History Data for Temporal Reprojection
         private Dictionary<Camera, Matrix4x4> _prevViewProjMatrices = new Dictionary<Camera, Matrix4x4>();
@@ -218,6 +222,10 @@ public class LNSurfaceFeature : ScriptableRendererFeature
             internal float sscsThickness;
             internal float sscsIntensity;
 
+            // Performance Params
+            internal float enableCheckerboard;
+            internal int frameCount;
+
             // Light Data
             internal Vector4 mainLightDirection;  
             internal Vector4 mainLightColor;
@@ -251,6 +259,7 @@ public class LNSurfaceFeature : ScriptableRendererFeature
             UniversalRenderingData renderingData = frameData.Get<UniversalRenderingData>();
             UniversalLightData lightData = frameData.Get<UniversalLightData>(); 
 
+            _frameCount++;
             var desc = cameraData.cameraTargetDescriptor;
             desc.depthBufferBits = 0; 
             desc.enableRandomWrite = false;
@@ -449,6 +458,8 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                     passData.cameraToWorldMatrix = cameraData.GetViewMatrix().inverse;
                     passData.projectionMatrix = cameraData.GetProjectionMatrix();
                     passData.inverseProjectionMatrix = cameraData.GetProjectionMatrix().inverse;
+                    passData.enableCheckerboard = _settings.enableCheckerboard ? 1.0f : 0.0f;
+                    passData.frameCount = _frameCount;
 
                     builder.SetRenderFunc((ComputePassData data, ComputeGraphContext context) =>
                     {
@@ -467,6 +478,8 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                         context.cmd.SetComputeMatrixParam(data.compute, "_CameraToWorldMatrix", data.cameraToWorldMatrix);
                         context.cmd.SetComputeMatrixParam(data.compute, "_ProjectionMatrix", data.projectionMatrix);
                         context.cmd.SetComputeMatrixParam(data.compute, "_InverseProjectionMatrix", data.inverseProjectionMatrix);
+                        context.cmd.SetComputeFloatParam(data.compute, "_EnableCheckerboard", data.enableCheckerboard);
+                        context.cmd.SetComputeIntParam(data.compute, "_FrameCount", data.frameCount);
 
                         int gx = Mathf.CeilToInt(data.screenParams.x / 8.0f);
                         int gy = Mathf.CeilToInt(data.screenParams.y / 8.0f);
@@ -565,6 +578,8 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                         context.cmd.SetComputeVectorParam(data.compute, "_LNSurface_ScreenParams", data.screenParams);
                         context.cmd.SetComputeMatrixParam(data.compute, "_CameraToWorldMatrix", data.cameraToWorldMatrix);
                         context.cmd.SetComputeMatrixParam(data.compute, "_PrevViewProjMatrix", data.prevViewProjMatrix);
+                        context.cmd.SetComputeFloatParam(data.compute, "_EnableCheckerboard", _settings.enableCheckerboard ? 1.0f : 0.0f);
+                        context.cmd.SetComputeIntParam(data.compute, "_FrameCount", _frameCount);
 
                         int gx = Mathf.CeilToInt(data.screenParams.x / 8.0f);
                         int gy = Mathf.CeilToInt(data.screenParams.y / 8.0f);
@@ -608,6 +623,8 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                     passData.cameraToWorldMatrix = cameraData.GetViewMatrix().inverse;
                     passData.projectionMatrix = cameraData.GetProjectionMatrix();
                     passData.inverseProjectionMatrix = cameraData.GetProjectionMatrix().inverse;
+                    passData.enableCheckerboard = _settings.enableCheckerboard ? 1.0f : 0.0f;
+                    passData.frameCount = _frameCount;
 
                     builder.SetRenderFunc((ComputePassData data, ComputeGraphContext context) =>
                     {
@@ -626,6 +643,8 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                         context.cmd.SetComputeMatrixParam(data.compute, "_CameraToWorldMatrix", data.cameraToWorldMatrix);
                         context.cmd.SetComputeMatrixParam(data.compute, "_ProjectionMatrix", data.projectionMatrix);
                         context.cmd.SetComputeMatrixParam(data.compute, "_InverseProjectionMatrix", data.inverseProjectionMatrix);
+                        context.cmd.SetComputeFloatParam(data.compute, "_EnableCheckerboard", data.enableCheckerboard);
+                        context.cmd.SetComputeIntParam(data.compute, "_FrameCount", data.frameCount);
 
                         int gx = Mathf.CeilToInt(data.screenParams.x / 8.0f);
                         int gy = Mathf.CeilToInt(data.screenParams.y / 8.0f);

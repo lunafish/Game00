@@ -112,14 +112,14 @@ MonoBehaviour:
     ssaoIntensity: 1
     ssaoSampleCount: 16
     enableSSGI: 1
-    ssgiIntensity: 0.25
+    ssgiIntensity: 0.2
     ssgiSampleCount: 8
     ssgiRayStepSize: 0.1
     enableSSCS: 1
     sscsDistance: 1
     sscsMaxSteps: 16
     sscsThickness: 0.1
-    sscsIntensity: 0.125
+    sscsIntensity: 0.1
     renderPassEvent: 500
 --- !u!114 &8311532915064548623
 MonoBehaviour:

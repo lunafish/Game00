@@ -6,6 +6,7 @@
 #pragma kernel CS_SSGI
 #pragma kernel CS_SSGI_Blur
 #pragma kernel CS_SSCS
+#pragma kernel CS_TemporalReprojection
 
 // 최종 결과를 저장할 렌더 타겟
 RWTexture2D<float4> _Result;
@@ -36,7 +37,13 @@ Texture2D<float4> _LNSurface_SSGI_Blurred; // 블러 후 최종 SSGI
 RWTexture2D<float> _Result_SSCS; // SSCS 용 (R8) - 쓰기 전용
 Texture2D<float> _SSCS_Texture;  // SSCS 용 (R8) - 읽기 전용
 
+// --- Temporal Reprojection Resources ---
+Texture2D<float4> _HistoryBuffer; // 이전 프레임 결과 (Read)
+RWTexture2D<float4> _NewHistoryBuffer; // 다음 프레임용 저장 (Write)
+Texture2D<float4> _CurrentFrameResult; // 현재 프레임 결과 (Noisy)
+
 SamplerState painter_linear_clamp_sampler;
+SamplerState painter_point_clamp_sampler;
 
 // --- 전역 파라미터 ---
 float2 _LNSurface_ScreenParams;     // 화면 해상도 (이름 변경)
@@ -62,6 +69,7 @@ float4x4 _InverseProjectionMatrix; // 뷰 공간 재구성을 위한 투영 역�
 float4x4 _CameraToWorldMatrix;      // 뷰 -> 월드 변환
 float4x4 _WorldToCameraMatrix;      // 월드 -> 뷰 변환
 float4x4 _ProjectionMatrix;         // 월드 -> 클립 변환
+float4x4 _PrevViewProjMatrix;       // 이전 프레임 View-Projection 행렬 (Velocity 계산용)
 int _LightingModel; // 조명 모델 선택 (0: HalfLambert, 1: DisneyBRDF)
 
 // Material Global Settings
@@ -776,6 +784,78 @@ void CS_SSR_Blur (uint3 id : SV_DispatchThreadID)
     }
 
     _Result_SSR[id.xy] = float4(totalSSR / max(0.0001, totalWeight), 1.0);
+}
+
+// ------------------------------------------------
+// Temporal Reprojection 커널 (Denoising)
+// ------------------------------------------------
+[numthreads(8, 8, 1)]
+void CS_TemporalReprojection (uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_LNSurface_ScreenParams.x || id.y >= (uint)_LNSurface_ScreenParams.y)
+        return;
+
+    float2 uv = (float2(id.xy) + 0.5) / _LNSurface_ScreenParams;
+    
+    // 1. 현재 프레임 결과 읽기
+    float4 currentColor = _CurrentFrameResult[id.xy];
+    
+    // 2. Velocity 계산 (Reconstruction)
+    float depth = _LNSurface_Front_Packed.SampleLevel(painter_point_clamp_sampler, uv, 0).b;
+    
+    // 현재 프레임의 World Position 복원
+    float3 viewPos = GetViewSpacePos(uv, depth);
+    float3 worldPos = mul(_CameraToWorldMatrix, float4(viewPos, 1.0)).xyz;
+    
+    // 이전 프레임의 Clip Space 좌표 계산
+    float4 prevClipPos = mul(_PrevViewProjMatrix, float4(worldPos, 1.0));
+    float2 prevUV = (prevClipPos.xy / prevClipPos.w) * 0.5 + 0.5;
+    
+    // Velocity Vector
+    float2 velocity = uv - prevUV;
+    
+    // 3. History 샘플링 위치 계산
+    float2 historyUV = uv - velocity;
+    
+    // 4. 유효성 검사 (화면 밖으로 나갔는지)
+    if (any(historyUV < 0.0 || historyUV > 1.0))
+    {
+        _NewHistoryBuffer[id.xy] = currentColor;
+        return;
+    }
+    
+    // 5. History 샘플링
+    float4 historyColor = _HistoryBuffer.SampleLevel(painter_linear_clamp_sampler, historyUV, 0);
+    
+    // 6. Neighborhood Clamping (Ghosting 방지)
+    // 현재 픽셀 주변 3x3 영역의 Min/Max 색상을 구해서 History를 그 범위 내로 자름
+    float4 minColor = currentColor;
+    float4 maxColor = currentColor;
+    
+    for(int x = -1; x <= 1; x++)
+    {
+        for(int y = -1; y <= 1; y++)
+        {
+            uint2 neighborId = uint2(
+                clamp(id.x + x, 0, (uint)_LNSurface_ScreenParams.x - 1),
+                clamp(id.y + y, 0, (uint)_LNSurface_ScreenParams.y - 1)
+            );
+            float4 neighborColor = _CurrentFrameResult[neighborId];
+            minColor = min(minColor, neighborColor);
+            maxColor = max(maxColor, neighborColor);
+        }
+    }
+    
+    historyColor = clamp(historyColor, minColor, maxColor);
+    
+    // 7. Blending (90% History, 10% Current)
+    // 움직임이 빠를수록 History 비중을 줄이는 것이 좋음 (Velocity 크기 기반)
+    float velocityMag = length(velocity * _LNSurface_ScreenParams);
+    float blendFactor = lerp(0.9, 0.5, saturate(velocityMag / 10.0));
+    
+    float4 finalColor = lerp(currentColor, historyColor, blendFactor);
+    
+    _NewHistoryBuffer[id.xy] = finalColor;
 }
 
 [numthreads(8, 8, 1)]

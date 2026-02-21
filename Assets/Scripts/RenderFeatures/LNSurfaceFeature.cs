@@ -3,6 +3,7 @@ using UnityEngine.Rendering;
 using UnityEngine.Rendering.Universal;
 using UnityEngine.Rendering.RenderGraphModule;
 using UnityEngine.Rendering.RenderGraphModule.Util;
+using System.Collections.Generic;
 
 public class LNSurfaceFeature : ScriptableRendererFeature
 {
@@ -100,6 +101,14 @@ public class LNSurfaceFeature : ScriptableRendererFeature
         private FilteringSettings _filteringSettings;
         private RTHandle _resultHandle;
         private int _kernelLighting;
+        
+        // History Data for Temporal Reprojection
+        private Dictionary<Camera, Matrix4x4> _prevViewProjMatrices = new Dictionary<Camera, Matrix4x4>();
+        
+        // History Buffers (Double Buffering per Camera)
+        // Key: Camera, Value: [ReadBuffer, WriteBuffer]
+        private Dictionary<Camera, RTHandle[]> _ssrHistoryBuffers = new Dictionary<Camera, RTHandle[]>();
+        private Dictionary<Camera, RTHandle[]> _ssgiHistoryBuffers = new Dictionary<Camera, RTHandle[]>(); // SSGI History
 
         public LNSurfacePass(LNSurfaceSettings settings)
         {
@@ -115,6 +124,25 @@ public class LNSurfaceFeature : ScriptableRendererFeature
         public void Dispose()
         {
             _resultHandle?.Release();
+            foreach (var buffers in _ssrHistoryBuffers.Values)
+            {
+                if (buffers != null)
+                {
+                    buffers[0]?.Release();
+                    buffers[1]?.Release();
+                }
+            }
+            _ssrHistoryBuffers.Clear();
+            
+            foreach (var buffers in _ssgiHistoryBuffers.Values)
+            {
+                if (buffers != null)
+                {
+                    buffers[0]?.Release();
+                    buffers[1]?.Release();
+                }
+            }
+            _ssgiHistoryBuffers.Clear();
         }
 
         private class GBufferPassData
@@ -143,6 +171,11 @@ public class LNSurfaceFeature : ScriptableRendererFeature
             internal TextureHandle ssgiTexture; // SSGI Blurred Result
             internal TextureHandle sscsTexture; // SSCS Result
             internal TextureHandle result; // Input/Output
+            
+            // Temporal Reprojection Textures
+            internal TextureHandle historyBuffer;
+            internal TextureHandle newHistoryBuffer;
+            internal TextureHandle currentFrameResult;
             
             internal float intensity;
             internal float thicknessScale;
@@ -197,6 +230,9 @@ public class LNSurfaceFeature : ScriptableRendererFeature
             internal Matrix4x4 worldToCameraMatrix;
             internal Matrix4x4 projectionMatrix;
             internal Matrix4x4 inverseProjectionMatrix;
+            
+            // Temporal Reprojection Data
+            internal Matrix4x4 prevViewProjMatrix;
             
             // Ambient SH
             internal Vector4[] shAr;
@@ -256,10 +292,12 @@ public class LNSurfaceFeature : ScriptableRendererFeature
             ssrDesc.enableRandomWrite = true;
             TextureHandle ssrRaw = UniversalRenderer.CreateRenderGraphTexture(renderGraph, ssrDesc, "LNSurface_SSR_Raw", false);
             TextureHandle ssrBlurred = UniversalRenderer.CreateRenderGraphTexture(renderGraph, ssrDesc, "LNSurface_SSR_Blurred", false);
+            TextureHandle ssrDenoised = UniversalRenderer.CreateRenderGraphTexture(renderGraph, ssrDesc, "LNSurface_SSR_Denoised", false); // Denoised Result
 
             // SSGI Textures (Scaled Res, HDR)
             TextureHandle ssgiRaw = UniversalRenderer.CreateRenderGraphTexture(renderGraph, ssrDesc, "LNSurface_SSGI_Raw", false);
             TextureHandle ssgiBlurred = UniversalRenderer.CreateRenderGraphTexture(renderGraph, ssrDesc, "LNSurface_SSGI_Blurred", false);
+            TextureHandle ssgiDenoised = UniversalRenderer.CreateRenderGraphTexture(renderGraph, ssrDesc, "LNSurface_SSGI_Denoised", false); // Denoised Result
 
             // SSCS Textures (Full Res, R8) - Contact Shadows need precision
             var sscsDesc = desc;
@@ -447,6 +485,74 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                         context.cmd.DispatchCompute(data.compute, data.kernel, gx, gy, 1);
                     });
                 }
+
+                // 7.2 SSR Temporal Reprojection Pass (New)
+                // History Buffer Management
+                if (!_ssrHistoryBuffers.TryGetValue(cameraData.camera, out var historyBuffers))
+                {
+                    historyBuffers = new RTHandle[2];
+                    var historyDesc = ssrDesc;
+                    historyDesc.enableRandomWrite = true;
+                    historyBuffers[0] = RTHandles.Alloc(historyDesc, name: $"_LNSurface_SSR_History0_{cameraData.camera.name}");
+                    historyBuffers[1] = RTHandles.Alloc(historyDesc, name: $"_LNSurface_SSR_History1_{cameraData.camera.name}");
+                    _ssrHistoryBuffers[cameraData.camera] = historyBuffers;
+                }
+
+                // Swap buffers (Ping-Pong)
+                var readHistory = historyBuffers[0];
+                var writeHistory = historyBuffers[1];
+                historyBuffers[0] = writeHistory;
+                historyBuffers[1] = readHistory;
+                _ssrHistoryBuffers[cameraData.camera] = historyBuffers; // Update reference
+
+                // Import persistent history into RenderGraph
+                TextureHandle historyReadHandle = renderGraph.ImportTexture(readHistory);
+                TextureHandle historyWriteHandle = renderGraph.ImportTexture(writeHistory);
+
+                using (var builder = renderGraph.AddComputePass<ComputePassData>("LNSurface SSR Temporal Pass", out var passData))
+                {
+                    passData.compute = _settings.lightingComputeShader;
+                    passData.kernel = _settings.lightingComputeShader.FindKernel("CS_TemporalReprojection");
+
+                    passData.frontPacked = frontPacked; // Depth for Velocity
+                    passData.currentFrameResult = ssrBlurred; // Input (Noisy)
+                    passData.historyBuffer = historyReadHandle; // Previous Frame
+                    passData.newHistoryBuffer = historyWriteHandle; // Output (Denoised)
+                    
+                    builder.UseTexture(passData.frontPacked);
+                    builder.UseTexture(passData.currentFrameResult);
+                    builder.UseTexture(passData.historyBuffer);
+                    builder.UseTexture(passData.newHistoryBuffer, AccessFlags.Write);
+
+                    passData.screenParams = new Vector4(scaledDesc.width, scaledDesc.height, 1.0f / scaledDesc.width, 1.0f / scaledDesc.height);
+                    passData.cameraToWorldMatrix = cameraData.camera.cameraToWorldMatrix;
+                    
+                    Matrix4x4 currentViewProj = GL.GetGPUProjectionMatrix(cameraData.camera.projectionMatrix, false) * cameraData.camera.worldToCameraMatrix;
+                    if (!_prevViewProjMatrices.TryGetValue(cameraData.camera, out Matrix4x4 prevViewProj))
+                    {
+                        prevViewProj = currentViewProj;
+                    }
+                    passData.prevViewProjMatrix = prevViewProj;
+
+                    builder.SetRenderFunc((ComputePassData data, ComputeGraphContext context) =>
+                    {
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Front_Packed", data.frontPacked);
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_CurrentFrameResult", data.currentFrameResult);
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_HistoryBuffer", data.historyBuffer);
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_NewHistoryBuffer", data.newHistoryBuffer);
+                        
+                        context.cmd.SetComputeVectorParam(data.compute, "_LNSurface_ScreenParams", data.screenParams);
+                        context.cmd.SetComputeMatrixParam(data.compute, "_CameraToWorldMatrix", data.cameraToWorldMatrix);
+                        context.cmd.SetComputeMatrixParam(data.compute, "_PrevViewProjMatrix", data.prevViewProjMatrix);
+
+                        int gx = Mathf.CeilToInt(data.screenParams.x / 8.0f);
+                        int gy = Mathf.CeilToInt(data.screenParams.y / 8.0f);
+                        context.cmd.DispatchCompute(data.compute, data.kernel, gx, gy, 1);
+                    });
+                }
+                
+                // Update SSR Texture to use the Denoised Result
+                ssrDenoised = historyWriteHandle; 
             }
 
             // 7.5 SSGI Calculation Pass
@@ -535,6 +641,74 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                         context.cmd.DispatchCompute(data.compute, data.kernel, gx, gy, 1);
                     });
                 }
+
+                // 7.7 SSGI Temporal Reprojection Pass (New)
+                // History Buffer Management
+                if (!_ssgiHistoryBuffers.TryGetValue(cameraData.camera, out var ssgiHistoryBuffers))
+                {
+                    ssgiHistoryBuffers = new RTHandle[2];
+                    var historyDesc = ssrDesc; // Same format as SSR
+                    historyDesc.enableRandomWrite = true;
+                    ssgiHistoryBuffers[0] = RTHandles.Alloc(historyDesc, name: $"_LNSurface_SSGI_History0_{cameraData.camera.name}");
+                    ssgiHistoryBuffers[1] = RTHandles.Alloc(historyDesc, name: $"_LNSurface_SSGI_History1_{cameraData.camera.name}");
+                    _ssgiHistoryBuffers[cameraData.camera] = ssgiHistoryBuffers;
+                }
+
+                // Swap buffers (Ping-Pong)
+                var readHistory = ssgiHistoryBuffers[0];
+                var writeHistory = ssgiHistoryBuffers[1];
+                ssgiHistoryBuffers[0] = writeHistory;
+                ssgiHistoryBuffers[1] = readHistory;
+                _ssgiHistoryBuffers[cameraData.camera] = ssgiHistoryBuffers; // Update reference
+
+                // Import persistent history into RenderGraph
+                TextureHandle historyReadHandle = renderGraph.ImportTexture(readHistory);
+                TextureHandle historyWriteHandle = renderGraph.ImportTexture(writeHistory);
+
+                using (var builder = renderGraph.AddComputePass<ComputePassData>("LNSurface SSGI Temporal Pass", out var passData))
+                {
+                    passData.compute = _settings.lightingComputeShader;
+                    passData.kernel = _settings.lightingComputeShader.FindKernel("CS_TemporalReprojection");
+
+                    passData.frontPacked = frontPacked; // Depth for Velocity
+                    passData.currentFrameResult = ssgiBlurred; // Input (Noisy)
+                    passData.historyBuffer = historyReadHandle; // Previous Frame
+                    passData.newHistoryBuffer = historyWriteHandle; // Output (Denoised)
+                    
+                    builder.UseTexture(passData.frontPacked);
+                    builder.UseTexture(passData.currentFrameResult);
+                    builder.UseTexture(passData.historyBuffer);
+                    builder.UseTexture(passData.newHistoryBuffer, AccessFlags.Write);
+
+                    passData.screenParams = new Vector4(scaledDesc.width, scaledDesc.height, 1.0f / scaledDesc.width, 1.0f / scaledDesc.height);
+                    passData.cameraToWorldMatrix = cameraData.camera.cameraToWorldMatrix;
+                    
+                    Matrix4x4 currentViewProj = GL.GetGPUProjectionMatrix(cameraData.camera.projectionMatrix, false) * cameraData.camera.worldToCameraMatrix;
+                    if (!_prevViewProjMatrices.TryGetValue(cameraData.camera, out Matrix4x4 prevViewProj))
+                    {
+                        prevViewProj = currentViewProj;
+                    }
+                    passData.prevViewProjMatrix = prevViewProj;
+
+                    builder.SetRenderFunc((ComputePassData data, ComputeGraphContext context) =>
+                    {
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Front_Packed", data.frontPacked);
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_CurrentFrameResult", data.currentFrameResult);
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_HistoryBuffer", data.historyBuffer);
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_NewHistoryBuffer", data.newHistoryBuffer);
+                        
+                        context.cmd.SetComputeVectorParam(data.compute, "_LNSurface_ScreenParams", data.screenParams);
+                        context.cmd.SetComputeMatrixParam(data.compute, "_CameraToWorldMatrix", data.cameraToWorldMatrix);
+                        context.cmd.SetComputeMatrixParam(data.compute, "_PrevViewProjMatrix", data.prevViewProjMatrix);
+
+                        int gx = Mathf.CeilToInt(data.screenParams.x / 8.0f);
+                        int gy = Mathf.CeilToInt(data.screenParams.y / 8.0f);
+                        context.cmd.DispatchCompute(data.compute, data.kernel, gx, gy, 1);
+                    });
+                }
+                
+                // Update SSGI Texture to use the Denoised Result
+                ssgiDenoised = historyWriteHandle; 
             }
 
             // 7.8 SSCS Calculation Pass
@@ -624,6 +798,15 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                     passData.inverseProjectionMatrix = passData.projectionMatrix.inverse;
                     passData.screenParams = new Vector4(resultDesc.width, resultDesc.height, 1.0f / resultDesc.width, 1.0f / resultDesc.height);
 
+                    // Temporal Reprojection Matrix Update
+                    Matrix4x4 currentViewProj = passData.projectionMatrix * passData.worldToCameraMatrix;
+                    if (!_prevViewProjMatrices.TryGetValue(cameraData.camera, out Matrix4x4 prevViewProj))
+                    {
+                        prevViewProj = currentViewProj; // First frame
+                    }
+                    passData.prevViewProjMatrix = prevViewProj;
+                    _prevViewProjMatrices[cameraData.camera] = currentViewProj; // Update for next frame
+
                     // SSR Params
                     passData.enableSSR = _settings.enableSSR ? 1.0f : 0.0f;
                     passData.ssrMaxSteps = _settings.ssrMaxSteps;
@@ -655,7 +838,8 @@ public class LNSurfaceFeature : ScriptableRendererFeature
 
                     if (_settings.enableSSR)
                     {
-                        passData.ssrTexture = ssrBlurred;
+                        // Use Denoised SSR if available, otherwise Blurred
+                        passData.ssrTexture = ssrDenoised.IsValid() ? ssrDenoised : ssrBlurred;
                     }
                     else
                     {
@@ -665,7 +849,8 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                     // SSGI Texture Binding Logic
                     if (_settings.enableSSGI)
                     {
-                        passData.ssgiTexture = ssgiBlurred;
+                        // Use Denoised SSGI if available, otherwise Blurred
+                        passData.ssgiTexture = ssgiDenoised.IsValid() ? ssgiDenoised : ssgiBlurred;
                     }
                     else
                     {

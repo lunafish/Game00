@@ -102,6 +102,7 @@ int _SSAO_SampleCount;  // 샘플 개수 (4~32 권장)
 float _EnableSSGI;
 float _SSGI_Intensity;
 int _SSGI_SampleCount;
+int _SSGI_MaxSteps; // Added
 float _SSGI_RayStepSize;
 
 // --- SSCS (Screen Space Cast Shadow) 설정 ---
@@ -117,6 +118,9 @@ int _FrameCount;
 
 // Hi-Z Settings
 int _HiZ_MaxMip;
+
+// Backface Raymarching Option
+float _UseBackfaceRaymarching;
 
 #ifndef PI
 #define PI 3.14159265359f
@@ -369,10 +373,11 @@ float CalculateSSAO(float3 posWS, float3 normalWS, uint2 pixId)
  * @param startPosVS: 시작 위치 (뷰 공간)
  * @param rayDirVS: 반사 레이 방향 (뷰 공간)
  * @param stepSize: 레이 전진 보폭
+ * @param maxSteps: 최대 레이마칭 단계 (Added)
  * @param hitUV: 충돌 시 화면 UV 결과값
  * @param hitBack: 뒷면(Back face) 충돌 여부
  */
-bool Raymarch(float3 startPosVS, float3 rayDirVS, float stepSize, out float2 hitUV, out bool hitBack)
+bool Raymarch(float3 startPosVS, float3 rayDirVS, float stepSize, int maxSteps, out float2 hitUV, out bool hitBack)
 {
     float3 rayPosVS = startPosVS;
     hitBack = false;
@@ -384,14 +389,18 @@ bool Raymarch(float3 startPosVS, float3 rayDirVS, float stepSize, out float2 hit
 
     float3 rayDir = normalize(rayDirVS);
     
-    // Bias: 시작 위치를 표면에서 살짝 띄움
-    rayPosVS += rayDir * 0.05;
+    // Bias: 시작 위치를 표면에서 살짝 띄움 (Depth-dependent bias)
+    // 기존: rayPosVS += rayDir * 0.05;
+    // 수정: 깊이에 비례하여 바이어스 증가 (0.5% of depth)
+    float startDepth = -startPosVS.z;
+    float bias = max(0.05, startDepth * 0.005); 
+    rayPosVS += rayDir * bias;
 
     // 이전 스텝 위치 저장용 (Binary Search를 위해)
     float3 prevRayPosVS = rayPosVS;
 
     [loop]
-    for (int i = 0; i < _SSR_MaxSteps; i++)
+    for (int i = 0; i < maxSteps; i++)
     {
         // prevRayPosVS = rayPosVS; // <-- 여기가 아니라 이동 직전에 저장해야 함
 
@@ -447,20 +456,44 @@ bool Raymarch(float3 startPosVS, float3 rayDirVS, float stepSize, out float2 hit
 
                 // 2. 최종 충돌 판정
                 float fDepth = frontDepth;
-                float bDepth = _LNSurface_Back_Packed.SampleLevel(painter_point_clamp_sampler, screenPos.xy, 0).b;
                 
-                bool hasBackFace = (bDepth > fDepth + 0.001) && (bDepth < 900.0);
-                float thickness = hasBackFace ? (bDepth - fDepth) : _SSR_Thickness;
-                
-                float adaptiveThickness = max(_SSR_Thickness, traveled * 0.005); // 계수 감소 (0.01 -> 0.005)
-                thickness = max(thickness, adaptiveThickness);
-
-                // 충돌 허용 오차 완화 (-0.02 -> -0.05)
-                if (rayDepth >= fDepth - 0.05 && rayDepth <= fDepth + thickness)
+                if (_UseBackfaceRaymarching > 0.5)
                 {
-                    hitUV = screenPos.xy;
-                    hitBack = hasBackFace && (abs(rayDepth - bDepth) < abs(rayDepth - fDepth));
-                    return true;
+                    float bDepth = _LNSurface_Back_Packed.SampleLevel(painter_point_clamp_sampler, screenPos.xy, 0).b;
+                    
+                    bool hasBackFace = (bDepth > fDepth + 0.001) && (bDepth < 900.0);
+                    float thickness = hasBackFace ? (bDepth - fDepth) : _SSR_Thickness;
+                    
+                    float adaptiveThickness = max(_SSR_Thickness, traveled * 0.005); // 계수 감소 (0.01 -> 0.005)
+                    thickness = max(thickness, adaptiveThickness);
+
+                    // 충돌 허용 오차 완화 (-0.02 -> -0.05)
+                    // 수정: 깊이에 비례하여 오차 범위 조절 (0.2% of depth)
+                    float depthTolerance = max(0.05, rayDepth * 0.002);
+
+                    if (rayDepth >= fDepth - depthTolerance && rayDepth <= fDepth + thickness)
+                    {
+                        hitUV = screenPos.xy;
+                        hitBack = hasBackFace && (abs(rayDepth - bDepth) < abs(rayDepth - fDepth));
+                        return true;
+                    }
+                }
+                else
+                {
+                    // Backface 미사용: Front Depth와 Thickness만 사용
+                    float thickness = _SSR_Thickness;
+                    float adaptiveThickness = max(_SSR_Thickness, traveled * 0.005);
+                    thickness = max(thickness, adaptiveThickness);
+                    
+                    // 수정: 깊이에 비례하여 오차 범위 조절
+                    float depthTolerance = max(0.05, rayDepth * 0.002);
+
+                    if (rayDepth >= fDepth - depthTolerance && rayDepth <= fDepth + thickness)
+                    {
+                        hitUV = screenPos.xy;
+                        hitBack = false; // Backface 충돌 없음
+                        return true;
+                    }
                 }
                 
                 // 충돌이 아니라면 다시 전진 (Binary Search로 위치가 뒤로 갔을 수 있으므로 주의)
@@ -659,10 +692,10 @@ void CS_SSGI (uint3 id : SV_DispatchThreadID)
         float2 hitUV;
         bool hitBack;
         
-        if(Raymarch(viewPos, rayDirVS, _SSGI_RayStepSize, hitUV, hitBack))
+        if(Raymarch(viewPos, rayDirVS, _SSGI_RayStepSize, _SSGI_MaxSteps, hitUV, hitBack))
         {
             float3 hitColor;
-            if (hitBack)
+            if (hitBack && _UseBackfaceRaymarching > 0.5)
             {
                 hitColor = _LNSurface_Back_Color.SampleLevel(painter_linear_clamp_sampler, hitUV, 0).rgb;
             }
@@ -671,6 +704,12 @@ void CS_SSGI (uint3 id : SV_DispatchThreadID)
                 hitColor = _SceneColor.SampleLevel(painter_linear_clamp_sampler, hitUV, 0).rgb;
             }
             indirectLight += hitColor;
+        }
+        else
+        {
+            // Fallback: Ambient (Sky) Light
+            float3 rayDirWS = mul((float3x3)_CameraToWorldMatrix, rayDirVS);
+            indirectLight += SampleSH(rayDirWS);
         }
     }
     
@@ -780,12 +819,12 @@ void CS_SSR (uint3 id : SV_DispatchThreadID)
 
         float2 hitUV;
         bool hitBack;
-        if (Raymarch(startPos, reflectDirVS, _SSR_StepSize, hitUV, hitBack))
+        if (Raymarch(startPos, reflectDirVS, _SSR_StepSize, _SSR_MaxSteps, hitUV, hitBack))
         {
             float hitMask = _LNSurface_Front_Extra.SampleLevel(painter_linear_clamp_sampler, hitUV, 0).r;
             if (hitMask > 0.1 || hitBack) 
             {
-                if (hitBack)
+                if (hitBack && _UseBackfaceRaymarching > 0.5)
                     reflectionColor = _LNSurface_Back_Color.SampleLevel(painter_linear_clamp_sampler, hitUV, 0).rgb;
                 else
                 {
@@ -1189,10 +1228,50 @@ void CSMain (uint3 id : SV_DispatchThreadID)
     float3 ambientColor = SampleSH(normalWS) * albedo * (1.0 - metallic);
 
     // --- SSGI 적용 (간접광) ---
+    float3 ssgi = 0;
     if (_EnableSSGI > 0.5)
     {
-        // Half-Res SSGI 텍스처를 Full-Res UV로 샘플링 (Linear Interpolation)
-        float3 ssgi = _LNSurface_SSGI_Blurred.SampleLevel(painter_linear_clamp_sampler, uv, 0).rgb;
+        // Nearest-Depth Upsampling
+        float width, height;
+        _LNSurface_SSGI_Blurred.GetDimensions(width, height);
+        float2 ssgiTexelSize = float2(1.0 / width, 1.0 / height);
+
+        // 현재 픽셀의 저해상도 텍스처 상의 좌표 (0.5 씩 오프셋되어 텍셀 중심을 맞춤)
+        float2 lowResUV = uv * float2(width, height) - 0.5;
+        float2 baseUV = floor(lowResUV);
+
+        // 4개의 샘플 UV (저해상도 텍스처 기준)
+        float2 uv00 = (baseUV + float2(0.5, 0.5)) * ssgiTexelSize;
+        float2 uv10 = (baseUV + float2(1.5, 0.5)) * ssgiTexelSize;
+        float2 uv01 = (baseUV + float2(0.5, 1.5)) * ssgiTexelSize;
+        float2 uv11 = (baseUV + float2(1.5, 1.5)) * ssgiTexelSize;
+
+        // 각 샘플의 깊이와 색상 가져오기
+        // 주의: Depth는 Full-Res 텍스처이지만, 저해상도 그리드 위치에 맞춰 샘플링하여 '저해상도 픽셀이 가졌던 깊이'를 근사함
+        float d00 = _LNSurface_Front_Packed.SampleLevel(painter_point_clamp_sampler, uv00, 0).b;
+        float d10 = _LNSurface_Front_Packed.SampleLevel(painter_point_clamp_sampler, uv10, 0).b;
+        float d01 = _LNSurface_Front_Packed.SampleLevel(painter_point_clamp_sampler, uv01, 0).b;
+        float d11 = _LNSurface_Front_Packed.SampleLevel(painter_point_clamp_sampler, uv11, 0).b;
+
+        float3 c00 = _LNSurface_SSGI_Blurred.SampleLevel(painter_point_clamp_sampler, uv00, 0).rgb;
+        float3 c10 = _LNSurface_SSGI_Blurred.SampleLevel(painter_point_clamp_sampler, uv10, 0).rgb;
+        float3 c01 = _LNSurface_SSGI_Blurred.SampleLevel(painter_point_clamp_sampler, uv01, 0).rgb;
+        float3 c11 = _LNSurface_SSGI_Blurred.SampleLevel(painter_point_clamp_sampler, uv11, 0).rgb;
+
+        // 현재 픽셀 깊이와의 차이 계산
+        float w00 = abs(d00 - linearDepth);
+        float w10 = abs(d10 - linearDepth);
+        float w01 = abs(d01 - linearDepth);
+        float w11 = abs(d11 - linearDepth);
+
+        // 가장 깊이 차이가 적은 샘플 선택 (Nearest Depth)
+        float minDiff = w00;
+        ssgi = c00;
+
+        if (w10 < minDiff) { minDiff = w10; ssgi = c10; }
+        if (w01 < minDiff) { minDiff = w01; ssgi = c01; }
+        if (w11 < minDiff) { minDiff = w11; ssgi = c11; }
+
         ambientColor += ssgi * albedo * _SSGI_Intensity * (1.0 - metallic);
     }
 
@@ -1246,6 +1325,10 @@ void CSMain (uint3 id : SV_DispatchThreadID)
     else if (_DebugMode == 3) // SSR Blurred
     {
         finalResult = reflectionColor;
+    }
+    else if (_DebugMode == 4) // SSGI Blurred
+    {
+        finalResult = ssgi;
     }
 
     _Result[id.xy] = float4(finalResult, 1.0);

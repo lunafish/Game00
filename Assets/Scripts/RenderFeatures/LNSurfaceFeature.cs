@@ -34,7 +34,8 @@ public class LNSurfaceFeature : ScriptableRendererFeature
             None = 0,
             HiZ = 1,
             SSR_Raw = 2,
-            SSR_Blurred = 3
+            SSR_Blurred = 3,
+            SSGI_Blurred = 4
         }
 
         public LayerMask layerMask = -1;
@@ -43,6 +44,7 @@ public class LNSurfaceFeature : ScriptableRendererFeature
         
         [Header("Optimization")]
         public ResolutionScale resolutionScale = ResolutionScale.Half;
+        public bool useBackfaceRaymarching = true; // Added Option
 
         public bool enableSSS = true; 
         // intensity and thicknessScale removed (controlled by material)
@@ -73,6 +75,7 @@ public class LNSurfaceFeature : ScriptableRendererFeature
         public bool enableSSGI = true;
         [Range(0f, 5f)] public float ssgiIntensity = 1.0f;
         [Range(1, 16)] public int ssgiSampleCount = 4;
+        [Range(8, 128)] public int ssgiMaxSteps = 64; // Added SSGI Max Steps
         [Range(0.1f, 2.0f)] public float ssgiRayStepSize = 0.5f;
 
         [Header("Contact Shadows")]
@@ -225,6 +228,7 @@ public class LNSurfaceFeature : ScriptableRendererFeature
             internal float enableSSGI;
             internal float ssgiIntensity;
             internal int ssgiSampleCount;
+            internal int ssgiMaxSteps; // Added
             internal float ssgiRayStepSize;
 
             // SSCS Params
@@ -238,6 +242,7 @@ public class LNSurfaceFeature : ScriptableRendererFeature
             internal float enableCheckerboard;
             internal int frameCount;
             internal int debugMode;
+            internal float useBackfaceRaymarching; // Added
 
             // Light Data
             internal Vector4 mainLightDirection;  
@@ -562,6 +567,7 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                     passDataSSR.frameCount = _frameCount;
                     passDataSSR.maxMipLevel = Mathf.Min(10, Mathf.FloorToInt(Mathf.Log(Mathf.Max(scaledDesc.width, scaledDesc.height), 2)));
                     passDataSSR.debugMode = (int)_settings.debugMode;
+                    passDataSSR.useBackfaceRaymarching = _settings.useBackfaceRaymarching ? 1.0f : 0.0f; // Added
 
                     builder.SetRenderFunc((ComputePassData data, ComputeGraphContext context) =>
                     {
@@ -585,6 +591,7 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                         context.cmd.SetComputeIntParam(data.compute, "_FrameCount", data.frameCount);
                         context.cmd.SetComputeIntParam(data.compute, "_HiZ_MaxMip", data.maxMipLevel);
                         context.cmd.SetComputeIntParam(data.compute, "_DebugMode", data.debugMode);
+                        context.cmd.SetComputeFloatParam(data.compute, "_UseBackfaceRaymarching", data.useBackfaceRaymarching); // Added
 
                         int gx = Mathf.CeilToInt(data.screenParams.x / 8.0f);
                         int gy = Mathf.CeilToInt(data.screenParams.y / 8.0f);
@@ -732,6 +739,8 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                     passDataSSGI.enableCheckerboard = _settings.enableCheckerboard ? 1.0f : 0.0f;
                     passDataSSGI.frameCount = _frameCount;
                     passDataSSGI.maxMipLevel = Mathf.Min(10, Mathf.FloorToInt(Mathf.Log(Mathf.Max(scaledDesc.width, scaledDesc.height), 2)));
+                    passDataSSGI.ssgiMaxSteps = _settings.ssgiMaxSteps; // Pass SSGI Max Steps
+                    passDataSSGI.useBackfaceRaymarching = _settings.useBackfaceRaymarching ? 1.0f : 0.0f; // Added
 
                     builder.SetRenderFunc((ComputePassData data, ComputeGraphContext context) =>
                     {
@@ -754,6 +763,8 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                         context.cmd.SetComputeFloatParam(data.compute, "_EnableCheckerboard", data.enableCheckerboard);
                         context.cmd.SetComputeIntParam(data.compute, "_FrameCount", data.frameCount);
                         context.cmd.SetComputeIntParam(data.compute, "_HiZ_MaxMip", data.maxMipLevel);
+                        context.cmd.SetComputeIntParam(data.compute, "_SSGI_MaxSteps", data.ssgiMaxSteps); // Set SSGI Max Steps
+                        context.cmd.SetComputeFloatParam(data.compute, "_UseBackfaceRaymarching", data.useBackfaceRaymarching); // Added
 
                         int gx = Mathf.CeilToInt(data.screenParams.x / 8.0f);
                         int gy = Mathf.CeilToInt(data.screenParams.y / 8.0f);

@@ -34,9 +34,11 @@ Material:
     - _FresnelPower: 5
     - _FresnelStrength: 0.5
     - _Metallic: 0
+    - _SSSIntensity: 1
     - _SSSMask: 1
+    - _SSSThickness: 10
     - _ShadowStrength: 1
-    - _Smoothness: 0.5
+    - _Smoothness: 0.75
     - _Subsurface: 0
     m_Colors:
     - _BaseColor: {r: 1, g: 0, b: 0, a: 1}

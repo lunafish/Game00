@@ -98,15 +98,15 @@ MonoBehaviour:
     resolutionScale: 4
     useBackfaceRaymarching: 1
     enableSSS: 1
-    specularStrength: 0.5
+    specularStrength: 1
     diffuseWrap: 0.5
     shadowTintMode: 1
     shadowTintColor: {r: 0.3921569, g: 0.5843138, b: 0.9294118, a: 1}
-    shadowTintIntensity: 0.25
-    shadowThreshold: 0.25
+    shadowTintIntensity: 0.5
+    shadowThreshold: 0.26
     enableSSR: 1
     ssrMaxSteps: 8
-    ssrStepSize: 0.333
+    ssrStepSize: 0.33
     ssrThickness: 0.1
     enableSSAO: 1
     ssaoRadius: 0.5

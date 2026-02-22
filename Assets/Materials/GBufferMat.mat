@@ -99,7 +99,7 @@ Material:
     - _DstBlend: 0
     - _DstBlendAlpha: 0
     - _EnvironmentReflections: 1
-    - _FresnelPower: 7.94
+    - _FresnelPower: 8.11
     - _FresnelStrength: 0.5
     - _GlossMapScale: 0
     - _Glossiness: 0
@@ -109,26 +109,26 @@ Material:
     - _Parallax: 0.005
     - _QueueOffset: 0
     - _ReceiveShadows: 1
-    - _SSSIntensity: 2
+    - _SSSIntensity: 1
     - _SSSMask: 1
-    - _SSSThickness: 10
+    - _SSSThickness: 15
     - _ShadowStrength: 0.5
-    - _Smoothness: 0.777
+    - _Smoothness: 0.33
     - _SmoothnessTextureChannel: 0
     - _SpecularHighlights: 1
     - _SrcBlend: 1
     - _SrcBlendAlpha: 1
-    - _Subsurface: 0.3
+    - _Subsurface: 0.33
     - _Surface: 0
     - _WorkflowMode: 1
     - _XRMotionVectorsPass: 1
     - _ZWrite: 1
     m_Colors:
-    - _BaseColor: {r: 0.9, g: 0.9, b: 0.9, a: 1}
+    - _BaseColor: {r: 0.9607844, g: 1, b: 0.9803922, a: 1}
     - _Color: {r: 0.9, g: 0.9, b: 0.9, a: 1}
     - _EmissionColor: {r: 0, g: 0, b: 0, a: 1}
     - _SpecColor: {r: 0.19999996, g: 0.19999996, b: 0.19999996, a: 1}
-    - _SpecularColor: {r: 0.5019608, g: 0.5019608, b: 0.5019608, a: 1}
+    - _SpecularColor: {r: 0.3921569, g: 0.5843138, b: 0.9294118, a: 1}
   m_BuildTextureStacks: []
   m_AllowLocking: 1
 --- !u!114 &9022484026067859511

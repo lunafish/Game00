@@ -2,6 +2,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using UnityEngine;
+using UnityEngine.Rendering; // IndexFormat.UInt32 사용을 위해 추가
 using Debug = UnityEngine.Debug;
 using Random = UnityEngine.Random;
 
@@ -13,6 +14,12 @@ namespace CityGen
     [RequireComponent(typeof(MeshFilter), typeof(MeshRenderer), typeof(MeshCollider))]
     public class SimpleCityGenerator : MonoBehaviour, ISerializationCallbackReceiver
     {
+        public enum BuildingDisplayMode
+        {
+            Individual, // 건물마다 별도의 GameObject 생성
+            Combined    // 모든 건물을 하나의 Mesh로 통합
+        }
+
         [Header("분할 설정 (Subdivision Settings)")]
         public int seed = 1234;
         public Vector2 citySize = new Vector2(100, 100);
@@ -22,6 +29,7 @@ namespace CityGen
         [Range(0, 5f)] public float nodeJitter = 1.0f;
 
         [Header("건물 및 부지 설정 (Building & Lot Settings)")]
+        public BuildingDisplayMode displayMode = BuildingDisplayMode.Individual; // New: 표시 모드
         public int subdivisionDepth = 2;
         public float minLotArea = 100f;
         [Range(0, 0.45f)] public float lotSplitJitter = 0.2f;
@@ -54,7 +62,10 @@ namespace CityGen
         protected List<List<int>> adjacency = new List<List<int>>();
         private Dictionary<int, Vector3[]> _nodeJunctionCorners = new Dictionary<int, Vector3[]>();
         [SerializeField, HideInInspector] protected List<CityBlock> cityBlocks = new List<CityBlock>();
-        private Transform _buildingRoot;
+        
+        // 건물 루트 오브젝트
+        private Transform _buildingRoot;        // 개별 건물들의 부모
+        private GameObject _combinedBuildingObj; // 통합된 건물 오브젝트
         
         // 디버그용 정점 리스트
         private List<Vector3> _debugLotVerts = new List<Vector3>();
@@ -135,7 +146,7 @@ namespace CityGen
             // 6. 부지 정점 보정 (T-Junction 해결)
             RefineLotShapes();
 
-            // 7. 건물 부지 메쉬 생성
+            // 7. 건물 부지 메쉬 생성 (개별 및 통합 모두 생성)
             GenerateBuildingMeshes();
             
             // 8. 연결 정보 로그 출력
@@ -643,24 +654,38 @@ namespace CityGen
 
         private void GenerateBuildingMeshes()
         {
-            // 기존 건물 루트 제거
+            // 1. 기존 건물 루트 및 통합 오브젝트 제거
             if (_buildingRoot != null)
             {
                 if (Application.isPlaying) Destroy(_buildingRoot.gameObject);
                 else DestroyImmediate(_buildingRoot.gameObject);
             }
+            if (_combinedBuildingObj != null)
+            {
+                if (Application.isPlaying) Destroy(_combinedBuildingObj);
+                else DestroyImmediate(_combinedBuildingObj);
+            }
             
-            _buildingRoot = new GameObject("Buildings").transform;
+            // 2. 새로운 컨테이너 생성
+            _buildingRoot = new GameObject("Buildings_Individual").transform;
             _buildingRoot.SetParent(transform, false);
 
+            _combinedBuildingObj = new GameObject("Buildings_Combined");
+            _combinedBuildingObj.transform.SetParent(transform, false);
+
             _debugLotVerts.Clear();
+
+            // 통합 메쉬를 위한 데이터 리스트
+            List<Vector3> allVerts = new List<Vector3>();
+            List<int> allTris = new List<int>();
+            List<Vector2> allUvs = new List<Vector2>();
 
             for (int bIdx = 0; bIdx < cityBlocks.Count; bIdx++)
             {
                 var block = cityBlocks[bIdx];
                 if (block.subLots == null || block.subLots.Count == 0) continue;
 
-                // 1. 블록 내 모든 부지에 층수 및 층 높이 사전 할당
+                // 블록 내 모든 부지에 층수 및 층 높이 사전 할당
                 int[] lotFloors = new int[block.subLots.Count];
                 float[] lotFloorHeights = new float[block.subLots.Count];
                 for (int i = 0; i < block.subLots.Count; i++)
@@ -669,7 +694,7 @@ namespace CityGen
                     lotFloorHeights[i] = Random.Range(minFloorHeight, maxFloorHeight);
                 }
 
-                // 2. 엣지 공유 정보 맵핑 (엣지 -> 해당 엣지를 가진 부지들의 절대 높이 리스트)
+                // 엣지 공유 정보 맵핑
                 var edgeToHeights = new Dictionary<EdgeKey, List<float>>();
                 for (int i = 0; i < block.subLots.Count; i++)
                 {
@@ -684,13 +709,13 @@ namespace CityGen
                     }
                 }
 
-                // 3. 개별 건물 메쉬 생성
+                // 개별 건물 메쉬 생성 및 통합 데이터 수집
                 for (int i = 0; i < block.subLots.Count; i++)
                 {
                     Vector3[] poly = block.subLots[i].array;
                     if (poly == null || poly.Length < 3) continue;
 
-                    // 개별 빌딩을 위한 데이터
+                    // 개별 빌딩을 위한 임시 데이터
                     List<Vector3> bVerts = new List<Vector3>();
                     List<int> bTris = new List<int>();
                     List<Vector2> bUvs = new List<Vector2>();
@@ -716,7 +741,7 @@ namespace CityGen
                         bTris.Add(roofStartIdx + j + 1);
                     }
 
-                    // --- 층별 외벽 생성 (최적화: 1층 별도, 2층 이상 통합) ---
+                    // --- 층별 외벽 생성 ---
                     for (int j = 0; j < poly.Length; j++)
                     {
                         Vector3 p1 = poly[j];
@@ -735,7 +760,7 @@ namespace CityGen
                             }
                         }
 
-                        // 1. 1층 처리 (0 ~ myFloorHeight)
+                        // 1층 처리
                         float f1Bottom = 0;
                         float f1Top = myFloorHeight;
                         if (f1Top > neighborMaxHeight + 0.01f)
@@ -744,21 +769,20 @@ namespace CityGen
                             AddWallQuad(bVerts, bUvs, bTris, ref vertOffset, p1, p2, actualBottom, f1Top);
                         }
 
-                        // 2. 2층 이상 통합 처리 (myFloorHeight ~ myTotalHeight)
+                        // 2층 이상 통합 처리
                         if (myFloors > 1)
                         {
                             float restBottom = myFloorHeight;
                             float restTop = myTotalHeight;
                             if (restTop > neighborMaxHeight + 0.01f)
                             {
-                                // 2층 시작점보다 이웃 건물이 높다면 이웃 건물 높이부터 시작
                                 float actualBottom = Mathf.Max(restBottom, neighborMaxHeight);
                                 AddWallQuad(bVerts, bUvs, bTris, ref vertOffset, p1, p2, actualBottom, restTop);
                             }
                         }
                     }
 
-                    // --- 개별 오브젝트 생성 ---
+                    // A. 개별 오브젝트 생성 (Individual Mode용)
                     if (bVerts.Count > 0)
                     {
                         Mesh mesh = new Mesh();
@@ -776,9 +800,58 @@ namespace CityGen
                         MeshRenderer mr = go.AddComponent<MeshRenderer>();
                         mr.sharedMaterial = buildingMaterial != null ? buildingMaterial : meshRenderer.sharedMaterial;
                         go.AddComponent<MeshCollider>().sharedMesh = mesh;
+
+                        // B. 통합 데이터에 추가 (Combined Mode용)
+                        int currentGlobalVertCount = allVerts.Count;
+                        allVerts.AddRange(bVerts);
+                        allUvs.AddRange(bUvs);
+                        foreach (int tri in bTris)
+                        {
+                            allTris.Add(tri + currentGlobalVertCount);
+                        }
                     }
                 }
             }
+
+            // 3. 통합 메쉬 생성
+            if (allVerts.Count > 0)
+            {
+                Mesh combinedMesh = new Mesh();
+                combinedMesh.name = "CombinedCityBuildings";
+                // 정점 수가 많을 수 있으므로 32비트 인덱스 포맷 사용
+                combinedMesh.indexFormat = IndexFormat.UInt32; 
+                combinedMesh.vertices = allVerts.ToArray();
+                combinedMesh.triangles = allTris.ToArray();
+                combinedMesh.uv = allUvs.ToArray();
+                combinedMesh.RecalculateNormals();
+                combinedMesh.RecalculateBounds();
+
+                _combinedBuildingObj.AddComponent<MeshFilter>().mesh = combinedMesh;
+                MeshRenderer mr = _combinedBuildingObj.AddComponent<MeshRenderer>();
+                mr.sharedMaterial = buildingMaterial != null ? buildingMaterial : meshRenderer.sharedMaterial;
+                _combinedBuildingObj.AddComponent<MeshCollider>().sharedMesh = combinedMesh;
+            }
+
+            // 4. 현재 모드에 따라 가시성 설정
+            UpdateBuildingVisibility();
+        }
+
+        private void UpdateBuildingVisibility()
+        {
+            if (_buildingRoot != null)
+            {
+                _buildingRoot.gameObject.SetActive(displayMode == BuildingDisplayMode.Individual);
+            }
+            if (_combinedBuildingObj != null)
+            {
+                _combinedBuildingObj.SetActive(displayMode == BuildingDisplayMode.Combined);
+            }
+        }
+
+        // 인스펙터에서 값이 변경될 때 호출됨
+        private void OnValidate()
+        {
+            UpdateBuildingVisibility();
         }
 
         private void AddWallQuad(List<Vector3> verts, List<Vector2> uvs, List<int> tris, ref int offset, Vector3 p1, Vector3 p2, float bottomY, float topY)

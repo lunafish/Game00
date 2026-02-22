@@ -75,30 +75,32 @@ MonoBehaviour:
     lightingComputeShader: {fileID: 7200000, guid: 882c8abbaf1e64165a0ab4587a14e525, type: 3}
     lightingModel: 1
     resolutionScale: 4
+    useBackfaceRaymarching: 1
     enableSSS: 1
     specularStrength: 1
-    diffuseWrap: 0.25
+    diffuseWrap: 0.5
     shadowTintMode: 1
     shadowTintColor: {r: 0, g: 0, b: 0.2, a: 1}
-    shadowTintIntensity: 0.5
-    shadowThreshold: 0.75
+    shadowTintIntensity: 0.25
+    shadowThreshold: 0.25
     enableSSR: 1
-    ssrMaxSteps: 64
-    ssrStepSize: 0.1
+    ssrMaxSteps: 8
+    ssrStepSize: 0.33
     ssrThickness: 0.1
     enableSSAO: 1
     ssaoRadius: 0.5
     ssaoIntensity: 1
     ssaoSampleCount: 16
     enableSSGI: 1
-    ssgiIntensity: 0.34
+    ssgiIntensity: 0.5
     ssgiSampleCount: 16
+    ssgiMaxSteps: 8
     ssgiRayStepSize: 0.5
     enableSSCS: 1
     sscsDistance: 1
     sscsMaxSteps: 16
     sscsThickness: 0.1
-    sscsIntensity: 1
+    sscsIntensity: 0.1
     enableCheckerboard: 1
     debugMode: 0
     renderPassEvent: 500

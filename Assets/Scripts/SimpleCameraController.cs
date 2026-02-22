@@ -1,5 +1,7 @@
 using UnityEngine;
 using UnityEngine.InputSystem;
+using UnityEngine.InputSystem.EnhancedTouch;
+using Touch = UnityEngine.InputSystem.EnhancedTouch.Touch;
 
 public class SimpleCameraController : MonoBehaviour
 {
@@ -15,6 +17,11 @@ public class SimpleCameraController : MonoBehaviour
     public float maxDistance = 10f;     // 최대 거리 (줌아웃)
     public float zoomSpeed = 0.5f;      // 줌 속도
     
+    [Header("Touch Settings")]
+    public float touchSensitivityX = 0.2f; // 터치 좌우 감도
+    public float touchSensitivityY = 0.2f; // 터치 상하 감도
+    public float touchZoomSpeed = 0.01f;   // 터치 줌 속도
+
     [Header("Limitations")]
     public float minVerticalAngle = -20f; // 아래로 내려다보는 최대 각도 (제한)
     public float maxVerticalAngle = 80f;  // 위로 올려다보는 최대 각도
@@ -22,11 +29,30 @@ public class SimpleCameraController : MonoBehaviour
     private float currentX = 0f;
     private float currentY = 0f;
 
+    void OnEnable()
+    {
+        EnhancedTouchSupport.Enable();
+    }
+
+    void OnDisable()
+    {
+        EnhancedTouchSupport.Disable();
+    }
+
     void Start()
     {
-        // 커서 잠금 및 숨김 (게임 플레이 시 필수)
-        Cursor.lockState = CursorLockMode.Locked;
-        Cursor.visible = false;
+        // 모바일 플랫폼에서는 커서를 보이게 하고 잠금 해제
+        if (Application.isMobilePlatform)
+        {
+            Cursor.lockState = CursorLockMode.None;
+            Cursor.visible = true;
+        }
+        else
+        {
+            // PC 등에서는 커서 잠금 및 숨김
+            Cursor.lockState = CursorLockMode.Locked;
+            Cursor.visible = false;
+        }
 
         // 초기 각도 설정 (현재 카메라 각도 유지)
         Vector3 angles = transform.eulerAngles;
@@ -45,36 +71,70 @@ public class SimpleCameraController : MonoBehaviour
     {
         if (target == null) return;
 
-        // 1. 입력 수집 (Input System)
-        float mouseX = 0;
-        float mouseY = 0;
-        float scroll = 0;
+        float inputX = 0f;
+        float inputY = 0f;
+        float zoomDelta = 0f;
 
-        if (Mouse.current != null)
+        // 1. 터치 입력 처리 (EnhancedTouch 사용)
+        if (Touch.activeTouches.Count > 0)
+        {
+            // 한 손가락: 회전
+            if (Touch.activeTouches.Count == 1)
+            {
+                var touch = Touch.activeTouches[0];
+                if (touch.phase == UnityEngine.InputSystem.TouchPhase.Moved)
+                {
+                    inputX = touch.delta.x * touchSensitivityX;
+                    inputY = touch.delta.y * touchSensitivityY;
+                }
+            }
+            // 두 손가락: 핀치 줌
+            else if (Touch.activeTouches.Count >= 2)
+            {
+                var touch0 = Touch.activeTouches[0];
+                var touch1 = Touch.activeTouches[1];
+
+                // 이전 프레임의 터치 위치 계산
+                Vector2 touch0PrevPos = touch0.screenPosition - touch0.delta;
+                Vector2 touch1PrevPos = touch1.screenPosition - touch1.delta;
+
+                // 이전 거리와 현재 거리 비교
+                float prevTouchDeltaMag = (touch0PrevPos - touch1PrevPos).magnitude;
+                float touchDeltaMag = (touch0.screenPosition - touch1.screenPosition).magnitude;
+
+                // 거리가 멀어지면(확대) distance 감소, 가까워지면(축소) distance 증가
+                // deltaMagnitudeDiff > 0 (가까워짐) -> 줌 아웃
+                // deltaMagnitudeDiff < 0 (멀어짐) -> 줌 인
+                float deltaMagnitudeDiff = prevTouchDeltaMag - touchDeltaMag;
+
+                zoomDelta = deltaMagnitudeDiff * touchZoomSpeed;
+            }
+        }
+        // 2. 마우스 입력 처리 (터치가 없을 때)
+        else if (Mouse.current != null)
         {
             Vector2 delta = Mouse.current.delta.ReadValue();
-            mouseX = delta.x * sensitivityX;
-            mouseY = delta.y * sensitivityY;
-            scroll = Mouse.current.scroll.y.ReadValue();
+            inputX = delta.x * sensitivityX;
+            inputY = delta.y * sensitivityY;
+            
+            float scroll = Mouse.current.scroll.y.ReadValue();
+            if (Mathf.Abs(scroll) > 0.1f)
+            {
+                zoomDelta = -scroll * zoomSpeed * 0.01f;
+            }
         }
 
-        // 2. 회전 계산
-        currentX += mouseX;
-        currentY -= mouseY; // 마우스 위로(+Y) -> 카메라는 위를 봐야 함? 
-                            // 보통 FPS에서 마우스 위로 = 고개 듬 = Pitch 감소(X축 회전 마이너스).
-                            // Unity: Euler X 0=Horizon, 90=Down, -90=Up.
-                            // So decreasing Y (Pitch) looks UP. 
+        // 3. 회전 적용
+        currentX += inputX;
+        currentY -= inputY; // 마우스/터치 위로 -> Pitch 감소 (위를 봄)
         
         currentY = Mathf.Clamp(currentY, minVerticalAngle, maxVerticalAngle);
 
-        // 3. 줌 (거리 조절)
-        if (Mathf.Abs(scroll) > 0.1f)
-        {
-            distance -= scroll * zoomSpeed * 0.01f;
-            distance = Mathf.Clamp(distance, minDistance, maxDistance);
-        }
+        // 4. 줌 적용
+        distance += zoomDelta;
+        distance = Mathf.Clamp(distance, minDistance, maxDistance);
 
-        // 4. 위치 및 회전 적용
+        // 5. 위치 및 회전 최종 적용
         Quaternion rotation = Quaternion.Euler(currentY, currentX, 0);
         
         // 타겟 위치에서 Rotation * Distance 만큼 뒤로 뺌

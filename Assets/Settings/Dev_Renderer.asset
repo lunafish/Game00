@@ -102,7 +102,7 @@ MonoBehaviour:
     shadowTintMode: 1
     shadowTintColor: {r: 0.3921569, g: 0.5843138, b: 0.9294118, a: 1}
     shadowTintIntensity: 0.25
-    shadowThreshold: 0.75
+    shadowThreshold: 0.25
     enableSSR: 1
     ssrMaxSteps: 8
     ssrStepSize: 0.4
@@ -119,7 +119,7 @@ MonoBehaviour:
     sscsDistance: 1
     sscsMaxSteps: 16
     sscsThickness: 0.1
-    sscsIntensity: 0.34
+    sscsIntensity: 0.1
     enableCheckerboard: 1
     debugMode: 0
     renderPassEvent: 500

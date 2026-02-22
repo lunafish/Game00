@@ -653,15 +653,11 @@ namespace CityGen
             _buildingRoot = new GameObject("Buildings").transform;
             _buildingRoot.SetParent(transform, false);
 
-            List<Vector3> allVerts = new List<Vector3>();
-            List<int> allTris = new List<int>();
-            List<Vector2> allUvs = new List<Vector2>();
-            
             _debugLotVerts.Clear();
-            int vertOffset = 0;
 
-            foreach (var block in cityBlocks)
+            for (int bIdx = 0; bIdx < cityBlocks.Count; bIdx++)
             {
+                var block = cityBlocks[bIdx];
                 if (block.subLots == null || block.subLots.Count == 0) continue;
 
                 // 1. 블록 내 모든 부지에 층수 및 층 높이 사전 할당
@@ -688,11 +684,17 @@ namespace CityGen
                     }
                 }
 
-                // 3. 메쉬 생성
+                // 3. 개별 건물 메쉬 생성
                 for (int i = 0; i < block.subLots.Count; i++)
                 {
                     Vector3[] poly = block.subLots[i].array;
                     if (poly == null || poly.Length < 3) continue;
+
+                    // 개별 빌딩을 위한 데이터
+                    List<Vector3> bVerts = new List<Vector3>();
+                    List<int> bTris = new List<int>();
+                    List<Vector2> bUvs = new List<Vector2>();
+                    int vertOffset = 0;
 
                     int myFloors = lotFloors[i];
                     float myFloorHeight = lotFloorHeights[i];
@@ -703,15 +705,15 @@ namespace CityGen
                     for (int j = 0; j < poly.Length; j++)
                     {
                         Vector3 pos = poly[j] + Vector3.up * myTotalHeight; 
-                        allVerts.Add(pos);
-                        allUvs.Add(new Vector2(pos.x, pos.z) * 0.5f);
+                        bVerts.Add(pos);
+                        bUvs.Add(new Vector2(pos.x, pos.z) * 0.5f);
                     }
                     vertOffset += poly.Length;
                     for (int j = 1; j < poly.Length - 1; j++)
                     {
-                        allTris.Add(roofStartIdx + 0);
-                        allTris.Add(roofStartIdx + j);
-                        allTris.Add(roofStartIdx + j + 1);
+                        bTris.Add(roofStartIdx + 0);
+                        bTris.Add(roofStartIdx + j);
+                        bTris.Add(roofStartIdx + j + 1);
                     }
 
                     // --- 층별 외벽 생성 (최적화: 1층 별도, 2층 이상 통합) ---
@@ -739,7 +741,7 @@ namespace CityGen
                         if (f1Top > neighborMaxHeight + 0.01f)
                         {
                             float actualBottom = Mathf.Max(f1Bottom, neighborMaxHeight);
-                            AddWallQuad(allVerts, allUvs, allTris, ref vertOffset, p1, p2, actualBottom, f1Top);
+                            AddWallQuad(bVerts, bUvs, bTris, ref vertOffset, p1, p2, actualBottom, f1Top);
                         }
 
                         // 2. 2층 이상 통합 처리 (myFloorHeight ~ myTotalHeight)
@@ -751,31 +753,32 @@ namespace CityGen
                             {
                                 // 2층 시작점보다 이웃 건물이 높다면 이웃 건물 높이부터 시작
                                 float actualBottom = Mathf.Max(restBottom, neighborMaxHeight);
-                                AddWallQuad(allVerts, allUvs, allTris, ref vertOffset, p1, p2, actualBottom, restTop);
+                                AddWallQuad(bVerts, bUvs, bTris, ref vertOffset, p1, p2, actualBottom, restTop);
                             }
                         }
                     }
+
+                    // --- 개별 오브젝트 생성 ---
+                    if (bVerts.Count > 0)
+                    {
+                        Mesh mesh = new Mesh();
+                        mesh.name = $"BuildingMesh_{bIdx}_{i}";
+                        mesh.vertices = bVerts.ToArray();
+                        mesh.triangles = bTris.ToArray();
+                        mesh.uv = bUvs.ToArray();
+                        mesh.RecalculateNormals();
+                        mesh.RecalculateBounds();
+
+                        GameObject go = new GameObject($"Building_{bIdx}_{i}");
+                        go.transform.SetParent(_buildingRoot, false);
+                        
+                        go.AddComponent<MeshFilter>().mesh = mesh;
+                        MeshRenderer mr = go.AddComponent<MeshRenderer>();
+                        mr.sharedMaterial = buildingMaterial != null ? buildingMaterial : meshRenderer.sharedMaterial;
+                        go.AddComponent<MeshCollider>().sharedMesh = mesh;
+                    }
                 }
             }
-
-
-            if (allVerts.Count == 0) return;
-
-            Mesh lotMesh = new Mesh();
-            lotMesh.name = "CityBuildings_Mesh";
-            if (allVerts.Count > 65000) lotMesh.indexFormat = UnityEngine.Rendering.IndexFormat.UInt32;
-            lotMesh.vertices = allVerts.ToArray();
-            lotMesh.triangles = allTris.ToArray();
-            lotMesh.uv = allUvs.ToArray();
-            lotMesh.RecalculateNormals();
-            lotMesh.RecalculateBounds();
-
-            GameObject lotsObj = new GameObject("BuildingMesh");
-            lotsObj.transform.SetParent(_buildingRoot, false);
-            lotsObj.AddComponent<MeshFilter>().mesh = lotMesh;
-            MeshRenderer mr = lotsObj.AddComponent<MeshRenderer>();
-            mr.sharedMaterial = buildingMaterial != null ? buildingMaterial : meshRenderer.sharedMaterial;
-            lotsObj.AddComponent<MeshCollider>().sharedMesh = lotMesh;
         }
 
         private void AddWallQuad(List<Vector3> verts, List<Vector2> uvs, List<int> tris, ref int offset, Vector3 p1, Vector3 p2, float bottomY, float topY)

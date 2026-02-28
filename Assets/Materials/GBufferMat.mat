@@ -12,7 +12,8 @@ Material:
   m_Parent: {fileID: 0}
   m_ModifiedSerializedProperties: 0
   m_ValidKeywords: []
-  m_InvalidKeywords: []
+  m_InvalidKeywords:
+  - _USEINNERTRIPLANAR_ON
   m_LightmapFlags: 4
   m_EnableInstancingVariants: 0
   m_DoubleSidedGI: 0
@@ -106,16 +107,18 @@ Material:
     - _DiffuseWrap: 0.72
     - _DstBlend: 0
     - _DstBlendAlpha: 0
+    - _EnableInnerPOM: 1
     - _EnvironmentReflections: 1
     - _FresnelPower: 8.11
     - _FresnelStrength: 0.5
     - _GlossMapScale: 0
     - _Glossiness: 0
     - _GlossyReflections: 0
-    - _InnerBlend: 0.512
+    - _InnerBlend: 0.837
     - _InnerDepthFade: 1
     - _InnerDepthScale: 0.01
     - _InnerIOR: 1.45
+    - _InnerTriplanarTile: 1
     - _Metallic: 0
     - _OcclusionStrength: 1
     - _Parallax: 0.005
@@ -132,6 +135,7 @@ Material:
     - _SrcBlendAlpha: 1
     - _Subsurface: 0.33
     - _Surface: 0
+    - _UseInnerTriplanar: 1
     - _WorkflowMode: 1
     - _XRMotionVectorsPass: 1
     - _ZWrite: 1

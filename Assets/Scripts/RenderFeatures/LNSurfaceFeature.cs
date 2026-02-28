@@ -36,7 +36,8 @@ public class LNSurfaceFeature : ScriptableRendererFeature
             SSR_Raw = 2,
             SSR_Blurred = 3,
             SSGI_Blurred = 4,
-            InnerPOM = 5
+            InnerPOM = 5,
+            InnerHeight = 6
         }
 
         public LayerMask layerMask = -1;

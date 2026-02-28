@@ -19,7 +19,7 @@ Texture2D<float4> _LNSurface_Front_Packed; // RG: Oct-Encoded Normal, B: Linear 
 Texture2D<float4> _LNSurface_Front_Extra;  // R: Mask, G: Metallic, B: Smoothness, A: Unused
 Texture2D<float4> _LNSurface_Front_Extra2; // R: Shadow, G: Packed(Sub/Aniso), B: Packed(Int/Thick), A: Unused
 Texture2D<float4> _LNSurface_Front_Inner;  // R: Height, G: Normal X, B: Normal Y, A: Unused (Inner POM)
-Texture2D<float4> _LNSurface_Front_InnerParams; // R: Color(332), G: Scale/IOR(44), B: Blend/Fade(44), A: Unused
+Texture2D<float4> _LNSurface_Front_InnerParams; // R: Color(332), G: Thickness/IOR(44), B: Blend/Fade(44), A: Unused
 
 Texture2D<float4> _LNSurface_Back_Color;   // RGB: 뒷면 컬러
 Texture2D<float4> _LNSurface_Back_Packed;  // RG: Oct-Encoded Normal, B: Linear Depth, A: 미사용
@@ -1049,13 +1049,6 @@ float2 CalculateInnerPOM(float2 uv, float3 viewDirTS, float depthScale, uint2 pi
     
     for(int i=0; i<linearSteps; i++)
     {
-        // Screen Space Triplanar:
-        // If Triplanar is enabled, we assume the GBuffer contains Triplanar-mapped data.
-        // However, moving UV in screen space doesn't perfectly map to moving in 3D space for Triplanar.
-        // But for shallow depths, it's a reasonable approximation.
-        // The key is that 'currentUV' is Screen UV, and we sample the GBuffer at that Screen UV.
-        // This effectively samples the "surface at a different screen position", which has different World Pos and thus different Triplanar mapping.
-        
         currentHeight = _LNSurface_Front_Inner.SampleLevel(painter_linear_clamp_sampler, currentUV, 0).r;
         
         if(currentLayerDepth >= (1.0 - currentHeight)) // Hit!
@@ -1112,13 +1105,8 @@ void CSMain (uint3 id : SV_DispatchThreadID)
     float4 gbufferExtra2 = _LNSurface_Front_Extra2[id.xy];
     
     // 마스크 체크 (렌더링 대상이 아닌 배경 처리)
-    // Mask is now a bitmask packed in R channel
-    int maskFlags = int(gbufferExtra.r * 255.0 + 0.5);
-    bool sssEnabled = (maskFlags & 1) != 0;
-    bool triplanarEnabled = (maskFlags & 2) != 0;
-    
-    // If no flags are set (background or masked out), skip
-    if (maskFlags == 0)
+    float mask = gbufferExtra.r;
+    if (mask <= 0.001)
     {
         _Result[id.xy] = _SceneColor[id.xy]; 
         return;
@@ -1176,15 +1164,23 @@ void CSMain (uint3 id : SV_DispatchThreadID)
     innerColor.g = float((pColor >> 2) & 7) / 7.0;
     innerColor.b = float(pColor & 3) / 3.0;
     
-    // Unpack Scale & IOR (G: 44)
-    uint pScaleIOR = (uint)(innerParamsPacked.g * 255.0 + 0.5);
-    float innerDepthScale = float((pScaleIOR >> 4) & 15) / 15.0 * 0.1; // 0.0 ~ 0.1
-    float innerIOR = float(pScaleIOR & 15) / 15.0 * 2.0 + 1.0; // 1.0 ~ 3.0
+    // Unpack Thickness & IOR (G: 44)
+    uint pThickIOR = (uint)(innerParamsPacked.g * 255.0 + 0.5);
+    float innerSurfaceThickness = float((pThickIOR >> 4) & 15) / 15.0 * 0.2; // 0.0 ~ 0.2
+    float innerIOR = float(pThickIOR & 15) / 15.0 * 2.0 + 1.0; // 1.0 ~ 3.0
     
     // Unpack Blend & Fade (B: 44)
     uint pBlendFade = (uint)(innerParamsPacked.b * 255.0 + 0.5);
     float innerBlend = float((pBlendFade >> 4) & 15) / 15.0; // 0.0 ~ 1.0
     float innerDepthFade = float(pBlendFade & 15) / 15.0 * 5.0; // 0.0 ~ 5.0
+    
+    // Mask Unpacking for Triplanar
+    int maskFlags = int(gbufferExtra.r * 255.0 + 0.5);
+    bool sssEnabled = (maskFlags & 1) != 0;
+    bool triplanarEnabled = (maskFlags & 2) != 0;
+    
+    float3 innerContribution = 0;
+    float finalInnerBlend = 0;
     
     if (_EnableInnerPOM > 0.5)
     {
@@ -1198,21 +1194,24 @@ void CSMain (uint3 id : SV_DispatchThreadID)
         
         float3 tangentVS = normalize(posRight - viewPos);
         float3 bitangentVS = normalize(posUp - viewPos);
-        float3 normalVS = normalize(cross(tangentVS, bitangentVS)); // Reconstructed Normal
         
         // Transform to World Space
         float3 tangentWS = mul((float3x3)_CameraToWorldMatrix, tangentVS);
         float3 bitangentWS = mul((float3x3)_CameraToWorldMatrix, bitangentVS);
         
-        // Orthonormalize with actual normal
-        tangentWS = normalize(tangentWS - normalWS * dot(tangentWS, normalWS));
-        bitangentWS = cross(normalWS, tangentWS);
+        // Calculate Geometric Normal from reconstructed tangent frame
+        float3 geomNormalWS = normalize(cross(tangentWS, bitangentWS));
+        
+        // Orthonormalize Tangent Basis using Geometric Normal (not Normal Map)
+        // This ensures the inner space aligns with the polygon surface
+        tangentWS = normalize(tangentWS - geomNormalWS * dot(tangentWS, geomNormalWS));
+        bitangentWS = cross(geomNormalWS, tangentWS);
         
         // 2. Refract View Vector (Tangent Space Approximation)
         float3 viewDirTS = float3(
             dot(viewDir, tangentWS),
             dot(viewDir, bitangentWS),
-            dot(viewDir, normalWS)
+            dot(viewDir, geomNormalWS) // Use Geometric Normal for projection
         );
         
         float3 refractDirTS = viewDirTS;
@@ -1221,21 +1220,36 @@ void CSMain (uint3 id : SV_DispatchThreadID)
         // Normalize XY for UV offset calculation
         float2 viewDirTS_UV = normalize(refractDirTS.xy) * float2(1, -1); 
         
+        // Apply Surface Thickness Offset with Aspect Ratio Correction
+        float aspect = _LNSurface_ScreenParams.x / _LNSurface_ScreenParams.y;
+        float2 thicknessOffset = refractDirTS.xy * innerSurfaceThickness;
+        thicknessOffset.y *= aspect; // Correct vertical offset
+        
+        float2 startUV = uv - thicknessOffset;
+        
         // 3. Raymarch (Improved with Binary Search & Jitter)
-        // Pass triplanarEnabled flag
-        float2 innerUV = CalculateInnerPOM(uv, refractDirTS, innerDepthScale, id.xy, triplanarEnabled);
+        float fixedDepthScale = 0.05;
+        float2 innerUV = CalculateInnerPOM(startUV, refractDirTS, fixedDepthScale, id.xy, triplanarEnabled);
         
         // Calculate Inner Depth for fading
-        innerDepth = length(innerUV - uv) * 100.0; // Approximate depth from UV offset
+        innerDepth = length(innerUV - startUV) * 100.0; // Approximate depth from UV offset
         
         // 4. Sample Inner Normal
         float4 innerData = _LNSurface_Front_Inner.SampleLevel(painter_linear_clamp_sampler, innerUV, 0);
-        // innerData.gb is packed normal (0..1)
         float3 localInnerNormal = float3(innerData.g * 2.0 - 1.0, innerData.b * 2.0 - 1.0, 1.0);
         localInnerNormal.z = sqrt(max(0, 1.0 - dot(localInnerNormal.xy, localInnerNormal.xy))); // Reconstruct Z
         
         // Transform Local Inner Normal to World Space
-        innerNormalWS = normalize(tangentWS * localInnerNormal.x + bitangentWS * localInnerNormal.y + normalWS * localInnerNormal.z);
+        innerNormalWS = normalize(tangentWS * localInnerNormal.x + bitangentWS * localInnerNormal.y + geomNormalWS * localInnerNormal.z);
+        
+        // Calculate Inner Lighting Contribution
+        // We calculate this once here, but it depends on light direction.
+        // So we just prepare variables for the loop.
+        
+        // Fresnel-based Blending
+        float NdotV = saturate(abs(dot(normalWS, viewDir)) + 1e-5);
+        float fresnel = Local_SchlickFresnel(NdotV);
+        finalInnerBlend = innerBlend * (1.0 - fresnel);
     }
 
     float3 totalDiffuse = 0;
@@ -1355,16 +1369,11 @@ void CSMain (uint3 id : SV_DispatchThreadID)
                 // Inner Diffuse는 좀 더 부드럽게 (Wrap)
                 innerNdotL = (innerNdotL + 0.5) / 1.5; 
                 
-                // Fresnel-based Blending
-                // Glancing Angle(측면)에서는 표면 반사가 강해져 내부가 덜 보임
-                float fresnel = Local_SchlickFresnel(NdotV);
-                float blend = innerBlend * (1.0 - fresnel);
-                
                 // Depth Fade (Deep parts are darker)
                 float depthFade = exp(-innerDepth * innerDepthFade);
                 
                 // Blend Inner Diffuse
-                diffuseTerm = lerp(diffuseTerm, innerColor * innerNdotL * mixedLightColor * depthFade, blend);
+                diffuseTerm = lerp(diffuseTerm, innerColor * innerNdotL * mixedLightColor * depthFade, finalInnerBlend);
             }
             
             totalDiffuse += diffuseTerm * (1.0 - metallic);
@@ -1389,7 +1398,7 @@ void CSMain (uint3 id : SV_DispatchThreadID)
                 // Additive Blending for "Sparkle" inside
                 // Also affected by Depth Fade
                 float depthFade = exp(-innerDepth * innerDepthFade);
-                specTerm += innerSpec * innerBlend * depthFade;
+                specTerm += innerSpec * finalInnerBlend * depthFade; 
             }
             
             totalSpecular += max(0, specTerm) * lightColor * NdotL * PI * atten;
@@ -1414,7 +1423,22 @@ void CSMain (uint3 id : SV_DispatchThreadID)
             
             // SSS Intensity를 밝기 Multiplier로 사용
             float attenuation = exp(-thickness);
-            totalSSS += attenuation * albedo.rgb * lightColor * backLightFactor * atten * sssIntensity;
+            
+            // SSSS 감쇠 (Inner POM이 덮어씀)
+            float sssAttenuation = 1.0;
+            if (_EnableInnerPOM > 0.5)
+            {
+                sssAttenuation = (1.0 - finalInnerBlend * 0.8);
+            }
+            
+            totalSSS += attenuation * albedo.rgb * lightColor * backLightFactor * atten * sssIntensity * sssAttenuation;
+            
+            // Inner POM에 SSS 느낌 추가 (Back Light가 있을 때 내부가 밝아짐)
+            if (_EnableInnerPOM > 0.5)
+            {
+                float3 innerScattering = lightColor * atten * sssIntensity * backLightFactor * 0.5;
+                totalDiffuse += innerScattering * innerColor * finalInnerBlend;
+            }
         }
     }
 
@@ -1531,6 +1555,11 @@ void CSMain (uint3 id : SV_DispatchThreadID)
             // Visualize Inner Normal
             finalResult = innerNormalWS * 0.5 + 0.5;
         }
+    }
+    else if (_DebugMode == 6) // Inner Height Debug
+    {
+        float h = _LNSurface_Front_Inner.SampleLevel(painter_point_clamp_sampler, uv, 0).r;
+        finalResult = float3(h, h, h);
     }
 
     _Result[id.xy] = float4(finalResult, 1.0);

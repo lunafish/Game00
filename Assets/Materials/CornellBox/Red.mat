@@ -27,12 +27,26 @@ Material:
         m_Texture: {fileID: 0}
         m_Scale: {x: 1, y: 1}
         m_Offset: {x: 0, y: 0}
+    - _InnerHeightMap:
+        m_Texture: {fileID: 0}
+        m_Scale: {x: 1, y: 1}
+        m_Offset: {x: 0, y: 0}
+    - _InnerNormalMap:
+        m_Texture: {fileID: 0}
+        m_Scale: {x: 1, y: 1}
+        m_Offset: {x: 0, y: 0}
     m_Ints: []
     m_Floats:
     - _Anisotropic: 0
     - _DiffuseWrap: 0.25
+    - _EnableInnerPOM: 0
     - _FresnelPower: 5
     - _FresnelStrength: 0.5
+    - _InnerBlend: 0.5
+    - _InnerDepthFade: 1
+    - _InnerDepthScale: 0.02
+    - _InnerIOR: 1.45
+    - _InnerTriplanarTile: 1
     - _Metallic: 0
     - _SSSIntensity: 1
     - _SSSMask: 1
@@ -40,8 +54,10 @@ Material:
     - _ShadowStrength: 1
     - _Smoothness: 0.75
     - _Subsurface: 0
+    - _UseInnerTriplanar: 0
     m_Colors:
     - _BaseColor: {r: 1, g: 0, b: 0, a: 1}
+    - _InnerColor: {r: 1, g: 1, b: 1, a: 1}
     - _SpecularColor: {r: 1, g: 1, b: 1, a: 1}
   m_BuildTextureStacks: []
   m_AllowLocking: 1

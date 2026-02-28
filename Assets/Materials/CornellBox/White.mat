@@ -46,8 +46,12 @@ Material:
     - _InnerDepthFade: 1
     - _InnerDepthScale: 0.02
     - _InnerIOR: 1.45
+    - _InnerSSSBlend: 0.5
+    - _InnerSurfaceThickness: 0
     - _InnerTriplanarTile: 1
     - _Metallic: 0
+    - _ResinAbsorption: 1
+    - _ResinTurbidity: 0
     - _SSSIntensity: 1
     - _SSSMask: 1
     - _SSSThickness: 10

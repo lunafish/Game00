@@ -32,12 +32,22 @@ public class LNSurfaceFeature : ScriptableRendererFeature
         public enum DebugMode
         {
             None = 0,
-            HiZ = 1,
-            SSR_Raw = 2,
-            SSR_Blurred = 3,
-            SSGI_Blurred = 4,
-            InnerPOM = 5,
-            InnerHeight = 6
+            GBuffer1 = 1,
+            Albedo = 2,
+            FinalNormal = 3,
+            Metallic = 4,
+            Smoothness = 5,
+            Subsurface = 6,
+            Anisotropic = 7,
+            SSSIntensity = 8,
+            Shadow = 9,
+            InnerColor = 10,
+            InnerThickness = 11,
+            InnerBlend = 12,
+            Mask = 13,
+            InnerDepth = 14,
+            ResinAbsorption = 15,
+            ResinTurbidity = 16
         }
 
         public LayerMask layerMask = -1;

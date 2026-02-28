@@ -1027,11 +1027,12 @@ void CS_HiZ_Downsample(uint3 id : SV_DispatchThreadID)
 }
 
 // --- Inner POM Helper ---
-float2 CalculateInnerPOM(float2 uv, float3 viewDirTS, float depthScale, uint2 pixId, bool useTriplanar)
+float2 CalculateInnerPOM(float2 uv, float3 viewDirTS, float depthScale, uint2 pixId, bool useTriplanar, out float outLayerDepth)
 {
     // 1. Linear Search (Coarse)
     int linearSteps = 10;
     float stepSize = 1.0 / (float)linearSteps;
+    outLayerDepth = 0.0;
     
     float2 currentUV = uv;
     float2 deltaUV = viewDirTS.xy * depthScale / (float)linearSteps;
@@ -1076,6 +1077,7 @@ float2 CalculateInnerPOM(float2 uv, float3 viewDirTS, float depthScale, uint2 pi
                     startDepth = midDepth;
                 }
             }
+            outLayerDepth = (startDepth + endDepth) * 0.5;
             return (startUV + endUV) * 0.5;
         }
         
@@ -1087,6 +1089,7 @@ float2 CalculateInnerPOM(float2 uv, float3 viewDirTS, float depthScale, uint2 pi
         currentLayerDepth += stepSize;
     }
     
+    outLayerDepth = currentLayerDepth;
     return currentUV;
 }
 
@@ -1172,8 +1175,21 @@ void CSMain (uint3 id : SV_DispatchThreadID)
     // Unpack Blend & Fade (B: 44)
     uint pBlendFade = (uint)(innerParamsPacked.b * 255.0 + 0.5);
     float innerBlend = float((pBlendFade >> 4) & 15) / 15.0; // 0.0 ~ 1.0
-    float innerDepthFade = float(pBlendFade & 15) / 15.0 * 5.0; // 0.0 ~ 5.0
     
+    // Apply square curve for innerDepthFade for smoother tuning
+    float rawFade = float(pBlendFade & 15) / 15.0;
+    float innerDepthFade = (rawFade * rawFade) * 5.0; // 0.0 ~ 5.0
+    
+    // Unpack Absorption & Turbidity (A: 44)
+    // Apply cubic curve (x^3) to provide extremely fine precision near 0
+    uint pAbsTurb = (uint)(innerParamsPacked.a * 255.0 + 0.5);
+    float rawAbs = float((pAbsTurb >> 4) & 15) / 15.0;
+    float rawTurb = float(pAbsTurb & 15) / 15.0;
+
+    // x^2 gives a good balance between precision near 0 and visible change
+    float resinAbsorption = pow(rawAbs, 4.0) * 5.0; // 0.0 ~ 10.0
+    float resinTurbidity = pow(rawTurb, 4.0) * 0.75; // 0.0 ~ 1.5
+
     // Mask Unpacking for Triplanar
     int maskFlags = int(mask * 255.0 + 0.5);
     bool sssEnabled = (maskFlags & 1) != 0;
@@ -1239,8 +1255,12 @@ void CSMain (uint3 id : SV_DispatchThreadID)
         float2 startUV = uv - thicknessOffset;
         
         // 3. Raymarch (Improved with Binary Search & Jitter)
-        float fixedDepthScale = 0.05;
-        float2 innerUV = CalculateInnerPOM(uv, viewDirTS, innerSurfaceThickness, id.xy, triplanarEnabled);
+        float outLayerDepth = 0.0;
+        float2 innerUV = CalculateInnerPOM(uv, viewDirTS, innerSurfaceThickness, id.xy, triplanarEnabled, outLayerDepth);
+            
+        // Calculate physical inner depth (travel distance)
+        float nDotV = max(0.001, dot(viewDir, geomNormalWS));
+        innerDepth = (outLayerDepth * innerSurfaceThickness) / nDotV;
             
         // Sample Inner Normal (Unpack from 0..1 to -1..1 from GBuffer3 G/B channels)
         float2 packedInner = _LNSurface_Front_GBuffer3.SampleLevel(painter_linear_clamp_sampler, innerUV, 0).gb;
@@ -1377,11 +1397,41 @@ void CSMain (uint3 id : SV_DispatchThreadID)
                 // Inner Diffuse는 좀 더 부드럽게 (Wrap)
                 innerNdotL = (innerNdotL + 0.5) / 1.5; 
                 
-                // Depth Fade (Deep parts are darker)
-                float depthFade = exp(-innerDepth * innerDepthFade);
+                // --- Resin Volumetric Effect (Beer-Lambert & Scattering) ---
+                // Transmission: Absorption by Resin (BaseColor)
+                // If albedo is (1,1,1), it shouldn't absorb. But to make it more "visible" as resin,
+                // we can add a slight darkening factor based on absorption even for white.
+                float3 absColor = max(albedo, 0.01);
+                float distanceFactor = max(0.0, innerDepth * resinAbsorption * 2.0);
                 
-                // Blend Inner Diffuse
-                diffuseTerm = lerp(diffuseTerm, innerColor * innerNdotL * mixedLightColor * depthFade, finalInnerBlend);
+                // Physical Beer-Lambert approximation
+                float3 transmission = exp(- (1.0 - absColor) * distanceFactor);
+                // Also apply base tint independently to ensure behavior at 0 distance
+                transmission *= absColor;
+                
+                // Depth fade override
+                float depthFade = exp(-innerDepth * innerDepthFade);
+                transmission *= depthFade;
+                
+                // Turbidity (Scattering Fog)
+                float fogAmount = 1.0 - exp(-resinTurbidity * innerDepth * 15.0);
+                
+                // Fake scattering based on resin color and surface lighting (NOT inner lighting)
+                float rawNdotL = dot(normalWS, lightDir);
+                float surfaceNdotL = saturate((rawNdotL + diffuseWrap) / (1.0 + diffuseWrap));
+                float3 fogColor = albedo * mixedLightColor * surfaceNdotL; 
+                
+                // Base inner surface diffuse
+                float3 innerDiffuse = innerColor * innerNdotL * mixedLightColor;
+                
+                // Visible inner POM is tinted by the resin transmission
+                float3 visibleInner = innerDiffuse * transmission;
+                
+                // Combine: visible inner is obscured by turbidity fog
+                float3 combinedInner = lerp(visibleInner, fogColor, fogAmount);
+                
+                // Blend Inner Diffuse into surface
+                diffuseTerm = lerp(diffuseTerm, combinedInner, finalInnerBlend);
             }
             
             totalDiffuse += diffuseTerm * (1.0 - metallic);
@@ -1403,10 +1453,17 @@ void CSMain (uint3 id : SV_DispatchThreadID)
                 float innerD = Local_GTR2(innerNdotH, alpha * 0.8); // Inner is slightly sharper
                 float3 innerSpec = (innerD * F * G) / (4.0 * NdotL * NdotV + 0.0001);
                 
+                // Resin Volumetric Effect for Specular
+                float3 absColor = max(albedo, 0.01);
+                float distanceFactor = max(0.0, innerDepth * resinAbsorption * 2.0);
+                
+                float3 transmissionSpec = exp(- (1.0 - absColor) * distanceFactor) * absColor;
+                transmissionSpec *= exp(-innerDepth * innerDepthFade);
+                
+                float fogAmount = 1.0 - exp(-resinTurbidity * innerDepth * 15.0);
+                
                 // Additive Blending for "Sparkle" inside
-                // Also affected by Depth Fade
-                float depthFade = exp(-innerDepth * innerDepthFade);
-                specTerm += innerSpec * finalInnerBlend * depthFade; 
+                specTerm += innerSpec * transmissionSpec * (1.0 - fogAmount) * finalInnerBlend; 
             }
             
             totalSpecular += max(0, specTerm) * lightColor * NdotL * PI * atten;
@@ -1445,7 +1502,8 @@ void CSMain (uint3 id : SV_DispatchThreadID)
             if (_EnableInnerPOM > 0.5)
             {
                 float3 innerScattering = lightColor * atten * sssIntensity * backLightFactor * 0.5;
-                totalDiffuse += innerScattering * innerColor * finalInnerBlend;
+                // Use albedo instead of innerColor because light scatters through the resin volume
+                totalDiffuse += innerScattering * albedo * finalInnerBlend;
             }
         }
     }
@@ -1554,6 +1612,9 @@ void CSMain (uint3 id : SV_DispatchThreadID)
         else if (_DebugMode == 11) _Result[id.xy] = float4((innerSurfaceThickness / 0.2).xxx, 1.0); // Inner Thick
         else if (_DebugMode == 12) _Result[id.xy] = float4(innerBlend.xxx, 1.0); // Inner Blend
         else if (_DebugMode == 13) _Result[id.xy] = float4(mask.xxx, 1.0); // Mask (GBuffer1 A)
+        else if (_DebugMode == 14) _Result[id.xy] = float4((innerDepth / 0.5).xxx, 1.0); // Inner Depth
+        else if (_DebugMode == 15) _Result[id.xy] = float4((resinAbsorption / 10.0).xxx, 1.0); // Resin Absorption
+        else if (_DebugMode == 16) _Result[id.xy] = float4(resinTurbidity.xxx, 1.0); // Resin Turbidity
         _Result[id.xy] = float4(finalResult, 1.0); // Fallback if no debug mode matches
         return;
     }

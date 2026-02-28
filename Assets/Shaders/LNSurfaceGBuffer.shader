@@ -28,6 +28,8 @@ Shader "Custom/LNSurfaceGBuffer"
         _InnerDepthFade("Inner Depth Fade", Range(0.0, 5.0)) = 1.0
         [Toggle] _UseInnerTriplanar("Use Inner Triplanar", Float) = 0.0
         _InnerTriplanarTile("Inner Triplanar Tile", Float) = 1.0
+        _ResinAbsorption("Resin Absorption", Range(0.0, 10.0)) = 1.0
+        _ResinTurbidity("Resin Turbidity", Range(0.0, 1.0)) = 0.0
     }
 
     SubShader
@@ -86,6 +88,8 @@ Shader "Custom/LNSurfaceGBuffer"
             float _InnerDepthFade;
             float _UseInnerTriplanar;
             float _InnerTriplanarTile;
+            float _ResinAbsorption;
+            float _ResinTurbidity;
         CBUFFER_END
 
         Varyings vert(Attributes input)
@@ -118,7 +122,7 @@ Shader "Custom/LNSurfaceGBuffer"
             float4 GBuffer1 : SV_Target1; // Packed: Normal(RG) + Depth(B) + Mask(A)
             float4 GBuffer2 : SV_Target2; // Metallic(R), Smoothness(G), Shadow(B), Packed Sub/Aniso(A)
             float4 GBuffer3 : SV_Target3; // Inner Height(R), Inner Normal X(G), Inner Normal Y(B), Packed SSS Int/Thick(A)
-            float4 GBuffer4 : SV_Target4; // Inner Color(R), Inner Thick/IOR(G), Inner Blend/Fade(B), Unused(A)
+            float4 GBuffer4 : SV_Target4; // Inner Color(R), Inner Thick/IOR(G), Inner Blend/Fade(B), Packed Abs/Turbidity(A)
         };
 
         FragmentOutputFront frag_front(Varyings input)
@@ -250,7 +254,7 @@ Shader "Custom/LNSurfaceGBuffer"
             // R: Color (3:3:2 Packing) -> 8 bits
             // G: Thickness (4 bits) | IOR (4 bits) -> 8 bits
             // B: Blend (4 bits) | Fade (4 bits) -> 8 bits
-            // A: Unused
+            // A: Absorption (4 bits) | Turbidity (4 bits) -> 8 bits
             
             // Pack Color (R3 G3 B2)
             float r3 = floor(saturate(_InnerColor.r) * 7.0 + 0.5);
@@ -275,7 +279,14 @@ Shader "Custom/LNSurfaceGBuffer"
             float pFade = floor(normFade * 15.0 + 0.5);
             float packedBlendFade = (pBlend * 16.0 + pFade) / 255.0;
             
-            output.GBuffer4 = float4(packedColor, packedThickIOR, packedBlendFade, 0.0);
+            // Pack Absorption & Turbidity (4:4)
+            float normAbsorption = saturate(_ResinAbsorption / 10.0);
+            float normTurbidity = saturate(_ResinTurbidity);
+            float pAbs = floor(normAbsorption * 15.0 + 0.5);
+            float pTurb = floor(normTurbidity * 15.0 + 0.5);
+            float packedAbsTurb = (pAbs * 16.0 + pTurb) / 255.0;
+            
+            output.GBuffer4 = float4(packedColor, packedThickIOR, packedBlendFade, packedAbsTurb);
 
             return output;
         }

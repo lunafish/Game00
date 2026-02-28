@@ -103,7 +103,8 @@ MonoBehaviour:
     shadowTintMode: 1
     shadowTintColor: {r: 0.3921569, g: 0.5843138, b: 0.9294118, a: 1}
     shadowTintIntensity: 0.5
-    shadowThreshold: 0.26
+    shadowThreshold: 0.75
+    enableInnerPOM: 1
     enableSSR: 1
     ssrMaxSteps: 8
     ssrStepSize: 0.33
@@ -113,7 +114,7 @@ MonoBehaviour:
     ssaoIntensity: 1
     ssaoSampleCount: 16
     enableSSGI: 1
-    ssgiIntensity: 0.25
+    ssgiIntensity: 0.5
     ssgiSampleCount: 16
     ssgiMaxSteps: 8
     ssgiRayStepSize: 0.8

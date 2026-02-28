@@ -48,6 +48,14 @@ Material:
         m_Texture: {fileID: 0}
         m_Scale: {x: 1, y: 1}
         m_Offset: {x: 0, y: 0}
+    - _InnerHeightMap:
+        m_Texture: {fileID: 2800000, guid: 375ecd527d0b042ab91ffe50952aa7e5, type: 3}
+        m_Scale: {x: 1, y: 1}
+        m_Offset: {x: 0, y: 0}
+    - _InnerNormalMap:
+        m_Texture: {fileID: 2800000, guid: 298797a2798d84869a18a71cbd7f9a44, type: 3}
+        m_Scale: {x: 1, y: 1}
+        m_Offset: {x: 0, y: 0}
     - _MainTex:
         m_Texture: {fileID: 0}
         m_Scale: {x: 1, y: 1}
@@ -104,6 +112,10 @@ Material:
     - _GlossMapScale: 0
     - _Glossiness: 0
     - _GlossyReflections: 0
+    - _InnerBlend: 0.512
+    - _InnerDepthFade: 1
+    - _InnerDepthScale: 0.01
+    - _InnerIOR: 1.45
     - _Metallic: 0
     - _OcclusionStrength: 1
     - _Parallax: 0.005
@@ -127,6 +139,7 @@ Material:
     - _BaseColor: {r: 0.9607844, g: 1, b: 0.9803922, a: 1}
     - _Color: {r: 0.9, g: 0.9, b: 0.9, a: 1}
     - _EmissionColor: {r: 0, g: 0, b: 0, a: 1}
+    - _InnerColor: {r: 0.254902, g: 0.4117647, b: 0.882353, a: 1}
     - _SpecColor: {r: 0.19999996, g: 0.19999996, b: 0.19999996, a: 1}
     - _SpecularColor: {r: 0.3921569, g: 0.5843138, b: 0.9294118, a: 1}
   m_BuildTextureStacks: []

@@ -18,6 +18,8 @@ Texture2D<float4> _LNSurface_Front_Color;  // RGB: 알베도(Albedo), A: 미사�
 Texture2D<float4> _LNSurface_Front_Packed; // RG: Oct-Encoded Normal, B: Linear Depth, A: 미사용
 Texture2D<float4> _LNSurface_Front_Extra;  // R: Mask, G: Metallic, B: Smoothness, A: Unused
 Texture2D<float4> _LNSurface_Front_Extra2; // R: Shadow, G: Packed(Sub/Aniso), B: Packed(Int/Thick), A: Unused
+Texture2D<float4> _LNSurface_Front_Inner;  // R: Height, G: Normal X, B: Normal Y, A: Unused (Inner POM)
+Texture2D<float4> _LNSurface_Front_InnerParams; // R: Color(332), G: Scale/IOR(44), B: Blend/Fade(44), A: Unused
 
 Texture2D<float4> _LNSurface_Back_Color;   // RGB: 뒷면 컬러
 Texture2D<float4> _LNSurface_Back_Packed;  // RG: Oct-Encoded Normal, B: Linear Depth, A: 미사용
@@ -84,6 +86,10 @@ int _ShadowTintMode; // 0: Custom, 1: Complementary
 float4 _ShadowTintColor;
 float _ShadowTintIntensity;
 float _ShadowThreshold; // 0.0 ~ 1.0
+
+// Inner POM Settings
+float _EnableInnerPOM;
+// Per-pixel params are now in GBuffer
 
 // 화면 공간 반사(SSR) 설정
 float _EnableSSR;      // SSR 활성화 여부
@@ -1021,6 +1027,77 @@ void CS_HiZ_Downsample(uint3 id : SV_DispatchThreadID)
     _HiZ_Destination[id.xy] = minDepth;
 }
 
+// --- Inner POM Helper ---
+float2 CalculateInnerPOM(float2 uv, float3 viewDirTS, float depthScale, uint2 pixId, bool useTriplanar)
+{
+    // 1. Linear Search (Coarse)
+    int linearSteps = 10;
+    float stepSize = 1.0 / (float)linearSteps;
+    
+    float2 currentUV = uv;
+    float2 deltaUV = viewDirTS.xy * depthScale / (float)linearSteps;
+    
+    // Jittering (Dithering) to reduce banding
+    float jitter = Local_Hash(pixId.y * uint(_LNSurface_ScreenParams.x) + pixId.x);
+    currentUV -= deltaUV * jitter;
+    float currentLayerDepth = stepSize * jitter;
+    
+    float2 prevUV = currentUV;
+    float prevLayerDepth = 0.0;
+    float prevHeight = 1.0;
+    float currentHeight = 1.0;
+    
+    for(int i=0; i<linearSteps; i++)
+    {
+        // Screen Space Triplanar:
+        // If Triplanar is enabled, we assume the GBuffer contains Triplanar-mapped data.
+        // However, moving UV in screen space doesn't perfectly map to moving in 3D space for Triplanar.
+        // But for shallow depths, it's a reasonable approximation.
+        // The key is that 'currentUV' is Screen UV, and we sample the GBuffer at that Screen UV.
+        // This effectively samples the "surface at a different screen position", which has different World Pos and thus different Triplanar mapping.
+        
+        currentHeight = _LNSurface_Front_Inner.SampleLevel(painter_linear_clamp_sampler, currentUV, 0).r;
+        
+        if(currentLayerDepth >= (1.0 - currentHeight)) // Hit!
+        {
+            // 2. Binary Search (Refinement)
+            // Refine between prevUV and currentUV
+            float2 startUV = prevUV;
+            float2 endUV = currentUV;
+            float startDepth = prevLayerDepth;
+            float endDepth = currentLayerDepth;
+            
+            for(int j=0; j<5; j++) // 5 iterations of binary search
+            {
+                float2 midUV = (startUV + endUV) * 0.5;
+                float midDepth = (startDepth + endDepth) * 0.5;
+                float midHeight = _LNSurface_Front_Inner.SampleLevel(painter_linear_clamp_sampler, midUV, 0).r;
+                
+                if(midDepth >= (1.0 - midHeight))
+                {
+                    endUV = midUV;
+                    endDepth = midDepth;
+                }
+                else
+                {
+                    startUV = midUV;
+                    startDepth = midDepth;
+                }
+            }
+            return (startUV + endUV) * 0.5;
+        }
+        
+        prevUV = currentUV;
+        prevLayerDepth = currentLayerDepth;
+        prevHeight = currentHeight;
+        
+        currentUV -= deltaUV;
+        currentLayerDepth += stepSize;
+    }
+    
+    return currentUV;
+}
+
 
 [numthreads(8, 8, 1)]
 void CSMain (uint3 id : SV_DispatchThreadID)
@@ -1035,8 +1112,13 @@ void CSMain (uint3 id : SV_DispatchThreadID)
     float4 gbufferExtra2 = _LNSurface_Front_Extra2[id.xy];
     
     // 마스크 체크 (렌더링 대상이 아닌 배경 처리)
-    float mask = gbufferExtra.r;
-    if (mask <= 0.001)
+    // Mask is now a bitmask packed in R channel
+    int maskFlags = int(gbufferExtra.r * 255.0 + 0.5);
+    bool sssEnabled = (maskFlags & 1) != 0;
+    bool triplanarEnabled = (maskFlags & 2) != 0;
+    
+    // If no flags are set (background or masked out), skip
+    if (maskFlags == 0)
     {
         _Result[id.xy] = _SceneColor[id.xy]; 
         return;
@@ -1078,6 +1160,83 @@ void CSMain (uint3 id : SV_DispatchThreadID)
     // 카메라 위치 추출 및 시선 방향 계산
     float3 cameraPosWS = float3(_CameraToWorldMatrix._m03, _CameraToWorldMatrix._m13, _CameraToWorldMatrix._m23);
     float3 viewDir = normalize(cameraPosWS - worldPos);
+
+    // --- Inner POM Logic ---
+    float3 innerNormalWS = normalWS; // Default to surface normal
+    float3 innerAlbedo = albedo;
+    float innerDepth = 0.0;
+    
+    // Unpack Inner Params from GBuffer5
+    float4 innerParamsPacked = _LNSurface_Front_InnerParams[id.xy];
+    
+    // Unpack Color (R: 332)
+    uint pColor = (uint)(innerParamsPacked.r * 255.0 + 0.5);
+    float3 innerColor;
+    innerColor.r = float((pColor >> 5) & 7) / 7.0;
+    innerColor.g = float((pColor >> 2) & 7) / 7.0;
+    innerColor.b = float(pColor & 3) / 3.0;
+    
+    // Unpack Scale & IOR (G: 44)
+    uint pScaleIOR = (uint)(innerParamsPacked.g * 255.0 + 0.5);
+    float innerDepthScale = float((pScaleIOR >> 4) & 15) / 15.0 * 0.1; // 0.0 ~ 0.1
+    float innerIOR = float(pScaleIOR & 15) / 15.0 * 2.0 + 1.0; // 1.0 ~ 3.0
+    
+    // Unpack Blend & Fade (B: 44)
+    uint pBlendFade = (uint)(innerParamsPacked.b * 255.0 + 0.5);
+    float innerBlend = float((pBlendFade >> 4) & 15) / 15.0; // 0.0 ~ 1.0
+    float innerDepthFade = float(pBlendFade & 15) / 15.0 * 5.0; // 0.0 ~ 5.0
+    
+    if (_EnableInnerPOM > 0.5)
+    {
+        // 1. Tangent Space Basis Construction (Improved using Depth Derivatives)
+        float2 texelSize = 1.0 / _LNSurface_ScreenParams;
+        float dX = _LNSurface_Front_Packed.SampleLevel(painter_point_clamp_sampler, uv + float2(texelSize.x, 0), 0).b;
+        float dY = _LNSurface_Front_Packed.SampleLevel(painter_point_clamp_sampler, uv + float2(0, texelSize.y), 0).b;
+        
+        float3 posRight = GetViewSpacePos(uv + float2(texelSize.x, 0), dX);
+        float3 posUp = GetViewSpacePos(uv + float2(0, texelSize.y), dY);
+        
+        float3 tangentVS = normalize(posRight - viewPos);
+        float3 bitangentVS = normalize(posUp - viewPos);
+        float3 normalVS = normalize(cross(tangentVS, bitangentVS)); // Reconstructed Normal
+        
+        // Transform to World Space
+        float3 tangentWS = mul((float3x3)_CameraToWorldMatrix, tangentVS);
+        float3 bitangentWS = mul((float3x3)_CameraToWorldMatrix, bitangentVS);
+        
+        // Orthonormalize with actual normal
+        tangentWS = normalize(tangentWS - normalWS * dot(tangentWS, normalWS));
+        bitangentWS = cross(normalWS, tangentWS);
+        
+        // 2. Refract View Vector (Tangent Space Approximation)
+        float3 viewDirTS = float3(
+            dot(viewDir, tangentWS),
+            dot(viewDir, bitangentWS),
+            dot(viewDir, normalWS)
+        );
+        
+        float3 refractDirTS = viewDirTS;
+        refractDirTS.xy /= innerIOR; 
+        
+        // Normalize XY for UV offset calculation
+        float2 viewDirTS_UV = normalize(refractDirTS.xy) * float2(1, -1); 
+        
+        // 3. Raymarch (Improved with Binary Search & Jitter)
+        // Pass triplanarEnabled flag
+        float2 innerUV = CalculateInnerPOM(uv, refractDirTS, innerDepthScale, id.xy, triplanarEnabled);
+        
+        // Calculate Inner Depth for fading
+        innerDepth = length(innerUV - uv) * 100.0; // Approximate depth from UV offset
+        
+        // 4. Sample Inner Normal
+        float4 innerData = _LNSurface_Front_Inner.SampleLevel(painter_linear_clamp_sampler, innerUV, 0);
+        // innerData.gb is packed normal (0..1)
+        float3 localInnerNormal = float3(innerData.g * 2.0 - 1.0, innerData.b * 2.0 - 1.0, 1.0);
+        localInnerNormal.z = sqrt(max(0, 1.0 - dot(localInnerNormal.xy, localInnerNormal.xy))); // Reconstruct Z
+        
+        // Transform Local Inner Normal to World Space
+        innerNormalWS = normalize(tangentWS * localInnerNormal.x + bitangentWS * localInnerNormal.y + normalWS * localInnerNormal.z);
+    }
 
     float3 totalDiffuse = 0;
     float3 totalSpecular = 0;
@@ -1188,6 +1347,26 @@ void CSMain (uint3 id : SV_DispatchThreadID)
             // 여기서는 Stylized 느낌을 위해 NdotL을 직접 곱하지 않고 mixedLightColor에 의존
             float3 diffuseTerm = albedo * finalDiffuseFactor * mixedLightColor; 
             
+            // Inner POM Diffuse Contribution
+            if (_EnableInnerPOM > 0.5)
+            {
+                // Inner Normal을 사용한 추가 Diffuse 계산
+                float innerNdotL = saturate(dot(innerNormalWS, lightDir));
+                // Inner Diffuse는 좀 더 부드럽게 (Wrap)
+                innerNdotL = (innerNdotL + 0.5) / 1.5; 
+                
+                // Fresnel-based Blending
+                // Glancing Angle(측면)에서는 표면 반사가 강해져 내부가 덜 보임
+                float fresnel = Local_SchlickFresnel(NdotV);
+                float blend = innerBlend * (1.0 - fresnel);
+                
+                // Depth Fade (Deep parts are darker)
+                float depthFade = exp(-innerDepth * innerDepthFade);
+                
+                // Blend Inner Diffuse
+                diffuseTerm = lerp(diffuseTerm, innerColor * innerNdotL * mixedLightColor * depthFade, blend);
+            }
+            
             totalDiffuse += diffuseTerm * (1.0 - metallic);
             
             // Specular (GTR2/GGX 기반) - 스펙큘러는 광원 색상을 그대로 따라야 함 (Tint 제외)
@@ -1198,6 +1377,21 @@ void CSMain (uint3 id : SV_DispatchThreadID)
             float G = Local_G_Smith(NdotV, NdotL, 0.25);
             
             float3 specTerm = (D * F * G) / (4.0 * NdotL * NdotV + 0.0001);
+            
+            // Inner POM Specular Contribution (Coat Layer 느낌)
+            if (_EnableInnerPOM > 0.5)
+            {
+                // Inner Normal을 사용한 추가 Specular
+                float innerNdotH = saturate(dot(innerNormalWS, halfDir));
+                float innerD = Local_GTR2(innerNdotH, alpha * 0.8); // Inner is slightly sharper
+                float3 innerSpec = (innerD * F * G) / (4.0 * NdotL * NdotV + 0.0001);
+                
+                // Additive Blending for "Sparkle" inside
+                // Also affected by Depth Fade
+                float depthFade = exp(-innerDepth * innerDepthFade);
+                specTerm += innerSpec * innerBlend * depthFade;
+            }
+            
             totalSpecular += max(0, specTerm) * lightColor * NdotL * PI * atten;
         }
 
@@ -1329,6 +1523,14 @@ void CSMain (uint3 id : SV_DispatchThreadID)
     else if (_DebugMode == 4) // SSGI Blurred
     {
         finalResult = ssgi;
+    }
+    else if (_DebugMode == 5) // Inner POM Debug
+    {
+        if (_EnableInnerPOM > 0.5)
+        {
+            // Visualize Inner Normal
+            finalResult = innerNormalWS * 0.5 + 0.5;
+        }
     }
 
     _Result[id.xy] = float4(finalResult, 1.0);

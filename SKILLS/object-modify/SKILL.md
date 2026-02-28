@@ -34,6 +34,9 @@ curl -X POST http://localhost:54437/api/tools/object-modify \
 }'
 ```
 
+> The token is stored in the file: `UserSettings/AI-Game-Developer-Config.json`
+> Using the format: `"token": "YOUR_TOKEN"`
+
 ## Input
 
 | Name | Type | Required | Description |
@@ -226,3 +229,4 @@ Any unknown or invalid fields and properties will be reported in the response. |
   ]
 }
 ```
+

@@ -185,10 +185,9 @@ public class LNSurfaceFeature : ScriptableRendererFeature
             // Textures
             internal TextureHandle frontColor;
             internal TextureHandle frontPacked; // Normal(RG) + Depth(B)
-            internal TextureHandle frontExtra; // Mask(R), Metallic(G), Smoothness(B)
-            internal TextureHandle frontExtra2; // Shadow(R), Packed(G), Packed(B)
-            internal TextureHandle frontInner; // Inner POM: Height(R), Normal(GB)
-            internal TextureHandle frontInnerParams; // Inner POM Params: Color(R), Scale/IOR(G), Blend/Fade(B)
+            internal TextureHandle frontExtra; // Metallic(R), Smoothness(G), Shadow(B), Packed Sub/Aniso(A)
+            internal TextureHandle frontInner; // Inner POM: Height(R), Normal(GB), Packed SSS Int/Thick(A)
+            internal TextureHandle frontInnerParams; // Inner POM Params: Color(R), Scale/IOR(G), Blend/Fade(B), Unused(A)
             
             internal TextureHandle backColor;
             internal TextureHandle backPacked; // Normal(RG) + Depth(B)
@@ -317,10 +316,9 @@ public class LNSurfaceFeature : ScriptableRendererFeature
             
             var extraDesc = desc;
             extraDesc.graphicsFormat = UnityEngine.Experimental.Rendering.GraphicsFormat.R8G8B8A8_UNorm;
-            TextureHandle frontExtra = UniversalRenderer.CreateRenderGraphTexture(renderGraph, extraDesc, "LNSurface_Front_Extra", false);
-            TextureHandle frontExtra2 = UniversalRenderer.CreateRenderGraphTexture(renderGraph, extraDesc, "LNSurface_Front_Extra2", false);
-            TextureHandle frontInner = UniversalRenderer.CreateRenderGraphTexture(renderGraph, extraDesc, "LNSurface_Front_Inner", false); // Inner POM
-            TextureHandle frontInnerParams = UniversalRenderer.CreateRenderGraphTexture(renderGraph, extraDesc, "LNSurface_Front_InnerParams", false); // Inner POM Params
+            TextureHandle frontExtra = UniversalRenderer.CreateRenderGraphTexture(renderGraph, extraDesc, "LNSurface_Front_GBuffer2", false);
+            TextureHandle frontInner = UniversalRenderer.CreateRenderGraphTexture(renderGraph, extraDesc, "LNSurface_Front_GBuffer3", false); // Inner POM
+            TextureHandle frontInnerParams = UniversalRenderer.CreateRenderGraphTexture(renderGraph, extraDesc, "LNSurface_Front_GBuffer4", false); // Inner POM Params
 
             // Back Pass Textures (Full Res)
             // [Optimization] Enable auto-clear (clear: true) to remove explicit clear pass
@@ -350,7 +348,7 @@ public class LNSurfaceFeature : ScriptableRendererFeature
 
 
             // 2. Front Pass
-            RenderGBufferFront(renderGraph, frameData, "Front", "LNSurface_Front", frontColor, frontPacked, frontExtra, frontExtra2, frontInner, frontInnerParams);
+            RenderGBufferFront(renderGraph, frameData, "Front", "LNSurface_Front", frontColor, frontPacked, frontExtra, frontInner, frontInnerParams);
 
             // 3. Back Pass (Only if SSS is enabled)
             if (_settings.enableSSS || _settings.enableSSR || _settings.enableSSCS || _settings.enableSSGI)
@@ -407,7 +405,7 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                     {
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Front_Packed", data.frontPacked);
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Back_Packed", data.backPacked);
-                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Front_Extra", data.frontExtra);
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Front_GBuffer2", data.frontExtra);
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_Result_AO_SSCS", data.result);
                         
                         context.cmd.SetComputeVectorParam(data.compute, "_LNSurface_ScreenParams", data.screenParams);
@@ -590,7 +588,7 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Back_Packed", data.backPacked);
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Back_Color", data.backColor);
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_SceneColor", data.sceneColor);
-                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Front_Extra", data.frontExtra);
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Front_GBuffer2", data.frontExtra);
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_Result_SSR", data.result);
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_HiZ_Pyramid", data.hizPyramid.IsValid() ? data.hizPyramid : data.frontPacked); // Default to front depth if HiZ invalid
 
@@ -635,7 +633,7 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                     builder.SetRenderFunc((ComputePassData data, ComputeGraphContext context) =>
                     {
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Front_Packed", data.frontPacked);
-                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Front_Extra", data.frontExtra);
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Front_GBuffer2", data.frontExtra);
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_SSR_Raw", data.ssrTexture);
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_Result_SSR", data.result);
                         context.cmd.SetComputeVectorParam(data.compute, "_LNSurface_ScreenParams", data.screenParams); // Renamed
@@ -761,7 +759,7 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                     {
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Front_Color", data.frontColor); 
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Front_Packed", data.frontPacked);
-                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Front_Extra", data.frontExtra);
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Front_GBuffer2", data.frontExtra);
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Back_Packed", data.backPacked); 
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Back_Color", data.backColor); // Added
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_SceneColor", data.sceneColor);
@@ -1031,7 +1029,6 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                     passDataLighting.backColor = backColor;
                     passDataLighting.sceneColor = resourceData.activeColorTexture; 
                     passDataLighting.frontExtra = frontExtra;
-                    passDataLighting.frontExtra2 = frontExtra2; // Added
                     passDataLighting.frontInner = frontInner; // Inner POM
                     passDataLighting.frontInnerParams = frontInnerParams; // Inner POM Params
                     
@@ -1062,10 +1059,9 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                     builder.UseTexture(passDataLighting.backPacked); 
                     builder.UseTexture(passDataLighting.backColor);
                     builder.UseTexture(passDataLighting.frontExtra);
-                    builder.UseTexture(passDataLighting.frontExtra2); // Added
                     builder.UseTexture(passDataLighting.frontInner); // Inner POM
                     builder.UseTexture(passDataLighting.frontInnerParams); // Inner POM Params
-                    builder.UseTexture(passDataLighting.sceneColor); 
+                    builder.UseTexture(passDataLighting.sceneColor);
                     builder.UseTexture(passDataLighting.result, AccessFlags.Write); // Ensure result is writable
 
                     // Always use textures (real or dummy) to prevent binding error
@@ -1080,10 +1076,9 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Front_Packed", data.frontPacked);
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Back_Packed", data.backPacked);
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Back_Color", data.backColor);
-                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Front_Extra", data.frontExtra);
-                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Front_Extra2", data.frontExtra2);
-                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Front_Inner", data.frontInner); // Inner POM
-                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Front_InnerParams", data.frontInnerParams); // Inner POM Params
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Front_GBuffer2", data.frontExtra);
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Front_GBuffer3", data.frontInner); // Inner POM
+                        context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_LNSurface_Front_GBuffer4", data.frontInnerParams); // Inner POM Params
                         context.cmd.SetComputeTextureParam(data.compute, data.kernel, "_SceneColor", data.sceneColor);
                         
                         // Always bind textures, even if disabled (using dummy)
@@ -1157,7 +1152,7 @@ public class LNSurfaceFeature : ScriptableRendererFeature
             renderGraph.AddBlitPass(blitParams, "LNSurface Final Blit");
         } // End of RecordRenderGraph
 
-        private void RenderGBufferFront(RenderGraph renderGraph, ContextContainer frameData, string name, string lightMode, TextureHandle color, TextureHandle packed, TextureHandle extra, TextureHandle extra2, TextureHandle inner, TextureHandle innerParams)
+        private void RenderGBufferFront(RenderGraph renderGraph, ContextContainer frameData, string name, string lightMode, TextureHandle color, TextureHandle packed, TextureHandle extra, TextureHandle inner, TextureHandle innerParams)
         {
             UniversalResourceData resourceData = frameData.Get<UniversalResourceData>();
             UniversalRenderingData renderingData = frameData.Get<UniversalRenderingData>();
@@ -1168,9 +1163,8 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                 builder.SetRenderAttachment(color, 0);
                 builder.SetRenderAttachment(packed, 1);
                 builder.SetRenderAttachment(extra, 2);
-                builder.SetRenderAttachment(extra2, 3);
-                builder.SetRenderAttachment(inner, 4); // Inner POM
-                builder.SetRenderAttachment(innerParams, 5); // Inner POM Params
+                builder.SetRenderAttachment(inner, 3); // Inner POM
+                builder.SetRenderAttachment(innerParams, 4); // Inner POM Params
                 builder.SetRenderAttachmentDepth(resourceData.activeDepthTexture, AccessFlags.Write);
 
                 DrawingSettings drawSettings = new DrawingSettings(new ShaderTagId(lightMode), new SortingSettings(cameraData.camera) { criteria = SortingCriteria.CommonOpaque });

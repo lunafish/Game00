@@ -114,12 +114,11 @@ Shader "Custom/LNSurfaceGBuffer"
         // --- Front Pass Output Structure ---
         struct FragmentOutputFront
         {
-            float4 GBuffer0 : SV_Target0; // Color (RGB)
-            float4 GBuffer1 : SV_Target1; // Packed: Normal(RG) + Depth(B)
-            float4 GBuffer2 : SV_Target2; // Extra1: Mask, Metallic, Smoothness
-            float4 GBuffer3 : SV_Target3; // Extra2: Shadow, Packed(Sub/Aniso), Packed(Int/Thick)
-            float4 GBuffer4 : SV_Target4; // Inner POM: Height(R), Normal(GB)
-            float4 GBuffer5 : SV_Target5; // Inner Params: Color(R), Thickness/IOR(G), Blend/Fade(B)
+            float4 GBuffer0 : SV_Target0; // Color (RGB), Unused (A)
+            float4 GBuffer1 : SV_Target1; // Packed: Normal(RG) + Depth(B) + Mask(A)
+            float4 GBuffer2 : SV_Target2; // Metallic(R), Smoothness(G), Shadow(B), Packed Sub/Aniso(A)
+            float4 GBuffer3 : SV_Target3; // Inner Height(R), Inner Normal X(G), Inner Normal Y(B), Packed SSS Int/Thick(A)
+            float4 GBuffer4 : SV_Target4; // Inner Color(R), Inner Thick/IOR(G), Inner Blend/Fade(B), Unused(A)
         };
 
         FragmentOutputFront frag_front(Varyings input)
@@ -132,60 +131,48 @@ Shader "Custom/LNSurfaceGBuffer"
             Light mainLight = GetMainLight(shadowCoord);
             float shadow = mainLight.shadowAttenuation;
 
-            // GBuffer0: Albedo (RGB)
+            // GBuffer0: Albedo (RGB) + Unused (A)
             output.GBuffer0 = float4(color.rgb, 1.0); 
 
-            // GBuffer1: Packed Normal (RG) + Linear Depth (B)
-            float3 normalWS = normalize(input.normalWS);
-            float2 encodedNormal = EncodeNormal(normalWS);
-            
-            float3 positionVS = TransformWorldToView(input.positionWS.xyz);
-            float linearDepth = -positionVS.z;
-            
-            output.GBuffer1 = float4(encodedNormal, linearDepth, 1.0);
-            
-            // GBuffer2: Extra Data 1
-            // R: Mask (Bitmask)
-            // G: Metallic
-            // B: Smoothness
-            // A: Unused
-            
             // Bitmask Packing for Mask Channel
             // Bit 0 (1): SSS Mask
             // Bit 1 (2): Use Inner Triplanar
             int maskFlags = 0;
             if (_SSSMask > 0.5) maskFlags |= 1;
             if (_UseInnerTriplanar > 0.5) maskFlags |= 2;
-            
-            output.GBuffer2 = float4(float(maskFlags) / 255.0, _Metallic, _Smoothness, 1.0);
 
-            // GBuffer3: Extra Data 2
-            // R: Shadow Attenuation
-            // G: Packed (Subsurface 4bit + Anisotropic 4bit)
-            // B: Packed (SSS Intensity 4bit + SSS Thickness 4bit)
-            // A: Unused
+            // GBuffer1: Packed Normal (RG) + Linear Depth (B) + Mask (A)
+            float3 normalWS = normalize(input.normalWS);
+            float2 encodedNormal = EncodeNormal(normalWS);
             
-            // Pack G: Subsurface & Anisotropic
+            float3 positionVS = TransformWorldToView(input.positionWS.xyz);
+            float linearDepth = -positionVS.z;
+            
+            output.GBuffer1 = float4(encodedNormal, linearDepth, float(maskFlags) / 255.0);
+            
+            // --- Pack Extra Data ---
+            // Pack Subsurface & Anisotropic
             float packedSub = floor(_Subsurface * 15.0 + 0.5); 
             float packedAniso = floor(_Anisotropic * 15.0 + 0.5);
-            float packedG = (packedSub * 16.0 + packedAniso) / 255.0;
+            float packedSubAniso = (packedSub * 16.0 + packedAniso) / 255.0;
             
-            // Pack B: SSS Intensity & Thickness
+            // GBuffer2: Metallic, Smoothness, Shadow, Packed Sub/Aniso
+            output.GBuffer2 = float4(_Metallic, _Smoothness, shadow, packedSubAniso);
+
+            // Pack SSS Intensity & Thickness
             // Normalize ranges: Intensity (0-10), Thickness (0-100)
             float normIntensity = saturate(_SSSIntensity / 10.0);
             float normThickness = saturate(_SSSThickness / 100.0);
             
             float packedInt = floor(normIntensity * 15.0 + 0.5);
             float packedThick = floor(normThickness * 15.0 + 0.5);
-            float packedB = (packedInt * 16.0 + packedThick) / 255.0;
+            float packedSSSIntThick = (packedInt * 16.0 + packedThick) / 255.0;
 
-            output.GBuffer3 = float4(shadow, packedG, packedB, 1.0);
-
-            // GBuffer4: Inner POM Data
+            // GBuffer3: Inner POM Data & SSS Params
             // R: Height (0-1)
             // G: Normal X (0-1)
             // B: Normal Y (0-1)
-            // A: Unused
+            // A: Packed SSS Int/Thick
             
             float height = 0;
             float3 innerNormal = float3(0,0,1);
@@ -243,8 +230,7 @@ Shader "Custom/LNSurfaceGBuffer"
             float3 ddxPos = ddx(input.positionWS.xyz);
             float3 ddyPos = ddy(input.positionWS.xyz);
             
-            float3 tng = normalize(cross(float3(0,1,0), normalWS));
-            if (abs(normalWS.y) > 0.99) tng = normalize(cross(float3(0,0,1), normalWS));
+            float3 tng = normalize(ddxPos - normalWS * dot(normalWS, ddxPos));
             float3 bitng = cross(normalWS, tng);
             
             if (_UseInnerTriplanar > 0.5)
@@ -254,13 +240,13 @@ Shader "Custom/LNSurfaceGBuffer"
                 innerNormal.y = dot(ws, bitng);
                 innerNormal.z = dot(ws, normalWS);
             }
-            
+
             // Pack Normal (-1..1 -> 0..1)
             float2 packedInnerNormal = innerNormal.xy * 0.5 + 0.5;
             
-            output.GBuffer4 = float4(height, packedInnerNormal.x, packedInnerNormal.y, 0.0);
+            output.GBuffer3 = float4(height, packedInnerNormal.x, packedInnerNormal.y, packedSSSIntThick);
 
-            // GBuffer5: Inner POM Params (Packed)
+            // GBuffer4: Inner POM Params (Packed)
             // R: Color (3:3:2 Packing) -> 8 bits
             // G: Thickness (4 bits) | IOR (4 bits) -> 8 bits
             // B: Blend (4 bits) | Fade (4 bits) -> 8 bits
@@ -289,7 +275,7 @@ Shader "Custom/LNSurfaceGBuffer"
             float pFade = floor(normFade * 15.0 + 0.5);
             float packedBlendFade = (pBlend * 16.0 + pFade) / 255.0;
             
-            output.GBuffer5 = float4(packedColor, packedThickIOR, packedBlendFade, 0.0);
+            output.GBuffer4 = float4(packedColor, packedThickIOR, packedBlendFade, 0.0);
 
             return output;
         }
@@ -357,7 +343,12 @@ Shader "Custom/LNSurfaceGBuffer"
                 half3 ambient = SampleSH(normalWS) * albedo.rgb;
                 half3 diffuse = albedo.rgb * mainLight.color * NdotL * shadow;
                 
-                return half4(diffuse + ambient, albedo.a);
+                // Specular (Blinn-Phong)
+                float3 halfDir = normalize(mainLight.direction + viewDirWS);
+                float NdotH = saturate(dot(normalWS, halfDir));
+                float specular = pow(NdotH, _Smoothness * 128.0) * _SpecularColor.rgb;
+                
+                return half4(diffuse + ambient + specular * shadow, albedo.a);
             }
             ENDHLSL
         }

@@ -14,12 +14,11 @@ RWTexture2D<float4> _Result;
 RWTexture2D<float2> _Result_AO_SSCS; // SSAO(R) + SSCS(G) 통합 용
 
 // --- 입력 텍스처 (GBuffer 자료형) ---
-Texture2D<float4> _LNSurface_Front_Color;  // RGB: 알베도(Albedo), A: 미사용
-Texture2D<float4> _LNSurface_Front_Packed; // RG: Oct-Encoded Normal, B: Linear Depth, A: 미사용
-Texture2D<float4> _LNSurface_Front_Extra;  // R: Mask, G: Metallic, B: Smoothness, A: Unused
-Texture2D<float4> _LNSurface_Front_Extra2; // R: Shadow, G: Packed(Sub/Aniso), B: Packed(Int/Thick), A: Unused
-Texture2D<float4> _LNSurface_Front_Inner;  // R: Height, G: Normal X, B: Normal Y, A: Unused (Inner POM)
-Texture2D<float4> _LNSurface_Front_InnerParams; // R: Color(332), G: Thickness/IOR(44), B: Blend/Fade(44), A: Unused
+Texture2D<float4> _LNSurface_Front_Color;    // RGB: 알베도(Albedo), A: 1.0 (GBuffer0)
+Texture2D<float4> _LNSurface_Front_Packed;   // RG: Oct-Encoded Normal, B: Linear Depth, A: Mask (GBuffer1)
+Texture2D<float4> _LNSurface_Front_GBuffer2; // R: Metallic, G: Smoothness, B: Shadow, A: Packed Sub/Aniso
+Texture2D<float4> _LNSurface_Front_GBuffer3; // R: Inner Height, G: Inner Normal X, B: Inner Normal Y, A: Packed SSS Int/Thick
+Texture2D<float4> _LNSurface_Front_GBuffer4; // R: Inner Color(Packed), G: Thick/IOR, B: Blend/Fade, A: Unused
 
 Texture2D<float4> _LNSurface_Back_Color;   // RGB: 뒷면 컬러
 Texture2D<float4> _LNSurface_Back_Packed;  // RG: Oct-Encoded Normal, B: Linear Depth, A: 미사용
@@ -577,7 +576,7 @@ void CS_SSAO_SSCS (uint3 id : SV_DispatchThreadID)
         return;
 
     float2 uv = (float2(id.xy) + 0.5) / _LNSurface_ScreenParams;
-    float mask = _LNSurface_Front_Extra.SampleLevel(painter_linear_clamp_sampler, uv, 0).r;
+    float mask = _LNSurface_Front_Packed.SampleLevel(painter_linear_clamp_sampler, uv, 0).a;
     
     float ao = 0.0;
     float sscs = 1.0;
@@ -674,7 +673,7 @@ void CS_SSGI (uint3 id : SV_DispatchThreadID)
         return;
     }
 
-    float mask = _LNSurface_Front_Extra.SampleLevel(painter_linear_clamp_sampler, uv, 0).r;
+    float mask = _LNSurface_Front_Packed.SampleLevel(painter_linear_clamp_sampler, uv, 0).a;
     if (mask <= 0.001)
     {
         _Result_SSGI[id.xy] = 0.0;
@@ -793,7 +792,7 @@ void CS_SSR (uint3 id : SV_DispatchThreadID)
         return;
     }
 
-    float smoothness = _LNSurface_Front_Extra.SampleLevel(painter_linear_clamp_sampler, uv, 0).b;
+    float smoothness = _LNSurface_Front_GBuffer2.SampleLevel(painter_linear_clamp_sampler, uv, 0).g;
     float3 normalWS = DecodeNormal(_LNSurface_Front_Packed.SampleLevel(painter_linear_clamp_sampler, uv, 0).rg);
     float linearDepth = _LNSurface_Front_Packed.SampleLevel(painter_linear_clamp_sampler, uv, 0).b;
     float3 worldPos = GetViewSpacePos(uv, linearDepth);
@@ -827,7 +826,7 @@ void CS_SSR (uint3 id : SV_DispatchThreadID)
         bool hitBack;
         if (Raymarch(startPos, reflectDirVS, _SSR_StepSize, _SSR_MaxSteps, hitUV, hitBack))
         {
-            float hitMask = _LNSurface_Front_Extra.SampleLevel(painter_linear_clamp_sampler, hitUV, 0).r;
+            float hitMask = _LNSurface_Front_Packed.SampleLevel(painter_linear_clamp_sampler, hitUV, 0).a;
             if (hitMask > 0.1 || hitBack) 
             {
                 if (hitBack && _UseBackfaceRaymarching > 0.5)
@@ -860,7 +859,7 @@ void CS_SSR_Blur (uint3 id : SV_DispatchThreadID)
     float2 uv = (float2(id.xy) + 0.5) / _LNSurface_ScreenParams;
     float centerDepth = _LNSurface_Front_Packed.SampleLevel(painter_linear_clamp_sampler, uv, 0).b;
     float3 centerCol = _SSR_Raw[id.xy].rgb;
-    float smoothness = _LNSurface_Front_Extra.SampleLevel(painter_linear_clamp_sampler, uv, 0).b;
+    float smoothness = _LNSurface_Front_GBuffer2.SampleLevel(painter_linear_clamp_sampler, uv, 0).g;
     float roughness = saturate(1.0 - smoothness);
     
     float3 totalSSR = 0;
@@ -1049,7 +1048,7 @@ float2 CalculateInnerPOM(float2 uv, float3 viewDirTS, float depthScale, uint2 pi
     
     for(int i=0; i<linearSteps; i++)
     {
-        currentHeight = _LNSurface_Front_Inner.SampleLevel(painter_linear_clamp_sampler, currentUV, 0).r;
+        currentHeight = _LNSurface_Front_GBuffer3.SampleLevel(painter_linear_clamp_sampler, currentUV, 0).r;
         
         if(currentLayerDepth >= (1.0 - currentHeight)) // Hit!
         {
@@ -1064,7 +1063,7 @@ float2 CalculateInnerPOM(float2 uv, float3 viewDirTS, float depthScale, uint2 pi
             {
                 float2 midUV = (startUV + endUV) * 0.5;
                 float midDepth = (startDepth + endDepth) * 0.5;
-                float midHeight = _LNSurface_Front_Inner.SampleLevel(painter_linear_clamp_sampler, midUV, 0).r;
+                float midHeight = _LNSurface_Front_GBuffer3.SampleLevel(painter_linear_clamp_sampler, midUV, 0).r;
                 
                 if(midDepth >= (1.0 - midHeight))
                 {
@@ -1099,35 +1098,37 @@ void CSMain (uint3 id : SV_DispatchThreadID)
     if (id.x >= (uint)_LNSurface_ScreenParams.x || id.y >= (uint)_LNSurface_ScreenParams.y)
         return;
 
-    // 1. GBuffer 데이터 읽기 및 압축 해제
-    float4 gbufferPacked = _LNSurface_Front_Packed[id.xy];
-    float4 gbufferExtra = _LNSurface_Front_Extra[id.xy];
-    float4 gbufferExtra2 = _LNSurface_Front_Extra2[id.xy];
+    // 1. GBuffer 파라미터 읽기
+    float4 gbuffer1 = _LNSurface_Front_Packed[id.xy];
+    float mask = gbuffer1.a;
     
-    // 마스크 체크 (렌더링 대상이 아닌 배경 처리)
-    float mask = gbufferExtra.r;
+    // 마스크 체크 (오브젝트가 없는 허공 처리 안 함)
     if (mask <= 0.001)
     {
         _Result[id.xy] = _SceneColor[id.xy]; 
         return;
     }
 
+    float linearDepth = gbuffer1.b;
+    
     float4 gbuffer0 = _LNSurface_Front_Color[id.xy];
+    float4 gbuffer2 = _LNSurface_Front_GBuffer2[id.xy];
+    float4 gbuffer3 = _LNSurface_Front_GBuffer3[id.xy];
     
     float3 albedo = gbuffer0.rgb;
-    float metallic = gbufferExtra.g;
-    float smoothness = gbufferExtra.b;
+    float metallic = gbuffer2.r;
+    float smoothness = gbuffer2.g;
     
     // Extra2에서 데이터 읽기
-    float shadow = gbufferExtra2.r;
+    float shadow = gbuffer2.b;
     
     // G채널 언패킹 (Subsurface, Anisotropic)
-    float packedG = gbufferExtra2.g * 255.0;
+    float packedG = gbuffer2.a * 255.0;
     float subsurface = floor(packedG / 16.0) / 15.0;
     float anisotropic = (packedG - floor(packedG / 16.0) * 16.0) / 15.0;
     
     // B채널 언패킹 (SSS Intensity, SSS Thickness)
-    float packedB = gbufferExtra2.b * 255.0;
+    float packedB = gbuffer3.a * 255.0;
     float sssIntensity = floor(packedB / 16.0) / 15.0 * 10.0; // 0~10 범위로 복원
     float sssThickness = (packedB - floor(packedB / 16.0) * 16.0) / 15.0 * 100.0; // 0~100 범위로 복원
     
@@ -1136,11 +1137,10 @@ void CSMain (uint3 id : SV_DispatchThreadID)
     float diffuseWrap = _DiffuseWrap; // Global Setting
     
     // Normal 복원
-    float3 normalWS = DecodeNormal(gbufferPacked.rg);
+    float3 normalWS = DecodeNormal(gbuffer1.rg);
     
     // 2. 월드 공간 좌표 재구성
     float2 uv = (float2(id.xy) + 0.5) / _LNSurface_ScreenParams;
-    float linearDepth = gbufferPacked.b;
     
     float3 viewPos = GetViewSpacePos(uv, linearDepth);
     float3 worldPos = mul(_CameraToWorldMatrix, float4(viewPos, 1.0)).xyz;
@@ -1154,8 +1154,8 @@ void CSMain (uint3 id : SV_DispatchThreadID)
     float3 innerAlbedo = albedo;
     float innerDepth = 0.0;
     
-    // Unpack Inner Params from GBuffer5
-    float4 innerParamsPacked = _LNSurface_Front_InnerParams[id.xy];
+    // Unpack Inner Params from GBuffer4
+    float4 innerParamsPacked = _LNSurface_Front_GBuffer4[id.xy];
     
     // Unpack Color (R: 332)
     uint pColor = (uint)(innerParamsPacked.r * 255.0 + 0.5);
@@ -1175,7 +1175,7 @@ void CSMain (uint3 id : SV_DispatchThreadID)
     float innerDepthFade = float(pBlendFade & 15) / 15.0 * 5.0; // 0.0 ~ 5.0
     
     // Mask Unpacking for Triplanar
-    int maskFlags = int(gbufferExtra.r * 255.0 + 0.5);
+    int maskFlags = int(mask * 255.0 + 0.5);
     bool sssEnabled = (maskFlags & 1) != 0;
     bool triplanarEnabled = (maskFlags & 2) != 0;
     
@@ -1202,6 +1202,17 @@ void CSMain (uint3 id : SV_DispatchThreadID)
         // Calculate Geometric Normal from reconstructed tangent frame
         float3 geomNormalWS = normalize(cross(tangentWS, bitangentWS));
         
+        // Fallback for Geometric Normal (Edge Case Handling)
+        // If tangent/bitangent are degenerate or produce NaN, fallback to GBuffer Normal
+        if (length(tangentWS) < 0.001 || length(bitangentWS) < 0.001 || any(isnan(geomNormalWS)))
+        {
+            geomNormalWS = normalWS;
+            // Re-orthogonalize tangent basis based on fallback normal
+            float3 up = abs(geomNormalWS.y) < 0.999 ? float3(0, 1, 0) : float3(0, 0, 1);
+            tangentWS = normalize(cross(up, geomNormalWS));
+            bitangentWS = cross(geomNormalWS, tangentWS);
+        }
+
         // Orthonormalize Tangent Basis using Geometric Normal (not Normal Map)
         // This ensures the inner space aligns with the polygon surface
         tangentWS = normalize(tangentWS - geomNormalWS * dot(tangentWS, geomNormalWS));
@@ -1229,14 +1240,11 @@ void CSMain (uint3 id : SV_DispatchThreadID)
         
         // 3. Raymarch (Improved with Binary Search & Jitter)
         float fixedDepthScale = 0.05;
-        float2 innerUV = CalculateInnerPOM(startUV, refractDirTS, fixedDepthScale, id.xy, triplanarEnabled);
-        
-        // Calculate Inner Depth for fading
-        innerDepth = length(innerUV - startUV) * 100.0; // Approximate depth from UV offset
-        
-        // 4. Sample Inner Normal
-        float4 innerData = _LNSurface_Front_Inner.SampleLevel(painter_linear_clamp_sampler, innerUV, 0);
-        float3 localInnerNormal = float3(innerData.g * 2.0 - 1.0, innerData.b * 2.0 - 1.0, 1.0);
+        float2 innerUV = CalculateInnerPOM(uv, viewDirTS, innerSurfaceThickness, id.xy, triplanarEnabled);
+            
+        // Sample Inner Normal (Unpack from 0..1 to -1..1 from GBuffer3 G/B channels)
+        float2 packedInner = _LNSurface_Front_GBuffer3.SampleLevel(painter_linear_clamp_sampler, innerUV, 0).gb;
+        float3 localInnerNormal = float3(packedInner.x * 2.0 - 1.0, packedInner.y * 2.0 - 1.0, 0);
         localInnerNormal.z = sqrt(max(0, 1.0 - dot(localInnerNormal.xy, localInnerNormal.xy))); // Reconstruct Z
         
         // Transform Local Inner Normal to World Space
@@ -1407,7 +1415,7 @@ void CSMain (uint3 id : SV_DispatchThreadID)
         // 4. 투과형 하부표면 산란 (Translucency SSS)
         if (_EnableSSS > 0.5)
         {
-            float frontDepth = gbufferPacked.b;
+            float frontDepth = linearDepth;
             float backDepth = _LNSurface_Back_Packed[id.xy].b;
             
             // Back Depth 유효성 검사 (빈 공간 또는 오류 처리)
@@ -1530,36 +1538,24 @@ void CSMain (uint3 id : SV_DispatchThreadID)
     // 최종 픽셀 컬러 출력 (확산광 + 주변광/반사광 + 스펙큘러 + SSS)
     float3 finalResult = totalDiffuse + ambientColor + totalSpecular + totalSSS;
 
-    // --- Debug Visualization ---
-    if (_DebugMode == 1) // Hi-Z View
+    // 7. 디버그 모드 시각화 (A채널 데이터 확인 등 추가)
+    if (_DebugMode > 0)
     {
-        float hiz = _HiZ_Pyramid.SampleLevel(painter_point_clamp_sampler, uv, 0).r;
-        finalResult = float3(hiz * 0.01, hiz * 0.01, hiz * 0.01);
-    }
-    else if (_DebugMode == 2) // SSR Raw
-    {
-        finalResult = _Result_SSR[id.xy].rgb;
-    }
-    else if (_DebugMode == 3) // SSR Blurred
-    {
-        finalResult = reflectionColor;
-    }
-    else if (_DebugMode == 4) // SSGI Blurred
-    {
-        finalResult = ssgi;
-    }
-    else if (_DebugMode == 5) // Inner POM Debug
-    {
-        if (_EnableInnerPOM > 0.5)
-        {
-            // Visualize Inner Normal
-            finalResult = innerNormalWS * 0.5 + 0.5;
-        }
-    }
-    else if (_DebugMode == 6) // Inner Height Debug
-    {
-        float h = _LNSurface_Front_Inner.SampleLevel(painter_point_clamp_sampler, uv, 0).r;
-        finalResult = float3(h, h, h);
+        if (_DebugMode == 1) _Result[id.xy] = float4(gbuffer1.rgb, 1.0); // GBuffer1
+        else if (_DebugMode == 2) _Result[id.xy] = float4(albedo, 1.0); // Albedo
+        else if (_DebugMode == 3) _Result[id.xy] = float4(innerNormalWS * 0.5 + 0.5, 1.0); // Final Normal
+        else if (_DebugMode == 4) _Result[id.xy] = float4(metallic.xxx, 1.0); // Metallic
+        else if (_DebugMode == 5) _Result[id.xy] = float4(smoothness.xxx, 1.0); // Smoothness
+        else if (_DebugMode == 6) _Result[id.xy] = float4(subsurface.xxx, 1.0); // Subsurface
+        else if (_DebugMode == 7) _Result[id.xy] = float4(anisotropic.xxx, 1.0); // Aniso
+        else if (_DebugMode == 8) _Result[id.xy] = float4((sssIntensity / 10.0).xxx, 1.0); // SSS Int
+        else if (_DebugMode == 9) _Result[id.xy] = float4(shadow.xxx, 1.0); // Shadow
+        else if (_DebugMode == 10) _Result[id.xy] = float4(innerColor, 1.0); // Inner Color
+        else if (_DebugMode == 11) _Result[id.xy] = float4((innerSurfaceThickness / 0.2).xxx, 1.0); // Inner Thick
+        else if (_DebugMode == 12) _Result[id.xy] = float4(innerBlend.xxx, 1.0); // Inner Blend
+        else if (_DebugMode == 13) _Result[id.xy] = float4(mask.xxx, 1.0); // Mask (GBuffer1 A)
+        _Result[id.xy] = float4(finalResult, 1.0); // Fallback if no debug mode matches
+        return;
     }
 
     _Result[id.xy] = float4(finalResult, 1.0);

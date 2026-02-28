@@ -28,6 +28,9 @@ curl -X POST http://localhost:54437/api/tools/screenshot-game-view \
   -d '{}'
 ```
 
+> The token is stored in the file: `UserSettings/AI-Game-Developer-Config.json`
+> Using the format: `"token": "YOUR_TOKEN"`
+
 ## Input
 
 This tool takes no input parameters.
@@ -43,3 +46,4 @@ This tool takes no input parameters.
 ## Output
 
 This tool does not return structured output.
+

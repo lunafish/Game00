@@ -36,6 +36,9 @@ curl -X POST http://localhost:54437/api/tools/package-list \
 }'
 ```
 
+> The token is stored in the file: `UserSettings/AI-Game-Developer-Config.json`
+> Using the format: `"token": "YOUR_TOKEN"`
+
 ## Input
 
 | Name | Type | Required | Description |
@@ -131,3 +134,4 @@ curl -X POST http://localhost:54437/api/tools/package-list \
   ]
 }
 ```
+

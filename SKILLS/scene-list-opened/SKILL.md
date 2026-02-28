@@ -28,6 +28,9 @@ curl -X POST http://localhost:54437/api/tools/scene-list-opened \
   -d '{}'
 ```
 
+> The token is stored in the file: `UserSettings/AI-Game-Developer-Config.json`
+> Using the format: `"token": "YOUR_TOKEN"`
+
 ## Input
 
 This tool takes no input parameters.
@@ -112,3 +115,4 @@ This tool takes no input parameters.
   ]
 }
 ```
+

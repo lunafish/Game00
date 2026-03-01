@@ -47,7 +47,9 @@ public class LNSurfaceFeature : ScriptableRendererFeature
             Mask = 13,
             InnerDepth = 14,
             ResinAbsorption = 15,
-            ResinTurbidity = 16
+            ResinTurbidity = 16,
+            SSRBlurred = 17,
+            SSGIBlurred = 18
         }
 
         public LayerMask layerMask = -1;
@@ -976,7 +978,6 @@ public class LNSurfaceFeature : ScriptableRendererFeature
                         // Bind dummy texture to prevent "Property not set" error
                         passDataLighting.ssgiTexture = frontColor; // Any valid texture
                     }
-
 
 
                     passDataLighting.enableSSR = _settings.enableSSR ? 1.0f : 0.0f;

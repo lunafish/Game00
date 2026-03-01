@@ -27,11 +27,23 @@ Material:
         m_Texture: {fileID: 0}
         m_Scale: {x: 1, y: 1}
         m_Offset: {x: 0, y: 0}
+    - _BumpMap:
+        m_Texture: {fileID: 0}
+        m_Scale: {x: 1, y: 1}
+        m_Offset: {x: 0, y: 0}
+    - _InnerBaseMap:
+        m_Texture: {fileID: 0}
+        m_Scale: {x: 1, y: 1}
+        m_Offset: {x: 0, y: 0}
     - _InnerHeightMap:
         m_Texture: {fileID: 0}
         m_Scale: {x: 1, y: 1}
         m_Offset: {x: 0, y: 0}
     - _InnerNormalMap:
+        m_Texture: {fileID: 0}
+        m_Scale: {x: 1, y: 1}
+        m_Offset: {x: 0, y: 0}
+    - _RoughnessMap:
         m_Texture: {fileID: 0}
         m_Scale: {x: 1, y: 1}
         m_Offset: {x: 0, y: 0}
@@ -46,14 +58,18 @@ Material:
     - _InnerDepthFade: 1
     - _InnerDepthScale: 0.02
     - _InnerIOR: 1.45
+    - _InnerSurfaceThickness: 0
     - _InnerTriplanarTile: 1
     - _Metallic: 0
+    - _ResinAbsorption: 1
+    - _ResinTurbidity: 0
     - _SSSIntensity: 1
     - _SSSMask: 1
     - _SSSThickness: 10
     - _ShadowStrength: 1
     - _Smoothness: 0.75
     - _Subsurface: 0
+    - _UseInnerBaseMap: 0
     - _UseInnerTriplanar: 0
     m_Colors:
     - _BaseColor: {r: 1, g: 0, b: 0, a: 1}

@@ -1027,7 +1027,7 @@ void CS_HiZ_Downsample(uint3 id : SV_DispatchThreadID)
 }
 
 // --- Inner POM Helper ---
-float2 CalculateInnerPOM(float2 uv, float3 viewDirTS, float depthScale, uint2 pixId, bool useTriplanar, out float outLayerDepth)
+float2 CalculateInnerPOM(float2 uv, float2 totalUVOffset, uint2 pixId, out float outLayerDepth)
 {
     // 1. Linear Search (Coarse)
     int linearSteps = 10;
@@ -1035,26 +1035,23 @@ float2 CalculateInnerPOM(float2 uv, float3 viewDirTS, float depthScale, uint2 pi
     outLayerDepth = 0.0;
     
     float2 currentUV = uv;
-    float2 deltaUV = viewDirTS.xy * depthScale / (float)linearSteps;
+    float2 deltaUV = totalUVOffset / (float)linearSteps;
     
     // Jittering (Dithering) to reduce banding
     float jitter = Local_Hash(pixId.y * uint(_LNSurface_ScreenParams.x) + pixId.x);
-    currentUV -= deltaUV * jitter;
+    currentUV += deltaUV * jitter;
     float currentLayerDepth = stepSize * jitter;
     
-    float2 prevUV = currentUV;
+    float2 prevUV = uv;
     float prevLayerDepth = 0.0;
-    float prevHeight = 1.0;
-    float currentHeight = 1.0;
     
     for(int i=0; i<linearSteps; i++)
     {
-        currentHeight = _LNSurface_Front_GBuffer3.SampleLevel(painter_linear_clamp_sampler, currentUV, 0).r;
+        float currentHeight = _LNSurface_Front_GBuffer3.SampleLevel(painter_linear_clamp_sampler, currentUV, 0).r;
         
         if(currentLayerDepth >= (1.0 - currentHeight)) // Hit!
         {
             // 2. Binary Search (Refinement)
-            // Refine between prevUV and currentUV
             float2 startUV = prevUV;
             float2 endUV = currentUV;
             float startDepth = prevLayerDepth;
@@ -1083,9 +1080,8 @@ float2 CalculateInnerPOM(float2 uv, float3 viewDirTS, float depthScale, uint2 pi
         
         prevUV = currentUV;
         prevLayerDepth = currentLayerDepth;
-        prevHeight = currentHeight;
         
-        currentUV -= deltaUV;
+        currentUV += deltaUV;
         currentLayerDepth += stepSize;
     }
     
@@ -1200,75 +1196,41 @@ void CSMain (uint3 id : SV_DispatchThreadID)
     
     if (_EnableInnerPOM > 0.5)
     {
-        // 1. Tangent Space Basis Construction (Improved using Depth Derivatives)
-        float2 texelSize = 1.0 / _LNSurface_ScreenParams;
-        float dX = _LNSurface_Front_Packed.SampleLevel(painter_point_clamp_sampler, uv + float2(texelSize.x, 0), 0).b;
-        float dY = _LNSurface_Front_Packed.SampleLevel(painter_point_clamp_sampler, uv + float2(0, texelSize.y), 0).b;
+        // 1. Refract View Vector in World Space
+        float3 viewDirWS = viewDir; // Points TOWARDS the camera
+        float3 incidentWS = -viewDirWS;
+        float3 refractDirWS = refract(incidentWS, normalWS, 1.0 / innerIOR);
         
-        float3 posRight = GetViewSpacePos(uv + float2(texelSize.x, 0), dX);
-        float3 posUp = GetViewSpacePos(uv + float2(0, texelSize.y), dY);
+        // Prevent total internal reflection fallback
+        if (length(refractDirWS) < 0.001) refractDirWS = incidentWS;
         
-        float3 tangentVS = normalize(posRight - viewPos);
-        float3 bitangentVS = normalize(posUp - viewPos);
+        // 2. Compute Physical Displacement on the Tangent Plane
+        float nDotR = dot(normalWS, refractDirWS);
+        float t = innerSurfaceThickness / max(0.0001, -nDotR); 
+        float3 displacementWS = refractDirWS * t;
         
-        // Transform to World Space
-        float3 tangentWS = mul((float3x3)_CameraToWorldMatrix, tangentVS);
-        float3 bitangentWS = mul((float3x3)_CameraToWorldMatrix, bitangentVS);
+        // Project the displacement onto the surface tangent plane
+        // This removes the depth/parallax shrinking effect from perspective projection
+        float3 tangentDisplacementWS = displacementWS - normalWS * dot(displacementWS, normalWS);
+        float3 surfaceTargetWS = worldPos + tangentDisplacementWS;
         
-        // Calculate Geometric Normal from reconstructed tangent frame
-        float3 geomNormalWS = normalize(cross(tangentWS, bitangentWS));
+        // 3. Project back to Screen Space to get total UV offset
+        // In Unity, View Space is right-handed (Forward = -Z)
+        float3 targetPosVS = mul(_WorldToCameraMatrix, float4(surfaceTargetWS, 1.0)).xyz;
+        float2 targetUV = ProjectViewPos(targetPosVS).xy;
         
-        // Fallback for Geometric Normal (Edge Case Handling)
-        // If tangent/bitangent are degenerate or produce NaN, fallback to GBuffer Normal
-        if (length(tangentWS) < 0.001 || length(bitangentWS) < 0.001 || any(isnan(geomNormalWS)))
-        {
-            geomNormalWS = normalWS;
-            // Re-orthogonalize tangent basis based on fallback normal
-            float3 up = abs(geomNormalWS.y) < 0.999 ? float3(0, 1, 0) : float3(0, 0, 1);
-            tangentWS = normalize(cross(up, geomNormalWS));
-            bitangentWS = cross(geomNormalWS, tangentWS);
-        }
-
-        // Orthonormalize Tangent Basis using Geometric Normal (not Normal Map)
-        // This ensures the inner space aligns with the polygon surface
-        tangentWS = normalize(tangentWS - geomNormalWS * dot(tangentWS, geomNormalWS));
-        bitangentWS = cross(geomNormalWS, tangentWS);
+        float2 totalUVOffset = targetUV - uv;
         
-        // 2. Refract View Vector (Tangent Space Approximation)
-        float3 viewDirTS = float3(
-            dot(viewDir, tangentWS),
-            dot(viewDir, bitangentWS),
-            dot(viewDir, geomNormalWS) // Use Geometric Normal for projection
-        );
-        
-        float3 refractDirTS = viewDirTS;
-        refractDirTS.xy /= innerIOR; 
-        
-        // Normalize XY for UV offset calculation
-        float2 viewDirTS_UV = normalize(refractDirTS.xy) * float2(1, -1); 
-        
-        // Apply Surface Thickness Offset with Aspect Ratio Correction
-        float aspect = _LNSurface_ScreenParams.x / _LNSurface_ScreenParams.y;
-        float2 thicknessOffset = refractDirTS.xy * innerSurfaceThickness;
-        thicknessOffset.y *= aspect; // Correct vertical offset
-        
-        float2 startUV = uv - thicknessOffset;
-        
-        // 3. Raymarch (Improved with Binary Search & Jitter)
+        // 4. Raymarch (Improved with Binary Search & Jitter)
         float outLayerDepth = 0.0;
-        float2 innerUV = CalculateInnerPOM(uv, viewDirTS, innerSurfaceThickness, id.xy, triplanarEnabled, outLayerDepth);
+        float2 innerUV = CalculateInnerPOM(uv, totalUVOffset, id.xy, outLayerDepth);
             
-        // Calculate physical inner depth (travel distance)
-        float nDotV = max(0.001, dot(viewDir, geomNormalWS));
-        innerDepth = (outLayerDepth * innerSurfaceThickness) / nDotV;
+        // 5. Calculate physical inner depth (travel distance)
+        innerDepth = t * outLayerDepth;
             
-        // Sample Inner Normal (Unpack from 0..1 to -1..1 from GBuffer3 G/B channels)
+        // 6. Decode Inner Normal from GBuffer3
         float2 packedInner = _LNSurface_Front_GBuffer3.SampleLevel(painter_linear_clamp_sampler, innerUV, 0).gb;
-        float3 localInnerNormal = float3(packedInner.x * 2.0 - 1.0, packedInner.y * 2.0 - 1.0, 0);
-        localInnerNormal.z = sqrt(max(0, 1.0 - dot(localInnerNormal.xy, localInnerNormal.xy))); // Reconstruct Z
-        
-        // Transform Local Inner Normal to World Space
-        innerNormalWS = normalize(tangentWS * localInnerNormal.x + bitangentWS * localInnerNormal.y + geomNormalWS * localInnerNormal.z);
+        innerNormalWS = DecodeNormal(packedInner);
         
         // Calculate Inner Lighting Contribution
         // We calculate this once here, but it depends on light direction.

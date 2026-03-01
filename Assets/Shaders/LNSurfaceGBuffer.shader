@@ -227,26 +227,25 @@ Shader "Custom/LNSurfaceGBuffer"
                 // UV Sampling
                 height = SAMPLE_TEXTURE2D(_InnerHeightMap, sampler_InnerHeightMap, input.uv).r;
                 float3 n = UnpackNormal(SAMPLE_TEXTURE2D(_InnerNormalMap, sampler_InnerNormalMap, input.uv));
-                innerNormal = n; 
-            }
-            
-            // Convert World Space Inner Normal to Tangent Space if Triplanar
-            float3 ddxPos = ddx(input.positionWS.xyz);
-            float3 ddyPos = ddy(input.positionWS.xyz);
-            
-            float3 tng = normalize(ddxPos - normalWS * dot(normalWS, ddxPos));
-            float3 bitng = cross(normalWS, tng);
-            
-            if (_UseInnerTriplanar > 0.5)
-            {
-                float3 ws = innerNormal; 
-                innerNormal.x = dot(ws, tng);
-                innerNormal.y = dot(ws, bitng);
-                innerNormal.z = dot(ws, normalWS);
+                
+                // Construct World Space Tangent Basis using Screen Derivatives
+                float3 ddxPos = ddx(input.positionWS.xyz);
+                float3 ddyPos = ddy(input.positionWS.xyz);
+                float2 ddxUV = ddx(input.uv);
+                float2 ddyUV = ddy(input.uv);
+                
+                float det = ddxUV.x * ddyUV.y - ddyUV.x * ddxUV.y;
+                float r = 1.0 / (det >= 0.0 ? max(det, 1e-5) : min(det, -1e-5));
+                float3 tng = normalize((ddxPos * ddyUV.y - ddyPos * ddxUV.y) * r);
+                tng = normalize(tng - normalWS * dot(normalWS, tng));
+                float signFactor = det < 0.0 ? -1.0 : 1.0;
+                float3 bitng = signFactor * cross(normalWS, tng);
+                
+                innerNormal = normalize(tng * n.x + bitng * n.y + normalWS * n.z);
             }
 
-            // Pack Normal (-1..1 -> 0..1)
-            float2 packedInnerNormal = innerNormal.xy * 0.5 + 0.5;
+            // Pack Normal using Octahedron Encoding
+            float2 packedInnerNormal = EncodeNormal(innerNormal);
             
             output.GBuffer3 = float4(height, packedInnerNormal.x, packedInnerNormal.y, packedSSSIntThick);
 

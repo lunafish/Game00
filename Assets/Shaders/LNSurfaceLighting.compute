@@ -709,7 +709,7 @@ void CS_SSGI (uint3 id : SV_DispatchThreadID)
     
     for(int i=0; i<samples; i++)
     {
-        uint seed = id.y * uint(_LNSurface_ScreenParams.x) + id.x + uint(i * 152);
+        uint seed = id.y * uint(_LNSurface_ScreenParams.x) + id.x + uint(i * 152) + (uint)_FrameCount;
         float3 rayDirVS = GetCosineHemisphereDir(normalVS, seed);
         
         float2 hitUV;
@@ -776,12 +776,15 @@ void CS_SSGI_Blur (uint3 id : SV_DispatchThreadID)
             float weight = spatialWeight * depthWeight;
             
             // Checkerboard Awareness: Skip zero pixels if enabled
-            if (_EnableCheckerboard > 0.5 && any(sampleColor > 0))
+            if (_EnableCheckerboard > 0.5)
             {
-                totalColor += sampleColor * weight;
-                totalWeight += weight;
+                if (IsCheckerboardPixel(sampleId)) 
+                {
+                    totalColor += sampleColor * weight;
+                    totalWeight += weight;
+                }
             }
-            else if (_EnableCheckerboard <= 0.5)
+            else
             {
                 totalColor += sampleColor * weight;
                 totalWeight += weight;
@@ -827,7 +830,7 @@ void CS_SSR (uint3 id : SV_DispatchThreadID)
         float roughness = saturate(1.0 - smoothness);
         if (roughness > 0.01)
         {
-            uint seed = id.y * uint(_LNSurface_ScreenParams.x) + id.x;
+            uint seed = id.y * uint(_LNSurface_ScreenParams.x) + id.x + (uint)_FrameCount;
             float3 jitter = float3(
                 Local_Hash(seed) * 2.0 - 1.0,
                 Local_Hash(seed + 100) * 2.0 - 1.0,
@@ -1609,7 +1612,7 @@ void CSMain (uint3 id : SV_DispatchThreadID)
         else if (_DebugMode == 16) _Result[id.xy] = float4(resinTurbidity.xxx, 1.0); // Resin Turbidity
         else if (_DebugMode == 17) _Result[id.xy] = float4(_LNSurface_SSR_Blurred.SampleLevel(painter_linear_clamp_sampler, uv, 0).rgb, 1.0); // SSR Blurred
         else if (_DebugMode == 18) _Result[id.xy] = float4(_LNSurface_SSGI_Blurred.SampleLevel(painter_linear_clamp_sampler, uv, 0).rgb, 1.0); // SSGI Blurred
-        _Result[id.xy] = float4(finalResult, 1.0); // Fallback if no debug mode matches
+        else _Result[id.xy] = float4(finalResult, 1.0); // Fallback if no debug mode matches
         return;
     }
 

@@ -106,9 +106,9 @@ MonoBehaviour:
     shadowThreshold: 0.75
     enableInnerPOM: 1
     enableSSR: 1
-    ssrMaxSteps: 8
-    ssrStepSize: 0.33
-    ssrThickness: 0.1
+    ssrMaxSteps: 16
+    ssrStepSize: 1
+    ssrThickness: 0.5
     enableSSAO: 1
     ssaoRadius: 0.5
     ssaoIntensity: 1
@@ -116,8 +116,8 @@ MonoBehaviour:
     enableSSGI: 1
     ssgiIntensity: 0.5
     ssgiSampleCount: 16
-    ssgiMaxSteps: 8
-    ssgiRayStepSize: 0.8
+    ssgiMaxSteps: 16
+    ssgiRayStepSize: 2
     enableSSCS: 1
     sscsDistance: 1
     sscsMaxSteps: 16

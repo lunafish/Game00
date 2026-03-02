@@ -703,6 +703,14 @@ void CS_SSGI (uint3 id : SV_DispatchThreadID)
     
     float3 normalWS = DecodeNormal(_LNSurface_Front_Packed.SampleLevel(painter_linear_clamp_sampler, uv, 0).rg);
     float3 normalVS = mul((float3x3)_WorldToCameraMatrix, normalWS);
+
+    float smoothness = _LNSurface_Front_GBuffer2.SampleLevel(painter_linear_clamp_sampler, uv, 0).g;
+    
+    if (smoothness < 0.05)
+    {
+        _Result_SSGI[id.xy] = float4(SampleSH(normalWS), 1.0);
+        return;
+    }
     
     float3 indirectLight = 0;
     int samples = _SSGI_SampleCount;
@@ -726,6 +734,26 @@ void CS_SSGI (uint3 id : SV_DispatchThreadID)
             {
                 hitColor = _SceneColor.SampleLevel(painter_linear_clamp_sampler, hitUV, 0).rgb;
             }
+            
+            // [안전 장치 1] 음수 및 과도한 밝기 제거
+            hitColor = max(0.0, hitColor);
+            hitColor = min(hitColor, 50.0); // Firefly reduction
+
+            // [안전 장치 2] 화면 가장자리 페이드 (Screen Edge Fade)
+            // 화면 끝부분에서 가져온 데이터는 신뢰도가 낮으므로 Ambient와 섞음
+            float2 edgeDist = min(hitUV, 1.0 - hitUV);
+            float edgeFade = smoothstep(0.0, 0.1, min(edgeDist.x, edgeDist.y));
+
+            // [안전 장치 3] 검은 점 방지 (너무 어두운 값 대체)
+            float lum = dot(hitColor, float3(0.2126, 0.7152, 0.0722));
+            if (lum < 0.001)
+            {
+                 edgeFade = 0.0; // 강제로 Ambient 사용
+            }
+
+            float3 ambient = SampleSH(mul((float3x3)_CameraToWorldMatrix, rayDirVS));
+            hitColor = lerp(ambient, hitColor, edgeFade);
+            
             indirectLight += hitColor;
         }
         else

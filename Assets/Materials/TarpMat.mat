@@ -14,7 +14,8 @@ Material:
   m_ValidKeywords: []
   m_InvalidKeywords:
   - _INNER_POM_ON
-  - _USEINNERTRIPLANAR_ON
+  - _USEINNERBASEMAP_ON
+  - _USETRIPLANAR_ON
   m_LightmapFlags: 4
   m_EnableInstancingVariants: 0
   m_DoubleSidedGI: 0
@@ -31,7 +32,7 @@ Material:
         m_Scale: {x: 1, y: 1}
         m_Offset: {x: 0, y: 0}
     - _BumpMap:
-        m_Texture: {fileID: 0}
+        m_Texture: {fileID: 2800000, guid: a6e87b0ab0286420e98dd143deb2122d, type: 3}
         m_Scale: {x: 1, y: 1}
         m_Offset: {x: 0, y: 0}
     - _DetailAlbedoMap:
@@ -51,15 +52,15 @@ Material:
         m_Scale: {x: 1, y: 1}
         m_Offset: {x: 0, y: 0}
     - _InnerBaseMap:
-        m_Texture: {fileID: 2800000, guid: 65f0d8b3e4827407b990a5b1c1cde984, type: 3}
+        m_Texture: {fileID: 2800000, guid: 4302bfbddeb214582b184f4e88c277cb, type: 3}
         m_Scale: {x: 1, y: 1}
         m_Offset: {x: 0, y: 0}
     - _InnerHeightMap:
-        m_Texture: {fileID: 2800000, guid: 0023772b7392a4f7282a08bc90d048c7, type: 3}
+        m_Texture: {fileID: 2800000, guid: 3385ed72bd28044d5a54ee4acedbb627, type: 3}
         m_Scale: {x: 1, y: 1}
         m_Offset: {x: 0, y: 0}
     - _InnerNormalMap:
-        m_Texture: {fileID: 2800000, guid: 8740425a7bed5485682cb261e78d51a1, type: 3}
+        m_Texture: {fileID: 2800000, guid: a07b7b85cd8e6484ca17f1b2e33680ef, type: 3}
         m_Scale: {x: 1, y: 1}
         m_Offset: {x: 0, y: 0}
     - _MainTex:
@@ -103,7 +104,7 @@ Material:
     - _AddPrecomputedVelocity: 0
     - _AlphaClip: 0
     - _AlphaToMask: 0
-    - _Anisotropic: 0
+    - _Anisotropic: 0.3
     - _Blend: 0
     - _BlendModePreserveSpecular: 1
     - _BumpScale: 1
@@ -113,53 +114,56 @@ Material:
     - _Cutoff: 0.5
     - _DetailAlbedoMapScale: 1
     - _DetailNormalMapScale: 1
-    - _DiffuseWrap: 0.4
+    - _DiffuseWrap: 0.2
     - _DstBlend: 0
     - _DstBlendAlpha: 0
     - _EnableInnerPOM: 1
     - _EnvironmentReflections: 1
     - _FresnelPower: 8.11
-    - _FresnelStrength: 0.5
+    - _FresnelStrength: 1
     - _GlossMapScale: 0
     - _Glossiness: 0
     - _GlossyReflections: 0
-    - _InnerBlend: 1
+    - _InnerBlend: 0.6
     - _InnerDepthFade: 0
     - _InnerDepthScale: 0.01
-    - _InnerIOR: 1.4
+    - _InnerIOR: 1.5
     - _InnerSSSBlend: 0
-    - _InnerSurfaceThickness: 0.01
-    - _InnerTriplanarTile: 1
+    - _InnerSurfaceThickness: 0.03
+    - _InnerTriplanarTile: 2
     - _Metallic: 0
     - _OcclusionStrength: 1
     - _Parallax: 0.005
     - _QueueOffset: 0
     - _ReceiveShadows: 1
-    - _ResinAbsorption: 2
-    - _ResinTurbidity: 0.333
-    - _SSSIntensity: 1.5
+    - _ResinAbsorption: 3
+    - _ResinTurbidity: 0.182
+    - _SSSIntensity: 1.2
     - _SSSMask: 1
-    - _SSSThickness: 5
+    - _SSSThickness: 8
     - _ShadowStrength: 0.5
-    - _Smoothness: 0.35
+    - _Smoothness: 0.7
     - _SmoothnessTextureChannel: 0
     - _SpecularHighlights: 1
     - _SrcBlend: 1
     - _SrcBlendAlpha: 1
-    - _Subsurface: 0.4
+    - _Subsurface: 0.3
     - _Surface: 0
-    - _UseInnerBaseMap: 0
-    - _UseInnerTriplanar: 1
+    - _TriplanarBlendSharpness: 1
+    - _TriplanarTile: 1
+    - _UseInnerBaseMap: 1
+    - _UseInnerTriplanar: 0
+    - _UseTriplanar: 1
     - _WorkflowMode: 1
     - _XRMotionVectorsPass: 1
     - _ZWrite: 1
     m_Colors:
-    - _BaseColor: {r: 0.4156863, g: 0.3529412, b: 0.8039216, a: 1}
+    - _BaseColor: {r: 0.9921569, g: 0.9607844, b: 0.9019608, a: 1}
     - _Color: {r: 0.9, g: 0.9, b: 0.9, a: 1}
     - _EmissionColor: {r: 0, g: 0, b: 0, a: 1}
     - _InnerColor: {r: 1, g: 1, b: 1, a: 1}
     - _SpecColor: {r: 0.19999996, g: 0.19999996, b: 0.19999996, a: 1}
-    - _SpecularColor: {r: 0.3921569, g: 0.5843138, b: 0.9294118, a: 1}
+    - _SpecularColor: {r: 1, g: 0.2705882, b: 0, a: 1}
   m_BuildTextureStacks: []
   m_AllowLocking: 1
 --- !u!114 &9022484026067859511

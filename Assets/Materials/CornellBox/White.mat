@@ -70,8 +70,11 @@ Material:
     - _ShadowStrength: 1
     - _Smoothness: 0.75
     - _Subsurface: 0
+    - _TriplanarBlendSharpness: 4
+    - _TriplanarTile: 1
     - _UseInnerBaseMap: 0
     - _UseInnerTriplanar: 0
+    - _UseTriplanar: 0
     m_Colors:
     - _BaseColor: {r: 0.8, g: 0.8, b: 0.8, a: 1}
     - _InnerColor: {r: 1, g: 1, b: 1, a: 1}

@@ -25,9 +25,14 @@ public class SimpleCameraController : MonoBehaviour
     [Header("Limitations")]
     public float minVerticalAngle = -20f; // 아래로 내려다보는 최대 각도 (제한)
     public float maxVerticalAngle = 80f;  // 위로 올려다보는 최대 각도
+    
+    [Header("Smoothing")]
+    public float positionSmoothTime = 0.15f; // 카메라 추적 부드러움 (높을수록 바운스와 흔들림을 무시하고 부드럽게 따라감)
 
     private float currentX = 0f;
     private float currentY = 0f;
+    private Vector3 currentTargetPos;
+    private Vector3 positionVelocity;
 
     void OnEnable()
     {
@@ -64,6 +69,11 @@ public class SimpleCameraController : MonoBehaviour
         {
             GameObject player = GameObject.FindGameObjectWithTag("Player");
             if (player != null) target = player.transform;
+        }
+
+        if (target != null)
+        {
+            currentTargetPos = target.position + offset;
         }
     }
 
@@ -134,12 +144,23 @@ public class SimpleCameraController : MonoBehaviour
         distance += zoomDelta;
         distance = Mathf.Clamp(distance, minDistance, maxDistance);
 
-        // 5. 위치 및 회전 최종 적용
+        // 5. 부드러운 타겟 추적 적용 (Sway/Bounce 노이즈 감쇠 가능)
+        Vector3 targetDesiredPos = target.position + offset;
+        if (positionSmoothTime > 0f)
+        {
+            currentTargetPos = Vector3.SmoothDamp(currentTargetPos, targetDesiredPos, ref positionVelocity, positionSmoothTime);
+        }
+        else
+        {
+            currentTargetPos = targetDesiredPos;
+        }
+
+        // 6. 위치 및 회전 최종 적용
         Quaternion rotation = Quaternion.Euler(currentY, currentX, 0);
         
-        // 타겟 위치에서 Rotation * Distance 만큼 뒤로 뺌
+        // 타겟의 부드러운 위치에서 Rotation * Distance 만큼 뒤로 뺌
         Vector3 negDistance = new Vector3(0.0f, 0.0f, -distance);
-        Vector3 position = rotation * negDistance + (target.position + offset);
+        Vector3 position = rotation * negDistance + currentTargetPos;
 
         transform.rotation = rotation;
         transform.position = position;

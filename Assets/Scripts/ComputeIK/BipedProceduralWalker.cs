@@ -558,9 +558,39 @@ namespace ComputeIK
         private Vector3 currentNormal = Vector3.up;
         private Vector3 targetNormal = Vector3.up;
 
+        private float swayTimer;
+
         void ApplyBodySway()
         {
-            // 몸체의 좌우 흔들림(Sway)이나 상하 통통 튀는 움직임을 추가할 수 있는 공간입니다.
+            // 이동 속도가 있을 때만 흔들림 적용
+            if (velocity.sqrMagnitude > 0.01f)
+            {
+                // 현재 이동 속도에 맞춰 동적으로 발걸음 주기 계산
+                float dynamicDuration = stepDuration;
+                float currentV = velocity.magnitude;
+                
+                if (currentV > 0.1f) 
+                {
+                    dynamicDuration = (stepLength * 0.5f) / currentV;
+                    dynamicDuration = Mathf.Clamp(dynamicDuration, 0.01f, 2.0f);
+                }
+
+                // 발걸음 주기에 맞춰 사인파 타이머 증가
+                swayTimer += Time.deltaTime * (Mathf.PI / dynamicDuration);
+
+                // 좌우 흔들림 (Sway)
+                float currentSway = Mathf.Sin(swayTimer) * swayAmount;
+                // 상하 반동 (Bounce) - 절대값을 사용하여 매 걸음마다 위로 튀도록 함
+                float currentBounce = Mathf.Abs(Mathf.Sin(swayTimer)) * bounceAmount;
+
+                // 실시간 변환 오프셋 적용
+                transform.position += transform.right * currentSway + transform.up * currentBounce;
+            }
+            else
+            {
+                // 정지 시 부드럽게 초기화
+                swayTimer = Mathf.Lerp(swayTimer, 0, Time.deltaTime * 5f);
+            }
         }
     }
 }

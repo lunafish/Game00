@@ -2,6 +2,11 @@ Shader "Custom/LNSurfaceGBuffer"
 {
     Properties
     {
+        [Header(Surface Options)]
+        [Toggle] _UseTriplanar("Use Triplanar Mapping", Float) = 0.0
+        _TriplanarTile("Triplanar Tile", Float) = 1.0
+        _TriplanarBlendSharpness("Triplanar Blend Sharpness", Range(1.0, 64.0)) = 4.0
+
         _BaseMap("Base Map", 2D) = "white" {}
         _BaseColor("Base Color", Color) = (1,1,1,1)
         _BumpMap("Normal Map", 2D) = "bump" {}
@@ -85,6 +90,10 @@ Shader "Custom/LNSurfaceGBuffer"
             float _FresnelStrength;
             float _DiffuseWrap;
             
+            float _UseTriplanar;
+            float _TriplanarTile;
+            float _TriplanarBlendSharpness;
+
             float _EnableInnerPOM;
             float _UseInnerBaseMap;
             float4 _InnerColor;
@@ -135,7 +144,64 @@ Shader "Custom/LNSurfaceGBuffer"
         FragmentOutputFront frag_front(Varyings input)
         {
             FragmentOutputFront output;
-            float4 color = SAMPLE_TEXTURE2D(_BaseMap, sampler_BaseMap, input.uv) * _BaseColor;
+            
+            float4 color;
+            float3 normalWS = normalize(input.normalWS);
+            float roughness;
+
+            if (_UseTriplanar > 0.5)
+            {
+                // Triplanar Mapping Logic
+                float3 blendWeights = abs(normalWS);
+                blendWeights = pow(blendWeights, _TriplanarBlendSharpness);
+                blendWeights = blendWeights / (blendWeights.x + blendWeights.y + blendWeights.z);
+                
+                float2 uvX = input.positionWS.zy * _TriplanarTile;
+                float2 uvY = input.positionWS.xz * _TriplanarTile;
+                float2 uvZ = input.positionWS.xy * _TriplanarTile;
+                
+                // Base Color
+                float4 colX = SAMPLE_TEXTURE2D(_BaseMap, sampler_BaseMap, uvX);
+                float4 colY = SAMPLE_TEXTURE2D(_BaseMap, sampler_BaseMap, uvY);
+                float4 colZ = SAMPLE_TEXTURE2D(_BaseMap, sampler_BaseMap, uvZ);
+                color = (colX * blendWeights.x + colY * blendWeights.y + colZ * blendWeights.z) * _BaseColor;
+                
+                // Roughness
+                float rX = SAMPLE_TEXTURE2D(_RoughnessMap, sampler_RoughnessMap, uvX).r;
+                float rY = SAMPLE_TEXTURE2D(_RoughnessMap, sampler_RoughnessMap, uvY).r;
+                float rZ = SAMPLE_TEXTURE2D(_RoughnessMap, sampler_RoughnessMap, uvZ).r;
+                roughness = rX * blendWeights.x + rY * blendWeights.y + rZ * blendWeights.z;
+
+                // Normal
+                float3 nX = UnpackNormal(SAMPLE_TEXTURE2D(_BumpMap, sampler_BumpMap, uvX));
+                float3 nY = UnpackNormal(SAMPLE_TEXTURE2D(_BumpMap, sampler_BumpMap, uvY));
+                float3 nZ = UnpackNormal(SAMPLE_TEXTURE2D(_BumpMap, sampler_BumpMap, uvZ));
+                
+                // Swizzle tangent space normals to world space
+                float3 tX = float3(nX.z, nX.y, nX.x); 
+                float3 tY = float3(nY.x, nY.z, nY.y);
+                float3 tZ = float3(nZ.x, nZ.y, nZ.z);
+                
+                tX.x *= sign(normalWS.x);
+                tY.y *= sign(normalWS.y);
+                tZ.z *= sign(normalWS.z);
+                
+                normalWS = normalize(tX * blendWeights.x + tY * blendWeights.y + tZ * blendWeights.z);
+            }
+            else
+            {
+                // Standard UV Mapping
+                color = SAMPLE_TEXTURE2D(_BaseMap, sampler_BaseMap, input.uv) * _BaseColor;
+                roughness = SAMPLE_TEXTURE2D(_RoughnessMap, sampler_RoughnessMap, input.uv).r;
+                
+                // Normal Mapping
+                float3 tangentWS = normalize(input.tangentWS.xyz);
+                float3 bitangentWS = cross(normalWS, tangentWS) * input.tangentWS.w;
+                float3x3 tbn = float3x3(tangentWS, bitangentWS, normalWS);
+                
+                float3 normalTS = UnpackNormal(SAMPLE_TEXTURE2D(_BumpMap, sampler_BumpMap, input.uv));
+                normalWS = normalize(mul(normalTS, tbn));
+            }
             
             // Shadow Calculation
             float4 shadowCoord = TransformWorldToShadowCoord(input.positionWS.xyz);
@@ -150,15 +216,6 @@ Shader "Custom/LNSurfaceGBuffer"
             if (_SSSMask > 0.5) maskFlags |= 1;
             if (_UseInnerTriplanar > 0.5) maskFlags |= 2;
 
-            // --- Normal Mapping ---
-            float3 normalWS = normalize(input.normalWS);
-            float3 tangentWS = normalize(input.tangentWS.xyz);
-            float3 bitangentWS = cross(normalWS, tangentWS) * input.tangentWS.w;
-            float3x3 tbn = float3x3(tangentWS, bitangentWS, normalWS);
-            
-            float3 normalTS = UnpackNormal(SAMPLE_TEXTURE2D(_BumpMap, sampler_BumpMap, input.uv));
-            normalWS = normalize(mul(normalTS, tbn));
-
             // GBuffer1: Packed Normal (RG) + Linear Depth (B) + Mask (A)
             float2 encodedNormal = EncodeNormal(normalWS);
             float3 positionVS = TransformWorldToView(input.positionWS.xyz);
@@ -167,7 +224,6 @@ Shader "Custom/LNSurfaceGBuffer"
             output.GBuffer1 = float4(encodedNormal, linearDepth, float(maskFlags) / 255.0);
             
             // --- Roughness / Smoothness ---
-            float roughness = SAMPLE_TEXTURE2D(_RoughnessMap, sampler_RoughnessMap, input.uv).r;
             float smoothness = (1.0 - roughness) * _Smoothness;
 
             // --- Pack Extra Data ---
@@ -319,7 +375,28 @@ Shader "Custom/LNSurfaceGBuffer"
         FragmentOutputBack frag_back(Varyings input)
         {
             FragmentOutputBack output;
-            float4 color = SAMPLE_TEXTURE2D(_BaseMap, sampler_BaseMap, input.uv) * _BaseColor;
+            float4 color;
+            
+            if (_UseTriplanar > 0.5)
+            {
+                float3 normalWS = normalize(input.normalWS);
+                float3 blendWeights = abs(normalWS);
+                blendWeights = pow(blendWeights, _TriplanarBlendSharpness);
+                blendWeights = blendWeights / (blendWeights.x + blendWeights.y + blendWeights.z);
+                
+                float2 uvX = input.positionWS.zy * _TriplanarTile;
+                float2 uvY = input.positionWS.xz * _TriplanarTile;
+                float2 uvZ = input.positionWS.xy * _TriplanarTile;
+                
+                float4 colX = SAMPLE_TEXTURE2D(_BaseMap, sampler_BaseMap, uvX);
+                float4 colY = SAMPLE_TEXTURE2D(_BaseMap, sampler_BaseMap, uvY);
+                float4 colZ = SAMPLE_TEXTURE2D(_BaseMap, sampler_BaseMap, uvZ);
+                color = (colX * blendWeights.x + colY * blendWeights.y + colZ * blendWeights.z) * _BaseColor;
+            }
+            else
+            {
+                color = SAMPLE_TEXTURE2D(_BaseMap, sampler_BaseMap, input.uv) * _BaseColor;
+            }
             
             // GBuffer0: Albedo (RGB)
             output.GBuffer0 = float4(color.rgb, 1.0); 
@@ -368,7 +445,27 @@ Shader "Custom/LNSurfaceGBuffer"
                 float NdotL = saturate(dot(normalWS, mainLight.direction));
                 half shadow = mainLight.shadowAttenuation;
                 
-                half4 albedo = SAMPLE_TEXTURE2D(_BaseMap, sampler_BaseMap, input.uv) * _BaseColor;
+                half4 albedo;
+                if (_UseTriplanar > 0.5)
+                {
+                    float3 blendWeights = abs(normalWS);
+                    blendWeights = pow(blendWeights, _TriplanarBlendSharpness);
+                    blendWeights = blendWeights / (blendWeights.x + blendWeights.y + blendWeights.z);
+                    
+                    float2 uvX = input.positionWS.zy * _TriplanarTile;
+                    float2 uvY = input.positionWS.xz * _TriplanarTile;
+                    float2 uvZ = input.positionWS.xy * _TriplanarTile;
+                    
+                    float4 colX = SAMPLE_TEXTURE2D(_BaseMap, sampler_BaseMap, uvX);
+                    float4 colY = SAMPLE_TEXTURE2D(_BaseMap, sampler_BaseMap, uvY);
+                    float4 colZ = SAMPLE_TEXTURE2D(_BaseMap, sampler_BaseMap, uvZ);
+                    albedo = (colX * blendWeights.x + colY * blendWeights.y + colZ * blendWeights.z) * _BaseColor;
+                }
+                else
+                {
+                    albedo = SAMPLE_TEXTURE2D(_BaseMap, sampler_BaseMap, input.uv) * _BaseColor;
+                }
+
                 half3 ambient = SampleSH(normalWS) * albedo.rgb;
                 half3 diffuse = albedo.rgb * mainLight.color * NdotL * shadow;
                 

@@ -161,11 +161,13 @@ namespace ComputeIK
             chain.boneBuffer.GetData(chain.boneData);
             
             for (int i = 0; i < chain.bones.Length; i++) {
-                chain.bones[i].position = chain.boneData[i].position;
+                // 매쉬 분리 방지: 위치(position)를 직접 덮어쓰지 않고 원본 계층의 로컬 거리를 보존합니다.
+                // chain.bones[i].position = chain.boneData[i].position; (삭제 처리)
                 
                 // 회전 업데이트 로직
                 if (chain.updateRotation && i < chain.bones.Length - 1) {
-                    Vector3 currentDir = (chain.bones[i+1].position - chain.bones[i].position).normalized;
+                    // Unity Transform이 일그러지지 않도록 Compute Shader가 연산한 순수 방향 벡터만 추출
+                    Vector3 currentDir = (chain.boneData[i+1].position - chain.boneData[i].position).normalized;
                     if(currentDir != Vector3.zero)
                     {
                         // [Root Sync] 저장해둔 로컬 기준점을 현재 몸체 회전에 맞춰 월드로 변환
@@ -180,7 +182,7 @@ namespace ComputeIK
                         if (chain.poleTarget != null)
                         {
                             Vector3 boneAxis = currentDir;
-                            Vector3 poleDir = (chain.poleTarget.position - chain.bones[i].position).normalized;
+                            Vector3 poleDir = (chain.poleTarget.position - chain.bones[i].position).normalized; // 실제 부모 위치 기준 Pole
                             Vector3 projectedPoleDir = Vector3.ProjectOnPlane(poleDir, boneAxis).normalized;
                             
                             if (chain.initialStates[i].localPoleDir != Vector3.zero)

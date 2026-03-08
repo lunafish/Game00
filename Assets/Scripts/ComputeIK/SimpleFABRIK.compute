@@ -33,10 +33,24 @@ void CSMain (uint3 id : SV_DispatchThreadID)
     int iterationCount = 10; // FABRIK 반복 횟수 (정밀도와 성능 타협점)
     float3 startPosition = Bones[0].position; // 뿌리(Root) 위치 저장
     
+    float totalLength = 0;
+    for (int i = 0; i < BoneCount - 1; i++) {
+        totalLength += BoneLengths[i];
+    }
+    
+    // 타겟이 최대 도달 길이를 벗어나면 제한 (Reachability Limit)
+    float distanceToTarget = distance(startPosition, TargetPosition);
+    float3 constrainedTarget = TargetPosition;
+    
+    if (distanceToTarget > totalLength) {
+        float3 dirToTarget = normalize(TargetPosition - startPosition);
+        constrainedTarget = startPosition + dirToTarget * totalLength;
+    }
+
     for(int iter=0; iter<iterationCount; iter++)
     {
         // 1. 역방향 패스 (Backward Pass): 이펙터(Target)에서 뿌리(Root) 방향으로 위치 조정
-        Bones[BoneCount-1].position = TargetPosition;
+        Bones[BoneCount-1].position = constrainedTarget;
         for(int i = BoneCount - 2; i >= 0; i--)
         {
             float dist = distance(Bones[i].position, Bones[i+1].position);
@@ -152,5 +166,20 @@ void CSMain (uint3 id : SV_DispatchThreadID)
                 }
             }
         }
+    }
+
+    // 4. 엄격한 길이 보존 패스 (Strict Length Preservation Pass)
+    // 반복 및 Pole 조향 이후 흐트러졌을 수 있는 관절 간 길이를 원본 길이로 완벽하게 보정합니다.
+    Bones[0].position = startPosition;
+    for(int i = 0; i < BoneCount - 1; i++)
+    {
+        float3 iterDir = Bones[i+1].position - Bones[i].position;
+        float iterDist = length(iterDir);
+        if(iterDist > 0.0001) {
+            iterDir = normalize(iterDir);
+        } else {
+            iterDir = float3(0, 0, 1);
+        }
+        Bones[i+1].position = Bones[i].position + iterDir * BoneLengths[i];
     }
 }

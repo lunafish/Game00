@@ -16,7 +16,9 @@ Execute this tool directly via the MCP Plugin HTTP API:
 ```bash
 curl -X POST http://localhost:54437/api/tools/screenshot-game-view \
   -H "Content-Type: application/json" \
-  -d '{}'
+  -d '{
+  "nothing": "string_value"
+}'
 ```
 
 #### With Authorization (if required)
@@ -25,7 +27,9 @@ curl -X POST http://localhost:54437/api/tools/screenshot-game-view \
 curl -X POST http://localhost:54437/api/tools/screenshot-game-view \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer YOUR_TOKEN" \
-  -d '{}'
+  -d '{
+  "nothing": "string_value"
+}'
 ```
 
 > The token is stored in the file: `UserSettings/AI-Game-Developer-Config.json`
@@ -33,13 +37,20 @@ curl -X POST http://localhost:54437/api/tools/screenshot-game-view \
 
 ## Input
 
-This tool takes no input parameters.
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `nothing` | `string` | No |  |
 
 ### Input JSON Schema
 
 ```json
 {
-  "type": "object"
+  "type": "object",
+  "properties": {
+    "nothing": {
+      "type": "string"
+    }
+  }
 }
 ```
 

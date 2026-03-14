@@ -122,9 +122,6 @@ namespace CharacterCustomization
             // 새 파츠 생성 및 부착
             GameObject newPart = Instantiate(partPrefab, socket);
             newPart.name = $"{socketName}_Part";
-            newPart.transform.localPosition = Vector3.zero;
-            newPart.transform.localRotation = Quaternion.identity;
-            newPart.transform.localScale = Vector3.one;
 
             _attachedParts[socketName] = newPart;
             

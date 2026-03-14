@@ -1,8 +1,13 @@
 {
+  "host": "http://localhost:54437",
+  "token": "DqK6-UPmFNrE4srjjzLcyXjMu_CRM3hodG1sn7fuzG0",
   "logLevel": 3,
   "keepServerRunning": true,
   "transportMethod": 2,
   "authOption": 1,
+  "connectionMode": 0,
+  "cloudServerUrl": "https://ai-game.dev",
+  "cloudToken": null,
   "tools": [
     {
       "name": "assets-copy",
@@ -421,10 +426,8 @@
       "enabled": true
     }
   ],
-  "host": "http://localhost:54437",
   "timeoutMs": 10000,
   "keepConnected": true,
-  "token": "DqK6-UPmFNrE4srjjzLcyXjMu_CRM3hodG1sn7fuzG0",
   "generateSkillFiles": true,
   "skillsPath": "SKILLS"
 }
